@@ -305,7 +305,7 @@ for (const withBinds of [false, true]) test(`shared mounts (binds=${withBinds}) 
     );
   }
   volumes.delete(shared.volume);
-  await assert.rejects(pool.acquire(alice), /Docker volume failed/);
+  await assert.rejects(pool.acquire(alice), /Docker volume inspect failed/);
   volumes.set(shared.volume, sharedInfo);
   await pool.remove(alice, false);
   assert.equal((await pool.acquire(alice)).recreated, true);

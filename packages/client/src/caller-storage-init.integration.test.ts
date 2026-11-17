@@ -65,6 +65,35 @@ USER node
       assert.match(helper, /^sha256:[a-f0-9]{64}$/);
       assert.equal(await command(['image', 'inspect', '--format', '{{.Id}}', helper]), helper);
     }
+    const recoveryId = scopeDigest(config.agent_id, 'network-recovery');
+    let denyNetwork = true;
+    const recoveryRun: typeof runDockerCommand = async (args, opts) =>
+      denyNetwork && args[0] === 'network' && args[1] === 'create'
+        ? { exitCode: 1, stdout: '', stderr: 'all predefined address pools have been fully subnetted' }
+        : runDockerCommand(args, opts);
+    pool = new DockerCallerRuntimePool('claude', runtime, config.agent_id, recoveryRun);
+    await pool.initialize();
+    await assert.rejects(pool.acquire(recoveryId, undefined, 'network-recovery'), /docker_address_pool_exhausted/);
+    const recoveryIdentity = await pool.store.fixedStorage(recoveryId);
+    const recoveryVolume = `${pool.name(recoveryId)}-storage`;
+    await command(['run', '--rm', '--network', 'none', '--user', '1000:1000',
+      '--entrypoint', 'node', '--mount', `type=volume,src=${recoveryVolume},dst=/storage,volume-nocopy`,
+      image, '-e', "require('fs').writeFileSync('/storage/workspace/recovery-file','retained-before-recovery')"]);
+    const fileHash = async () => command(['run', '--rm', '--network', 'none', '--user', '1000:1000',
+      '--entrypoint', 'node', '--mount', `type=volume,src=${recoveryVolume},dst=/storage,volume-nocopy,readonly`,
+      image, '-e', "console.log(require('crypto').createHash('sha256').update(require('fs').readFileSync('/storage/workspace/recovery-file')).digest('hex'))"]);
+    const beforeRecoveryHash = await fileHash();
+    await pool.close();
+    denyNetwork = false;
+    pool = new DockerCallerRuntimePool('claude', runtime, config.agent_id, recoveryRun);
+    await pool.initialize(false, true);
+    await pool.recover(recoveryId);
+    assert.equal(await pool.store.fixedStorage(recoveryId), recoveryIdentity);
+    assert.equal(await fileHash(), beforeRecoveryHash);
+    assert.equal(await pool.store.allocationComplete(recoveryId), true);
+    assert.equal((await pool.describe(recoveryId)).state, 'stopped');
+    await pool.remove(recoveryId, true); // Only this disposable test scope.
+    await pool.close();
     pool = new DockerCallerRuntimePool('claude', runtime, config.agent_id);
     await pool.initialize(false, true);
     const id = scopeDigest(config.agent_id, principal);

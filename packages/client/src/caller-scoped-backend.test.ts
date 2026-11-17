@@ -1,3 +1,4 @@
+import { CallerDockerError } from './caller-runtime-diagnostics.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -861,5 +862,27 @@ test('idle cleanup timeout still stops the container and rejects a waiting reque
   assert.match(JSON.stringify(await waiting), /runtime_quarantined/);
   assert.equal(f.stops.length, 1);
   assert.equal(f.lifecycle.at(-1)?.update.lastIdleStop?.outcome, 'quarantined');
+  await f.backend.close();
+});
+
+test('network allocation logs a safe cause while preserving the public failure contract and another caller', async t => {
+  const f = fixture();
+  const logs: unknown[][] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args); });
+  await f.backend.initialize();
+  const acquire = f.pool.acquire.bind(f.pool);
+  f.pool.acquire = async (id, signal, principal, reserved, mutated) => {
+    if (principal !== 'alice') return acquire(id, signal, principal, reserved, mutated);
+    reserved?.(); mutated?.();
+    throw new CallerDockerError('network create', 75, {
+      exitCode: 1, stdout: 'PRIVATE', stderr: 'all predefined address pools have been fully subnetted PRIVATE',
+    });
+  };
+  const frames = await f.run();
+  assert.equal((frames.at(-1) as any).error.code, 'runtime_failed');
+  assert.ok(!JSON.stringify(frames).includes('docker_address_pool'));
+  assert.ok(JSON.stringify(logs).includes('docker_address_pool_exhausted'));
+  assert.ok(!JSON.stringify(logs).includes('PRIVATE'));
+  assert.equal((await f.run(task('bob'))).at(-1)?.type, 'task.complete');
   await f.backend.close();
 });

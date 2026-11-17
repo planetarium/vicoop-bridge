@@ -1,7 +1,8 @@
+import { CallerDockerError, dockerOperation } from './caller-runtime-diagnostics.js';
 import { CallerStorage, CallerStorageHelperUnconfirmedError } from './caller-storage.js';
 import { randomUUID } from 'node:crypto';
 import { realpath, stat } from 'node:fs/promises';
-import { runDockerCommand, type AsyncDockerRun } from './docker-command.js';
+import { CommandExecutionError, runDockerCommand, type AsyncDockerRun } from './docker-command.js';
 import { CallerRuntimeStore, scopeDigest, type CallerRuntimeLifecycle } from './caller-runtime-store.js';
 import { brokerFirewallScript } from './execution-runtime-boundary.js';
 import { PROVIDER_ENV_PATTERN } from './provider-environment.js';
@@ -72,12 +73,16 @@ export class DockerCallerRuntimePool {
   }
   private async command(args: string[], signal?: AbortSignal): Promise<string> {
     signal?.throwIfAborted();
-    const result = await this.run(args, { signal });
-    signal?.throwIfAborted();
+    const started = performance.now();
+    let result;
+    try { result = await this.run(args, { signal }); }
+    catch (error) {
+      throw new CallerDockerError(dockerOperation(args), Math.round(performance.now() - started), undefined,
+        signal?.aborted ? new CommandExecutionError('aborted', 'command aborted') : error);
+    }
     if (result.exitCode !== 0)
-      throw new Error(
-        `caller Docker ${args[0]} failed; inspect managed runtime resources`,
-      );
+      throw new CallerDockerError(dockerOperation(args), Math.round(performance.now() - started), result);
+    signal?.throwIfAborted();
     return result.stdout;
   }
   name(id: string, context?: string): string {
@@ -194,6 +199,13 @@ export class DockerCallerRuntimePool {
           if (this.options.fixedImageStorage) await this.storage.manage('check', id);
         }
       }
+      if (reconcile || validateOffline) console.warn('Caller network capacity planning:', JSON.stringify({
+        retainedScopes: ids.length,
+        maxScopes: this.options.maxScopes,
+        callerNetworkBudget: this.options.maxScopes,
+        additionalContextNetworkBudget: this.options.concurrency?.global ?? 0,
+        note: 'Subnet demand only, not available capacity. Include all other pools and retained networks on this Docker daemon; see docs/caller-runtime.md#docker-network-address-capacity.',
+      }));
       return ids;
     } catch (error) {
       if (error instanceof CallerStorageHelperUnconfirmedError) throw error;
@@ -442,6 +454,8 @@ export class DockerCallerRuntimePool {
     const info = await this.inspect(name);
     if (info) await this.validate(info, id);
     return {
+      reservationPending: await this.store.reservationPending(id),
+      allocationComplete: await this.store.allocationComplete(id),
       contexts: await this.store.contexts(id),
       container: name,
       state: info ? (info.State.Running ? 'running' : 'stopped') : 'absent',
@@ -472,6 +486,28 @@ export class DockerCallerRuntimePool {
     this.offline = false;
     return this.acquireContainer(id, signal, principalId);
   }
+  /** Explicit offline recovery never creates replacement storage or adopts orphans. */
+  async recover(id: string, signal?: AbortSignal): Promise<CallerContainer> {
+    if (!this.locked || !this.offline || !this.validateExecution)
+      throw new Error('recovery requires validated offline initialization');
+    if (!(await this.store.scopes()).includes(id)) throw new Error('unknown caller scope');
+    if (await this.store.reservationPending(id)) throw new CallerReservationUnconfirmedError();
+    if (await this.store.allocationComplete(id) || await this.inspect(this.name(id), signal))
+      throw new Error('recovery requires an incomplete allocation without a container; use container recreate for completed allocations');
+    await this.networkExists(id, undefined, signal);
+    for (const suffix of this.storageSuffixes()) {
+      if (!(await this.volumeExists(id, suffix, signal))) throw new CallerStorageMissingError();
+      const consumers = await this.command(['ps', '--all', '--quiet', '--filter',
+        `volume=${this.name(id)}-${suffix}`], signal);
+      if (consumers.trim()) throw new Error('caller volume is mounted by another container');
+    }
+    if (this.options.fixedImageStorage) await this.storage.manage('check', id, signal);
+    // The caller must close this pool even on failure, as with prepare().
+    this.offline = false;
+    const container = await this.acquireContainer(id, signal, undefined, undefined, undefined, true);
+    await this.stop(id);
+    return container;
+  }
   async acquire(
     id: string,
     signal?: AbortSignal,
@@ -489,6 +525,7 @@ export class DockerCallerRuntimePool {
     principalId?: string,
     onReserved?: () => void,
     onMutation?: () => void,
+    recoverIncomplete = false,
   ): Promise<CallerContainer> {
     if (!this.locked) throw new Error('caller pool is not initialized');
     if (this.offline) throw new Error('offline administration cannot acquire callers');
@@ -544,7 +581,7 @@ export class DockerCallerRuntimePool {
             ...(this.options.fixedImageStorage ? ['--opt', 'type=ext4', '--opt', `device=${await this.storage.device(id)}`, '--opt', 'o=rw,nodev,nosuid,nodiscard'] : []), volume]);
         }
       }
-      if (!fresh && !(await this.store.allocationComplete(id)))
+      if (!fresh && !recoverIncomplete && !(await this.store.allocationComplete(id)))
         throw new CallerAllocationIncompleteError();
       if (!(await this.networkExists(id, undefined, signal))) {
         await command([

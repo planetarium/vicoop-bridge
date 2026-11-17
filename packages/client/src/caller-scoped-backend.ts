@@ -1,3 +1,4 @@
+import { callerFailureDiagnostic } from './caller-runtime-diagnostics.js';
 import { CallerExecutionScheduler, CallerQueueFullError } from './caller-execution-scheduler.js';
 import { CallerStorageHelperUnconfirmedError } from './caller-storage.js';
 import { INPUT_FILE_MAX_BYTES, INPUT_IMAGE_MIME, decodedBase64Size } from './backends/fetch-uri-file.js';
@@ -396,7 +397,7 @@ export class CallerScopedBackend implements Backend {
       console.error(
         'Caller runtime failure phase:',
         phase,
-        error instanceof Error ? error.name : 'unknown',
+        JSON.stringify({ scope: id, ...callerFailureDiagnostic(error) }),
       );
       forwarding = false;
       if (acquired) {
@@ -573,7 +574,7 @@ export class CallerScopedBackend implements Backend {
       emit(terminal);
     } catch (error) {
       forwarding = false;
-      console.error('Caller context runtime failure phase:', phase, error instanceof Error ? error.name : 'unknown');
+      console.error('Caller context runtime failure phase:', phase, JSON.stringify({ scope: id, context, ...callerFailureDiagnostic(error) }));
       // Only this context owns this worker/broker/container. A sibling's grant,
       // approval handler and output snapshots are never closed here.
       if (acquired || worker) {

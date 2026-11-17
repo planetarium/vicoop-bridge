@@ -1043,3 +1043,104 @@ input routing, persistence/recovery, and serialization rollback. Claude also
 passed execution-bound FilePart byte attribution for identical output paths.
 No real provider/model calls or production deployment were performed in this
 validation.
+
+## Docker network address capacity
+
+Each retained caller owns a bridge network and consumes one Docker subnet,
+including when its container is stopped or idle. Earlier agent namespaces and
+other pools on the **same Docker daemon** also consume subnets. In context
+concurrency mode, budget additional networks for active context containers
+(up to the configured global execution limit per pool), plus operational
+headroom. Stale resources awaiting reconciliation may consume further networks.
+
+Startup prints a planning diagnostic with retained scopes, configured
+`maxScopes`, the caller network budget and the additional context network
+budget. These are demand estimates, **not available capacity**, and do not
+change admission policy. There is no universal Docker limit of 30 callers.
+The Bridge configuration currently accepts `maxScopes` from 1 to 32 per pool;
+address-pool configuration does not raise that existing application limit or
+increase CPU, memory or fixed-storage capacity.
+
+Inspect the daemon actually selected by the client's Docker context/environment:
+
+```sh
+docker context show
+docker info --format '{{json .DefaultAddressPools}}'
+docker network ls --filter driver=bridge
+docker network inspect NETWORK_NAME
+```
+
+Inventory all namespaces, retained networks, subnet CIDRs and attached
+containers. Check routes on the **daemon host**, including VNet, VPN and
+on-premises networks; local routes on a workstation do not describe a remote
+daemon's routing environment. A network count alone cannot establish remaining
+capacity because subnet sizes and overlapping routes differ.
+
+For a Linux daemon, merge a deliberate `default-address-pools` setting into
+its existing `/etc/docker/daemon.json`. The following is illustrative only:
+use this address block **only if it does not overlap your environment**.
+
+```json
+{
+  "default-address-pools": [
+    { "base": "10.240.0.0/16", "size": 24 }
+  ]
+}
+```
+
+A /16 divided into /24s provides 256 possible subnets before existing
+allocations and conflicts. Choose subnet size for the endpoints each network
+needs, and budget all pools plus headroom. This is a daemon-wide default for
+new networks, not a Bridge-only setting; existing networks keep their subnets.
+Do not overwrite unrelated daemon settings or automatically prune networks.
+
+Validate the merged configuration with
+`dockerd --validate --config-file=/etc/docker/daemon.json`, then schedule
+the required daemon restart with affected workloads stopped and accounted for.
+Re-inventory networks and verify a new caller allocation afterward. Configuration
+validation does not certify absence of route conflicts. See the
+[Docker daemon reference](https://docs.docker.com/reference/cli/dockerd/) and
+[Docker networking overview](https://docs.docker.com/engine/network/).
+
+### Address-pool exhaustion and incomplete allocation recovery
+
+The operator log reports `docker_address_pool_exhausted`, stage `network`,
+operation `network create`, exit code and elapsed milliseconds for recognized
+Docker subnet exhaustion errors. Timeout, abort and output-limit failures have
+separate codes: a timeout does not prove Docker rejected a mutation. Caller
+responses retain the existing public failure codes. Logs deliberately omit
+arguments, stdin, stdout, arbitrary stack/cause text and raw stderr; known
+exhaustion messages are replaced with a fixed diagnostic and other stderr is
+withheld, because Docker errors can echo credentials or workload data.
+
+A new allocation reserves its scope and creates storage before creating the
+network. Failure can therefore leave valuable storage with no container.
+Normal cleanup retains it, and ordinary retries remain blocked as incomplete
+even after addressing subnet capacity. `container list` exposes
+`reservationPending` and `allocationComplete` to distinguish these states.
+
+After correcting capacity, stop the Bridge daemon and inspect the affected
+scope with the same config/backend. Preserve a backup according to your storage
+procedures, then explicitly resume an incomplete allocation:
+
+```sh
+vicoop-client container list --config /path/to/config.json --backend codex
+vicoop-client container recover SCOPE --config /path/to/config.json --backend codex
+```
+
+Recovery requires a committed reservation, an incomplete allocation with no
+container, validated existing storage and no foreign volume consumers or
+network endpoints. Fixed storage must pass its existing identity, UUID and
+filesystem checks. Recovery attaches existing storage, creates the missing
+network/container, validates and initializes the runtime, and stops it before
+returning. No backend inference runs. Successful allocation is recorded only
+after runtime validation. If network creation fails again, storage remains and
+the operator can retry recovery after fixing capacity.
+
+Missing/mismatched storage and unconfirmed reservations fail closed; recover
+does not create replacement volumes or format data. Investigate/restore the
+original state instead. If a previous attempt left a validated container,
+inspect it and use the existing `container recreate` flow. Do not edit database
+completion markers manually. `container remove` deletes caller data and is
+not a data-preserving recovery step. Never use global network prune or delete
+another pool's resources to make this error disappear.

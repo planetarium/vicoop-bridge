@@ -587,7 +587,7 @@ export const containerCmd = command(
   ),
   {
     brief: message`Initialize, inspect and manage per-caller containers.`,
-    description: message`init prepares the image and configuration; list/validate/recreate/remove manage caller resources while the daemon is stopped. --config defaults to the canonical config.json. Legacy shared-container tools are under container legacy.`,
+    description: message`init prepares the image and configuration; list/validate/recover/recreate/remove manage caller resources while the daemon is stopped. --config defaults to the canonical config.json. Legacy shared-container tools are under container legacy.`,
   },
 );
 

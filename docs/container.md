@@ -366,3 +366,7 @@ to version 7. Older clients refuse that state directory; do not edit the marker
 to downgrade. Existing direct-user containers keep their original identity and
 volumes. Both bridge server and client must support the additive federated scope
 capability; see [scope and lifetime](./caller-runtime.md#scope-lifetime-and-persistence).
+
+Caller-scoped Docker deployments must also plan subnet capacity for retained
+callers and all pools sharing a daemon. See [network capacity and allocation
+recovery](./caller-runtime.md#docker-network-address-capacity).
