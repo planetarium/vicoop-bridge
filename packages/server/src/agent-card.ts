@@ -1,3 +1,4 @@
+import { parseFederatedDelegation } from './auth/federated-delegation.js';
 import { APPROVAL_EXTENSION_URI, REMOTE_APPROVAL_CAPABILITY } from '@vicoop-bridge/protocol';
 import {
   A2A_TRANSPORTS,
@@ -154,7 +155,7 @@ export function buildAgentA2XServer(
       supportsExecutionScopeV1(conn.protocolCapabilities) &&
       conn.protocolCapabilities.includes(FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY)
     )) &&
-    principals.some((p) => p?.kind === 'federated');
+    (principals.some((p) => p?.kind === 'federated') || conn.allowedCallers.some((p) => parseFederatedDelegation(p) !== null));
   for (const extension of wireExtensions) {
     if (callerRuntime && [OPENAI_COMPAT_EXTENSION_URI, TRACEABILITY_EXTENSION_URI].includes(extension.uri)) continue;
     if (extension.uri === SIWE_BEARER_AUTH_EXTENSION_URI) {
@@ -214,7 +215,7 @@ export function buildAgentA2XServer(
     a2xServer.addExtension({
       uri: OAUTH_FEDERATION_EXTENSION_URI,
       description:
-        'DID-backed OAuth 2.0 Token Exchange for exact Mentionable federated callers. This is an authentication alternative; extension activation is not required when using another advertised method.',
+        'DID-backed OAuth 2.0 Token Exchange for explicitly authorized Mentionable federated callers (exact grants or issuer/method delegation). This is an authentication alternative; extension activation is not required when using another advertised method.',
       required: false,
       params: {
         authorization_server: `${opts.publicUrl}/.well-known/oauth-authorization-server`,

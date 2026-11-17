@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   runAddCaller,
+  runAgentCallersDelegation,
   runAgentCallersIssue,
   runAgentCallersAdd,
   runAgentCallersAddFederated,
@@ -1185,4 +1186,19 @@ test('agent transfer stops on a rejected preview', async (t) => {
   const { calls } = installFetch(t, { status: 403, body: { error: 'admin only' } });
   assert.equal(await runAgentTransfer({ action: 'agent-transfer', server: BRIDGE, token: TOKEN, agentId: 'foo', to: 'new', yes: true, json: true }), 1);
   assert.equal(calls.length, 1);
+});
+
+
+test('delegation CLI uses structured issuer/method policy API without a subject', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const { calls } = installFetch(t, { body: { agent_id: 'foo', allowed_callers: [] } });
+  for (const action of ['agent-callers-add-delegation', 'agent-callers-remove-delegation'] as const) {
+    assert.equal(await runAgentCallersDelegation({ ...SHARED, action, agentId: 'foo', issuer: 'did:web:router.example', method: 'urn:vicoop:auth:verse8-user:v1' }), 0);
+  }
+  assert.deepEqual(calls.map((call) => [call.method, call.url]), [
+    ['POST', `${BRIDGE}/admin-api/agents/foo/federated-delegations`],
+    ['DELETE', `${BRIDGE}/admin-api/agents/foo/federated-delegations`],
+  ]);
+  assert.deepEqual(JSON.parse(calls[0].body!), { issuer: 'did:web:router.example', method: 'urn:vicoop:auth:verse8-user:v1' });
 });

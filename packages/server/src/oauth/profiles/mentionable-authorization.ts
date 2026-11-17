@@ -41,6 +41,32 @@ export async function authorizeMentionableOperation({
   if (operation.kind === 'task-list') {
     return { ok: false as const, reason: 'federated_task_list_not_supported' };
   }
+  if (operation.kind === 'message') {
+    // Context IDs and task references must not revive a revoked grant or
+    // cross a subject/actor boundary under a shared delegation policy.
+    if (operation.contextId) {
+      const rows = await sql<{ inaccessible: boolean }[]>`
+        SELECT EXISTS (
+          SELECT 1 FROM infra.a2a_tasks
+          WHERE owner_agent = ${agentId} AND context_id = ${operation.contextId}
+            AND (owner_principal IS DISTINCT FROM ${caller.principalId}
+              OR owner_actor IS DISTINCT FROM ${tokenExchange.actorId}
+              OR authorization_profile IS DISTINCT FROM ${tokenExchange.profileId}
+              OR authorization_key IS DISTINCT FROM ${tokenExchange.allowedCaller}
+              OR authorization_revoked_at IS NOT NULL)
+        ) AS inaccessible
+      `;
+      if (rows[0]?.inaccessible !== false) return { ok: false as const, reason: 'context_not_accessible' };
+    }
+    for (const taskId of operation.referenceTaskIds ?? []) {
+      const reference = await loadTokenExchangeTaskAuthorization(sql, agentId, taskId);
+      if (!reference || reference.authorizationRevoked || reference.principalId !== caller.principalId ||
+          reference.actorId !== tokenExchange.actorId || reference.profileId !== tokenExchange.profileId ||
+          reference.authorizationKey !== tokenExchange.allowedCaller) {
+        return { ok: false as const, reason: 'reference_task_not_accessible' };
+      }
+    }
+  }
   if (operation.kind === 'message' && operation.taskId === undefined) {
     if (tokenExchange.taskId !== undefined) {
       return { ok: false as const, reason: 'token_task_mismatch' };

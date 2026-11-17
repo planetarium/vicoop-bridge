@@ -213,3 +213,14 @@ denies every federated token.
 6. Repeat message send and task read through v0.3 JSON-RPC, v1 JSON-RPC, and v1
    HTTP+JSON. Wrong resource, audience, method, issuer/client equality, replayed
    `jti`, expired assertion, unsupported scope, and any `actor_token` must fail.
+
+
+## Optional issuer/method delegation
+
+Bridge also supports an explicit owner-configured issuer/method delegation policy
+for trusted Routers. It uses the same signed assertion wire profile but does not
+require one exact grant per subject. Exact grants remain unchanged and take
+precedence. Each token/task pins the authorizing policy generation while runtime
+isolation continues to use the full issuer/method/subject identity. For owner
+API/CLI configuration, revocation, discovery and rollback behavior, see
+[Delegate user authorization to a Router](manage-federated-callers.md#delegate-user-authorization-to-a-router).

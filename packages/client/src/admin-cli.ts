@@ -204,6 +204,22 @@ const agentCallersRemoveFederatedSubCmd = federatedCallerCommand(
   'agent-callers-remove-federated',
 );
 
+function delegationCommand<const A extends 'agent-callers-add-delegation' | 'agent-callers-remove-delegation'>(
+  name: 'add-delegation' | 'remove-delegation', action: A,
+) {
+  return command(name, object({
+    action: constant(action), ...sharedFlags,
+    agentId: argument(string({ metavar: 'AGENT_ID' })),
+    issuer: option('--issuer', string({ metavar: 'DID' })),
+    method: option('--method', string({ metavar: 'URN' })),
+  }), {
+    brief: message`Manage explicit issuer/method authorization delegation.`,
+    description: message`Trust all individually identified subjects attested by this exact issuer and authentication method for this agent. No per-user grant is needed. Removing trust revokes its tokens and tasks; re-adding creates a new policy generation. Once delegation has been enabled, removing the final policy keeps the agent restricted. Use callers list --json to inspect policy IDs.`,
+  });
+}
+const agentCallersAddDelegationSubCmd = delegationCommand('add-delegation', 'agent-callers-add-delegation');
+const agentCallersRemoveDelegationSubCmd = delegationCommand('remove-delegation', 'agent-callers-remove-delegation');
+
 // `issue-api-key` mints a static API key — a caller the bridge creates a
 // secret for, for non-interactive callers (CI, backend services) that can't
 // run the Google/SIWE login flow. It lives under `callers` alongside
@@ -236,6 +252,8 @@ const agentCallersSubCmd = command(
     agentCallersAddSubCmd,
     agentCallersRemoveSubCmd,
     agentCallersAddFederatedSubCmd,
+    agentCallersAddDelegationSubCmd,
+    agentCallersRemoveDelegationSubCmd,
     agentCallersRemoveFederatedSubCmd,
     agentCallersIssueSubCmd,
   ),
@@ -243,6 +261,19 @@ const agentCallersSubCmd = command(
     brief: message`Manage the agent's callers — external identities and API keys.`,
   },
 );
+
+export async function runAgentCallersDelegation(
+  args: Extract<AgentCliArgs, { action: 'agent-callers-add-delegation' | 'agent-callers-remove-delegation' }>,
+): Promise<number> {
+  const session = resolveSession(args);
+  if ('error' in session) { process.stderr.write(`${session.error}\n`); return 1; }
+  const result = await callApi({ session,
+    method: args.action === 'agent-callers-add-delegation' ? 'POST' : 'DELETE',
+    path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/federated-delegations`,
+    body: { issuer: args.issuer, method: args.method },
+  });
+  return emit(result, args.json, renderCallerMutation);
+}
 
 // ----- agent x402 (pricing) ---------------------------------------------------
 //
@@ -357,7 +388,7 @@ export const agentCmd = command(
   ),
   {
     brief: message`Manage agent registrations, their callers, and their pricing.`,
-    description: message`Operator-facing umbrella for agent state. Subcommands: \`transfer\`, \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, add-federated, remove-federated, issue-api-key}\`, \`x402 {show, set, clear}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
+    description: message`Operator-facing umbrella for agent state. Subcommands: \`transfer\`, \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, add-federated, remove-federated, add-delegation, remove-delegation, issue-api-key}\`, \`x402 {show, set, clear}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
     hidden: 'usage',
   },
 );
@@ -652,6 +683,8 @@ function renderCallerList(body: unknown): string {
   const b = body as {
     allowed_callers?: string[];
     federated_callers?: Array<{ issuer: string; method: string; subject: string }>;
+    federated_delegations?: Array<{ id: string; issuer: string; method: string }>;
+    federation_restricted?: boolean;
   };
   const callers = b.allowed_callers ?? [];
   // Empty allowed_callers means the dispatcher treats the agent as public.
@@ -666,16 +699,13 @@ function renderCallerList(body: unknown): string {
     callers.map((p) => [principalType(p), p]),
   );
   const federated = b.federated_callers ?? [];
-  if (federated.length === 0) return callerTable;
-  return [
-    callerTable,
-    '',
-    'FEDERATED CALLERS',
-    renderTable(
-      ['ISSUER', 'METHOD', 'SUBJECT'],
-      federated.map((entry) => [entry.issuer, entry.method, entry.subject]),
-    ),
-  ].join('\n');
+  const sections = [callerTable];
+  if (b.federation_restricted) sections.push('Restricted: removing all active delegation policies does not make this agent public.');
+  if (federated.length) sections.push('', 'FEDERATED CALLERS', renderTable(
+    ['ISSUER', 'METHOD', 'SUBJECT'], federated.map((entry) => [entry.issuer, entry.method, entry.subject])));
+  if (b.federated_delegations?.length) sections.push('', 'FEDERATED DELEGATIONS', renderTable(
+    ['POLICY ID', 'ISSUER', 'METHOD'], b.federated_delegations.map((entry) => [entry.id, entry.issuer, entry.method])));
+  return sections.join('\n');
 }
 
 // Agent-centric renderer for `agent list`. The /admin-api/clients response

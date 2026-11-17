@@ -248,10 +248,24 @@ export function agentAuthMiddleware(registry: Registry, opts: AgentAuthOptions) 
       return reject(c, 404, -32000, 'Agent not connected', rejectionId);
     }
 
-    c.set('agentConn', conn);
-
     const authHeader = c.req.header('Authorization');
     const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
+    // A stale empty registry policy must not bypass a delegation installed on
+    // another server. Database errors fail closed before the public fast path.
+    if (conn.allowedCallers.length === 0 && !bearerToken?.startsWith(TOKEN_EXCHANGE_ACCESS_TOKEN_PREFIX)) {
+      try {
+        const rows = await opts.sql<{ allowed_callers: string[] }[]>`
+          SELECT allowed_callers FROM agents WHERE id = ${agentId}
+        `;
+        if (!rows[0]) return reject(c, 503, -32000, 'Caller policy unavailable', newRejectionId());
+        conn.allowedCallers = rows[0].allowed_callers;
+      } catch {
+        return reject(c, 503, -32000, 'Caller policy temporarily unavailable', newRejectionId());
+      }
+    }
+
+    c.set('agentConn', conn);
+
     // Empty allowed_callers keeps its historical public-agent meaning, but a
     // A presented token-exchange token must still be validated. Otherwise removing
     // the final exact tuple would turn an already-issued vbc_oauth_* token into

@@ -51,7 +51,8 @@ async function mintBearer(opts: { domain: string; uri: string }): Promise<string
 // checks the `agents` table to tell registered-but-offline (503) apart from
 // unknown (404) — fakeSql answers that single query shape.
 function fakeSql(registeredAgentIds: string[]): Sql {
-  return (async (_strings: TemplateStringsArray, ...values: unknown[]) =>
+  return (async (strings: TemplateStringsArray, ...values: unknown[]) =>
+    strings.join('').includes('SELECT allowed_callers') ? [{ allowed_callers: [] }] :
     registeredAgentIds.includes(values[0] as string)
       ? [{ '?column?': 1 }]
       : []) as unknown as Sql;
@@ -442,4 +443,20 @@ test('caller runtime public agent requires authentication and accepts verified d
   assert.equal((await app.request(url, { method: 'POST', headers: { Authorization: 'Bearer invalid' } })).status, 401);
   const bearer = await mintBearer({ domain: 'bridge.example', uri: 'https://bridge.example' });
   assert.equal((await app.request(url, { method: 'POST', headers: { Authorization: `Bearer ${bearer}` } })).status, 200);
+});
+
+test('stale public registry cannot bypass a database delegation restriction', async () => {
+  const sql = (async () => [{ allowed_callers: ['federation-restricted:v1'] }]) as unknown as Sql;
+  const { app, registry } = buildApp({ sql });
+  registerAgent(registry, 'was-public', []);
+  assert.equal((await app.request('/agents/was-public', { method: 'POST' })).status, 401);
+});
+
+
+test('public-path policy read errors and missing rows fail closed', async () => {
+  for (const sql of [(async () => []) as unknown as Sql, (async () => { throw new Error('offline'); }) as unknown as Sql]) {
+    const { app, registry } = buildApp({ sql });
+    registerAgent(registry, 'public', []);
+    assert.equal((await app.request('/agents/public', { method: 'POST' })).status, 503);
+  }
 });

@@ -20,6 +20,8 @@ export interface TokenExchangeOperation {
   name: TokenExchangeOperationName;
   kind: 'message' | 'task' | 'task-list' | 'agent';
   taskId?: string;
+  contextId?: string;
+  referenceTaskIds?: string[];
 }
 
 export type TokenExchangeAuthorizationResult = { ok: true } | { ok: false; reason: string };
@@ -101,7 +103,10 @@ export function parseTokenExchangeJsonRpcOperation(
       ? stringField(params?.[version === '1.0' || method === 'tasks/pushNotificationConfig/set'
         ? 'taskId' : 'id'])
       : taskIdFromParams(params);
-  return { ...base, ...(taskId !== undefined ? { taskId } : {}) };
+  const message = base.kind === 'message' ? record(params?.message) : undefined;
+  const contextId = stringField(message?.contextId);
+  const references = Array.isArray(message?.referenceTaskIds) ? message.referenceTaskIds.filter((id): id is string => typeof id === 'string') : undefined;
+  return { ...base, ...(taskId !== undefined ? { taskId } : {}), ...(contextId ? { contextId } : {}), ...(references ? { referenceTaskIds: references } : {}) };
 }
 
 // Match the installed SDK decoder, including its protocol error on malformed IDs.
@@ -127,12 +132,10 @@ export function parseTokenExchangeHttpJsonOperation(
     return { name: 'agent.card', kind: 'agent' };
   }
   if (method === 'POST' && path === '/message:send') {
-    const taskId = taskIdFromMessage(record(body));
-    return { name: 'message.send', kind: 'message', ...(taskId ? { taskId } : {}) };
+    return parseTokenExchangeJsonRpcOperation({ method: 'message/send', params: body });
   }
   if (method === 'POST' && path === '/message:stream') {
-    const taskId = taskIdFromMessage(record(body));
-    return { name: 'message.stream', kind: 'message', ...(taskId ? { taskId } : {}) };
+    return parseTokenExchangeJsonRpcOperation({ method: 'message/stream', params: body });
   }
   if (method === 'GET' && path === '/tasks') {
     return { name: 'task.read', kind: 'task-list' };
