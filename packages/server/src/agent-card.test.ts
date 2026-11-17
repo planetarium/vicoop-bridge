@@ -550,3 +550,17 @@ test('public caller runtime advertises required direct authentication', () => {
   assert.equal(card.capabilities.extensions?.some((e) => e.uri === OAUTH_FEDERATION_EXTENSION_URI), false);
   assert.equal(card.capabilities.extensions?.some((e) => e.uri === TRACEABILITY_EXTENSION_URI), false);
 });
+
+test('delegation advertises federation without leaking policy, while the restriction marker alone does not', async () => {
+  const { formatFederatedDelegation, FEDERATION_RESTRICTED } = await import('./auth/federated-delegation.js');
+  const { randomUUID } = await import('node:crypto');
+  const policy = formatFederatedDelegation({ id: randomUUID(), issuer: 'did:web:router.example', method: 'urn:vicoop:auth:verse8-user:v1' })!;
+  for (const active of [false, true]) {
+    const card = buildAgentA2XServer(fakeConn({ name: 'test', description: 'Delegation test', version: '1', protocolVersion: '0.3.0' }, {
+      allowedCallers: active ? [policy, FEDERATION_RESTRICTED] : [FEDERATION_RESTRICTED],
+      protocolCapabilities: [CALLER_CONTEXT_V2_CAPABILITY],
+    }), new InMemoryTaskStore(), new Registry(), { publicUrl: 'https://bridge.example', deviceFlowEnabled: false }).getAgentCard() as AgentCardV03;
+    assert.equal(card.capabilities.extensions?.some((e) => e.uri === OAUTH_FEDERATION_EXTENSION_URI) ?? false, active);
+    assert.ok(!JSON.stringify(card).includes('router.example'));
+  }
+});

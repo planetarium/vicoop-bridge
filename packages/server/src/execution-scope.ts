@@ -1,5 +1,6 @@
+import { parseFederatedDelegation } from './auth/federated-delegation.js';
 import { createHash } from 'node:crypto';
-import { ExecutionScopeV1, supportsExecutionScopeV1, FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY, parseFederatedPrincipal, executionScopePolicy, executionScopePreimage } from '@vicoop-bridge/protocol';
+import { ExecutionScopeV1, supportsExecutionScopeV1, FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY, formatFederatedPrincipal, parseFederatedPrincipal, executionScopePolicy, executionScopePreimage } from '@vicoop-bridge/protocol';
 
 /** Input is the executor's authenticated HTTP handoff, NOT public metadata. */
 export function resolveExecutionScope(input: {
@@ -19,9 +20,14 @@ export function resolveExecutionScope(input: {
     if (!input.capabilities?.includes(FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY) ||
         input.authorizationProfile !== 'https://mentionable.dev/ns/oauth-federation/v0.1' ||
         !input.authorizationKey) return undefined;
-    const tuple = parseFederatedPrincipal(input.authorizationKey);
+    const delegation = parseFederatedDelegation(input.authorizationKey);
+    const tuple = delegation
+      ? { issuer: delegation.issuer, method: delegation.method, subject: input.principalId }
+      : parseFederatedPrincipal(input.authorizationKey);
     if (!tuple || tuple.issuer !== input.actorId || tuple.subject !== input.principalId) return undefined;
-    principalId = input.authorizationKey;
+    const individual = formatFederatedPrincipal(tuple);
+    if (!individual) return undefined;
+    principalId = individual;
   } else if (parseFederatedPrincipal(principalId)) {
     // A direct identity may not impersonate a federated environment key.
     return undefined;

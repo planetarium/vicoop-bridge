@@ -340,3 +340,76 @@ test('resource authorization dispatches a non-Mentionable token to its registere
   assert.deepEqual(result, { ok: true });
   assert.deepEqual(received, { name: 'message.send', kind: 'message' });
 });
+
+test('shared delegation cannot acquire another subject task or revive an exact-grant task', async () => {
+  const caller = federatedCaller();
+  for (const patch of [
+    { principalId: 'other-user', authorizationKey: 'federated-key-1' },
+    { principalId: caller.principalId, authorizationKey: 'revoked-exact-key' },
+  ]) {
+    const result = await authorize(authorizationSql({ actorId: caller.tokenExchange!.actorId,
+      ...patch, active: true }), 'agent-1', caller,
+      { name: 'task.read', kind: 'task', taskId: 'task-1' });
+    assert.equal(result.ok, false);
+  }
+});
+
+test('federated messages check context ownership even without a task ID', async () => {
+  const caller = federatedCaller();
+  for (const inaccessible of [true, false]) {
+    const sql = (async () => [{ inaccessible }]) as unknown as Sql;
+    const result = await authorize(sql, 'agent-1', caller,
+      { name: 'message.send', kind: 'message', contextId: 'known-context' });
+    assert.equal(result.ok, !inaccessible);
+  }
+  assert.deepEqual(parseTokenExchangeJsonRpcOperation({ method: 'message/send', params: {
+    message: { contextId: 'context', referenceTaskIds: ['task'] },
+  } }), { name: 'message.send', kind: 'message', contextId: 'context', referenceTaskIds: ['task'] });
+  assert.deepEqual(parseTokenExchangeHttpJsonOperation('POST', '/message:send', {
+    message: { contextId: 'context', referenceTaskIds: ['task'] },
+  }), { name: 'message.send', kind: 'message', contextId: 'context', referenceTaskIds: ['task'] });
+});
+
+test('reference authorization bounds work, rejects malformed input, and deduplicates task reads', async () => {
+  for (const referenceTaskIds of ['task', [null], ['']]) {
+    assert.equal(parseTokenExchangeJsonRpcOperation({ method: 'message/send',
+      params: { message: { referenceTaskIds } } }), undefined);
+    assert.equal(parseTokenExchangeHttpJsonOperation('POST', '/message:send',
+      { message: { referenceTaskIds } }), undefined);
+  }
+  const caller = federatedCaller();
+  let queries = 0;
+  const underlying = authorizationSql({ actorId: caller.actorId!, principalId: caller.principalId,
+    authorizationKey: caller.tokenExchange!.allowedCaller, active: true });
+  const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
+    queries++;
+    return underlying(strings, ...values as never[]);
+  }) as unknown as Sql;
+  assert.deepEqual(await authorize(sql, 'agent-1', caller,
+    { name: 'message.send', kind: 'message', referenceTaskIds: Array(10_000).fill('task') }),
+  { ok: false, reason: 'too_many_reference_tasks' });
+  assert.equal(queries, 0);
+  assert.deepEqual(await authorize(sql, 'agent-1', caller,
+    { name: 'message.send', kind: 'message', referenceTaskIds: Array(32).fill('task') }), { ok: true });
+  assert.equal(queries, 1);
+});
+
+
+test('reference count limits apply only to federated authorization across both transports', async () => {
+  const noSql = (async () => { throw new Error('reference limit must not query storage'); }) as unknown as Sql;
+  for (const count of [33, 10_000]) {
+    const referenceTaskIds = Array(count).fill('task');
+    for (const operation of [
+      parseTokenExchangeJsonRpcOperation({ method: 'message/send', params: { message: { referenceTaskIds } } }),
+      parseTokenExchangeHttpJsonOperation('POST', '/message:send', { message: { referenceTaskIds } }),
+    ]) {
+      assert.ok(operation);
+      assert.equal(operation.referenceTaskIds?.length, count);
+      for (const caller of [undefined, { principalId: 'apikey:test' }]) {
+        assert.deepEqual(await authorize(noSql, 'agent-1', caller, operation), { ok: true });
+      }
+      assert.deepEqual(await authorize(noSql, 'agent-1', federatedCaller(), operation),
+        { ok: false, reason: 'too_many_reference_tasks' });
+    }
+  }
+});

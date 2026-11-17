@@ -76,3 +76,18 @@ test('federated admission fails closed for old clients, inconsistent identity, m
   ]) assert.equal(resolveExecutionScope({ ...federated, ...patch }), undefined);
   assert.equal(resolveExecutionScope({ ...input, principalId: federated.authorizationKey }), undefined);
 });
+
+test('shared delegation keeps individual workspaces and does not use its policy generation as identity', async () => {
+  const { formatFederatedDelegation } = await import('./auth/federated-delegation.js');
+  const { randomUUID } = await import('node:crypto');
+  const authorizationKey = formatFederatedDelegation({ ...tuple, id: randomUUID() })!;
+  const a = resolveExecutionScope({ ...federated, authorizationKey })!;
+  const b = resolveExecutionScope({ ...federated, authorizationKey, principalId: 'another-user' })!;
+  assert.ok(a);
+  assert.notEqual(a.id, b.id);
+  assert.equal(a.principalId, formatFederatedPrincipal(tuple));
+  assert.equal(a.id, resolveExecutionScope(federated)?.id);
+  const renewedPolicy = formatFederatedDelegation({ ...tuple, id: randomUUID() })!;
+  assert.equal(a.id, resolveExecutionScope({ ...federated, authorizationKey: renewedPolicy })?.id);
+  assert.equal(resolveExecutionScope({ ...federated, authorizationKey, actorId: 'did:web:intruder' }), undefined);
+});

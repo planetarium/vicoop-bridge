@@ -741,7 +741,8 @@ AS $$
 DECLARE
   current_callers TEXT[];
 BEGIN
-  IF p_authorization_key NOT LIKE 'federated:v1:%' THEN
+  IF p_authorization_key NOT LIKE 'federated:v1:%'
+     AND p_authorization_key NOT LIKE 'federated-delegation:v1:%' THEN
     RAISE EXCEPTION 'authorization key is not a canonical federated caller'
       USING ERRCODE = '22023';
   END IF;
@@ -1203,3 +1204,20 @@ CREATE TRIGGER agents_owner_revision BEFORE UPDATE ON agents
   FOR EACH ROW EXECUTE FUNCTION bump_agent_owner_revision();
 
 COMMENT ON COLUMN agents.owner_revision IS E'@omit create,update';
+
+-- Delegation is an explicit policy kind stored alongside legacy exact callers.
+-- The sticky restriction cannot be erased by generic or GraphQL policy writes.
+CREATE OR REPLACE FUNCTION preserve_federation_restriction() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF ('federation-restricted:v1' = ANY(OLD.allowed_callers)
+      OR EXISTS (SELECT 1 FROM unnest(NEW.allowed_callers) c WHERE c LIKE 'federated-delegation:v1:%'))
+     AND NOT ('federation-restricted:v1' = ANY(NEW.allowed_callers)) THEN
+    NEW.allowed_callers := array_append(NEW.allowed_callers, 'federation-restricted:v1');
+  END IF;
+  RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS preserve_federation_restriction_trigger ON agents;
+CREATE TRIGGER preserve_federation_restriction_trigger BEFORE UPDATE OF allowed_callers ON agents
+FOR EACH ROW EXECUTE FUNCTION preserve_federation_restriction();

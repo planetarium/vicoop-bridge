@@ -1241,3 +1241,65 @@ test('tool approval API requires current owner authority, rejects caller tokens 
     await sql.end();
   }
 });
+
+test('delegation owner API generations revoke tokens/tasks and never reopen public access', { skip: !hasDb }, async () => {
+  const sql = postgres(process.env.DATABASE_URL!);
+  const owner = `eth:0x${'6'.repeat(40)}`;
+  const setup = await setupOwner(sql, owner);
+  const taskId = `delegated-${setup.agentId}`;
+  try {
+    const registry = new Registry();
+    const app = createHttpApp({ db: sql, registry });
+    const trust = { issuer: 'did:web:router.example', method: 'urn:vicoop:auth:verse8-user:v1' };
+    const mutate = (method: 'POST' | 'DELETE', token = setup.ownerToken) => app.request(`/admin-api/agents/${setup.agentId}/federated-callers`, {
+      method, headers: { ...authHeaders(token), 'content-type': 'application/json' }, body: JSON.stringify(trust),
+    });
+    assert.equal((await mutate('POST', 'bad')).status, 401);
+    for (const subject of [null, '', 1, false]) {
+      for (const method of ['POST', 'DELETE']) {
+        const response = await app.request(`/admin-api/agents/${setup.agentId}/federated-callers`, {
+          method, headers: { ...authHeaders(setup.ownerToken), 'content-type': 'application/json' },
+          body: JSON.stringify({ ...trust, subject }),
+        });
+        assert.equal(response.status, 400);
+      }
+    }
+
+    const added = await mutate('POST');
+    assert.equal(added.status, 200);
+    const first = await added.json() as { principal: string; allowed_callers: string[] };
+    assert.ok(first.allowed_callers.includes('federation-restricted:v1'));
+    const listed = await app.request(`/admin-api/agents/${setup.agentId}/callers`, { headers: authHeaders(setup.ownerToken) });
+    assert.deepEqual((await listed.json() as { federated_callers: unknown[] }).federated_callers,
+      [{ principal: first.principal, ...trust }]);
+
+    const repeated = await mutate('POST');
+    assert.equal((await repeated.json() as { principal: string }).principal, first.principal);
+    const token = await issueTokenExchangeAccessToken(sql, {
+      profileId: 'https://mentionable.dev/ns/oauth-federation/v0.1', agentId: setup.agentId,
+      resource: `https://bridge.example/agents/${setup.agentId}`, principalId: 'verse8:test:1', actorId: trust.issuer,
+      allowedCaller: first.principal, scopes: ['a2a:message.send'], expiresAt: new Date(Date.now() + 300_000),
+    });
+    await sql`INSERT INTO infra.a2a_tasks (task_id, context_id, state, task_json, owner_principal, owner_agent, owner_actor, authorization_profile, authorization_key)
+      VALUES (${taskId}, ${taskId}, 'working', ${sql.json({ id: taskId })}, 'verse8:test:1', ${setup.agentId}, ${trust.issuer}, 'https://mentionable.dev/ns/oauth-federation/v0.1', ${first.principal})`;
+    assert.equal((await mutate('DELETE')).status, 200);
+    await assert.rejects(verifyTokenExchangeAccessToken(sql, token.rawToken, setup.agentId), /revoked/);
+    assert.equal((await loadTokenExchangeTaskAuthorization(sql, setup.agentId, taskId))?.authorizationRevoked, true);
+    const list = await app.request(`/admin-api/agents/${setup.agentId}/callers`, { headers: authHeaders(setup.ownerToken) });
+    const policy = await list.json() as { is_public: boolean; federated_callers: unknown[] };
+    assert.equal(policy.is_public, false);
+    assert.deepEqual(policy.federated_callers, []);
+    // Even direct policy replacement retains the sticky restricted state.
+    await sql`UPDATE agents SET allowed_callers = '{}' WHERE id = ${setup.agentId}`;
+    const [stored] = await sql`SELECT allowed_callers FROM agents WHERE id = ${setup.agentId}`;
+    assert.deepEqual(stored.allowed_callers, ['federation-restricted:v1']);
+    const second = await (await mutate('POST')).json() as { principal: string };
+    assert.notEqual(second.principal, first.principal);
+    await assert.rejects(verifyTokenExchangeAccessToken(sql, token.rawToken, setup.agentId), /revoked/);
+    assert.equal((await loadTokenExchangeTaskAuthorization(sql, setup.agentId, taskId))?.authorizationRevoked, true);
+  } finally {
+    await sql`DELETE FROM infra.a2a_tasks WHERE task_id = ${taskId}`;
+    await teardown(sql, owner, setup.clientId);
+    await sql.end();
+  }
+});

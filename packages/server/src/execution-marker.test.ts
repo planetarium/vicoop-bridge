@@ -29,6 +29,8 @@ test('dispatch marker: persisted before dispatch, survives unbind, replaced per 
   const sql = postgres(process.env.DATABASE_URL!, { onnotice() {} });
   await ensureSchema(sql);
   const agentId = `execution-marker-${randomUUID()}`;
+  await sql`INSERT INTO agents (id, owner_principal, name, token_hash)
+    VALUES (${agentId}, 'owner', 'marker test', ${agentId})`;
   const sent: DownFrame[] = [];
   const logs: string[] = [];
   const originalLog = console.log;
@@ -50,6 +52,7 @@ test('dispatch marker: persisted before dispatch, survives unbind, replaced per 
     }
     console.log = originalLog;
     await sql`DELETE FROM infra.a2a_tasks WHERE owner_agent = ${agentId}`;
+    await sql`DELETE FROM agents WHERE id = ${agentId}`;
     await sql.end();
   });
 

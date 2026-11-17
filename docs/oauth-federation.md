@@ -114,6 +114,10 @@ DELETE /admin-api/agents/:id/federated-callers
 {"issuer":"did:web:connector.example","method":"urn:mentionable:auth:slack-workspace-member:v0.1","subject":"slack:T123/U456"}
 ```
 
+Omitting `subject` from the same endpoint (or `--subject` from the commands)
+configures issuer/method delegation instead of an exact grant. Assertions still
+require an individual subject. See [Router delegation](manage-federated-callers.md#delegate-user-authorization-to-a-router).
+
 The ordinary callers response includes both the canonical `allowed_callers`
 array and a decoded `federated_callers` array. Mutations update the serving
 instance immediately and use PostgreSQL notifications for cross-instance
@@ -123,7 +127,8 @@ Re-adding the same tuple authorizes future exchanges but cannot reactivate
 those tokens or task bindings.
 
 As elsewhere in the bridge, an empty `allowed_callers` array means the agent
-is public for new messages. Add a replacement caller before removing the last
+is public for new messages. After delegation has been enabled, a persistent
+restriction marker prevents an empty public policy. For exact-only agents, add a replacement caller before removing the last
 federated tuple if the agent must remain restricted. Previously created
 federated tasks remain token-protected even when the agent becomes public.
 
@@ -213,3 +218,17 @@ denies every federated token.
 6. Repeat message send and task read through v0.3 JSON-RPC, v1 JSON-RPC, and v1
    HTTP+JSON. Wrong resource, audience, method, issuer/client equality, replayed
    `jti`, expired assertion, unsupported scope, and any `actor_token` must fail.
+
+
+## Optional issuer/method delegation
+
+Bridge also supports an explicit owner-configured issuer/method delegation policy
+for trusted Routers. It uses the same signed assertion wire profile but does not
+require one exact grant per subject. Exact grants remain unchanged and take
+precedence. Each token/task pins the authorizing policy generation while runtime
+isolation continues to use the full issuer/method/subject identity. For owner
+API/CLI configuration, revocation, discovery and rollback behavior, see
+[Delegate user authorization to a Router](manage-federated-callers.md#delegate-user-authorization-to-a-router).
+
+Federated messages accept at most 32 non-empty task IDs in `referenceTaskIds`.
+Repeated IDs are authorized once; malformed or oversized lists fail closed before task lookups.

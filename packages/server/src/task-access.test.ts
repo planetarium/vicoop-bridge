@@ -355,6 +355,8 @@ test('task access is bound to the authenticated caller across transports (issue 
     });
 
     await t.test('public transition hides private/legacy tasks; newly public tasks remain shared', async () => {
+      await sql`INSERT INTO agents (id, owner_principal, name, token_hash)
+        VALUES (${agentId}, ${principals[1]!}, 'task access', ${agentId})`;
       publicAgent = true;
       app = buildApp();
       await denied(await rpc(undefined, 'tasks/get', { id: a.id }));
@@ -379,6 +381,7 @@ test('task access is bound to the authenticated caller across transports (issue 
     });
   } finally {
     await sql`DELETE FROM infra.a2a_tasks WHERE owner_agent IN (${agentId}, ${otherAgent})`;
+    await sql`DELETE FROM agents WHERE id = ${agentId}`;
     for (const token of issued) await sql`DELETE FROM callers WHERE id=${token.callerId}`;
     await sql.end();
   }

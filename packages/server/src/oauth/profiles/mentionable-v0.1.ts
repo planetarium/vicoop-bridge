@@ -1,3 +1,4 @@
+import { parseFederatedDelegation, selectFederatedAuthorization } from '../../auth/federated-delegation.js';
 import { createHash } from 'node:crypto';
 import { CallerAttestationV2 } from '@vicoop-bridge/protocol';
 export * from '@mentionable/connector-kit';
@@ -21,7 +22,7 @@ import {
   type TokenExchangeVerifyResult,
 } from '@mentionable/connector-kit/signing';
 import { decodeJwt, decodeProtectedHeader } from 'jose';
-import { formatFederatedPrincipal, parseFederatedPrincipal } from '../../auth/principal.js';
+import { parseFederatedPrincipal } from '../../auth/principal.js';
 import type { DidDocumentResolver, ResolvedDidDocument } from '../../identity-vc/types.js';
 import {
   consumeTokenExchangeReplays,
@@ -262,11 +263,11 @@ export function createMentionableOAuthProfile(
               let matchedAuthorizationKey: string | undefined;
               if (candidate.kind === 'platform') {
                 matchedAuthorizationKey =
-                  formatFederatedPrincipal({
+                  selectFederatedAuthorization(allowedCallers, {
                     issuer: candidate.issuer,
                     method: candidate.method,
                     subject: candidate.subject,
-                  }) ?? undefined;
+                  });
                 if (
                   matchedAuthorizationKey === undefined ||
                   !allowedCallers.includes(matchedAuthorizationKey)
@@ -413,7 +414,10 @@ export function createMentionableOAuthProfile(
         );
       }
 
-      const parsedTuple = parseFederatedPrincipal(authorizationKey!);
+      const delegated = parseFederatedDelegation(authorizationKey!);
+      const parsedTuple = delegated
+        ? { issuer: delegated.issuer, method: delegated.method, subject: context.principal }
+        : parseFederatedPrincipal(authorizationKey!);
       if (!parsedTuple) {
         return failure(
           500,

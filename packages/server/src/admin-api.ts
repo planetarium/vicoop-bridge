@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { FEDERATION_RESTRICTED, formatFederatedDelegation, parseFederatedDelegation } from './auth/federated-delegation.js';
 // Deterministic admin operations exposed by the admin agent's LLM tools and
 // by the /admin-api/* HTTP routes. Centralising the logic here means both
 // callers share the same RLS handling, registry hot-reload, and idempotency
@@ -44,10 +46,11 @@ const INVALID_PRINCIPAL_MESSAGE =
   'or a canonical federated:v1 principal.';
 
 const INVALID_FEDERATED_CALLER_MESSAGE =
-  'Invalid federated caller. Expected an exact did:web issuer, method, and subject ' +
-  'whose canonical encoding is at most 512 bytes.';
+  'Invalid federated caller. Expected an exact did:web issuer and method, with an optional non-empty subject. ' +
+  'Omit subject to delegate issuer/method authorization; the canonical encoding must be at most 512 bytes.';
 
-export interface FederatedCallerResult extends FederatedPrincipalInput {
+export interface FederatedCallerResult extends Omit<FederatedPrincipalInput, 'subject'> {
+  subject?: string;
   principal: string;
 }
 
@@ -56,6 +59,7 @@ export interface CallerListResult {
   owner_principal: string;
   allowed_callers: string[];
   federated_callers: FederatedCallerResult[];
+  federation_restricted: boolean;
   is_public: boolean;
   created_at?: string;
   updated_at?: string;
@@ -245,9 +249,10 @@ export async function addFederatedCaller(
   registry: Registry,
   principalId: string,
   agentId: string,
-  input: FederatedPrincipalInput,
+  input: Omit<FederatedPrincipalInput, 'subject'> & { subject?: string },
 ): Promise<CallerMutationResult> {
-  const principal = formatFederatedPrincipal(input);
+  if (input.subject === undefined) return mutateFederatedDelegation(db, registry, principalId, agentId, input, true);
+  const principal = formatFederatedPrincipal({ ...input, subject: input.subject });
   if (!principal) throw new AdminApiError(INVALID_FEDERATED_CALLER_MESSAGE, 400);
   return addCaller(db, registry, principalId, agentId, principal);
 }
@@ -257,11 +262,51 @@ export async function removeFederatedCaller(
   registry: Registry,
   principalId: string,
   agentId: string,
-  input: FederatedPrincipalInput,
+  input: Omit<FederatedPrincipalInput, 'subject'> & { subject?: string },
 ): Promise<CallerMutationResult> {
-  const principal = formatFederatedPrincipal(input);
+  if (input.subject === undefined) return mutateFederatedDelegation(db, registry, principalId, agentId, input, false);
+  const principal = formatFederatedPrincipal({ ...input, subject: input.subject });
   if (!principal) throw new AdminApiError(INVALID_FEDERATED_CALLER_MESSAGE, 400);
   return removeCaller(db, registry, principalId, agentId, principal);
+}
+
+/** Add or revoke an explicit issuer/method delegation under an agent-row lock. */
+async function mutateFederatedDelegation(
+  db: Sql, registry: Registry, principalId: string, agentId: string,
+  input: { issuer: string; method: string }, adding: boolean,
+): Promise<CallerMutationResult> {
+  const proposed = formatFederatedDelegation({ ...input, id: randomUUID() });
+  if (!proposed) throw new AdminApiError('Invalid delegation issuer or method', 400);
+  const result = await db.begin(async (tx) => {
+    await setRlsContext(tx, principalId);
+    const rows = await tx<{ allowed_callers: string[] }[]>`
+      SELECT allowed_callers FROM agents
+      WHERE id = ${agentId} AND (owner_principal = ${principalId} OR is_admin())
+      FOR UPDATE
+    `;
+    if (!rows[0]) throw new AdminApiError('Agent not found or not authorized.', 404);
+    const callers = rows[0].allowed_callers;
+    const existing = callers.find((key) => {
+      const parsed = parseFederatedDelegation(key);
+      return parsed?.issuer === input.issuer && parsed.method === input.method;
+    });
+    if (adding) {
+      if (existing) return { agent_id: agentId, principal: existing, allowed_callers: callers, message: 'Delegation already exists' };
+      const next = [...callers, proposed];
+      if (!next.includes(FEDERATION_RESTRICTED)) next.push(FEDERATION_RESTRICTED);
+      await tx`UPDATE agents SET allowed_callers = ${next}, updated_at = now() WHERE id = ${agentId}`;
+      return { agent_id: agentId, principal: proposed, allowed_callers: next };
+    }
+    if (!existing) return { agent_id: agentId, principal: '', allowed_callers: callers, message: 'Delegation not found' };
+    const [removed] = await tx<{ allowed_callers: string[] }[]>`
+      SELECT allowed_callers FROM revoke_federated_caller_authorization(${agentId}, ${existing})
+    `;
+    return { agent_id: agentId, principal: existing, allowed_callers: removed.allowed_callers };
+  });
+  registry.updateAllowedCallers(agentId, result.allowed_callers);
+  await notifyCallerPolicyChanged(db, agentId);
+  logEvent('federated_delegation_changed', { agentId, changedBy: principalId, action: adding ? 'add' : 'remove', policy: result.principal, changed: !result.message });
+  return result;
 }
 
 export async function listCallers(
@@ -285,10 +330,13 @@ export async function listCallers(
     agent_id: policy.agent_id as string,
     owner_principal: policy.owner_principal as string,
     allowed_callers: callers,
-    federated_callers: callers.flatMap((principal) => {
-      const parsed = parseFederatedPrincipal(principal);
-      return parsed ? [{ principal, ...parsed }] : [];
+    federated_callers: callers.flatMap<FederatedCallerResult>((principal) => {
+      const exact = parseFederatedPrincipal(principal);
+      if (exact) return [{ principal, ...exact }];
+      const delegated = parseFederatedDelegation(principal);
+      return delegated ? [{ principal, issuer: delegated.issuer, method: delegated.method }] : [];
     }),
+    federation_restricted: callers.includes(FEDERATION_RESTRICTED),
     is_public: callers.length === 0,
     created_at: policy.created_at instanceof Date ? policy.created_at.toISOString() : policy.created_at as string | undefined,
     updated_at: policy.updated_at instanceof Date ? policy.updated_at.toISOString() : policy.updated_at as string | undefined,

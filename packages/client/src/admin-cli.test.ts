@@ -812,6 +812,8 @@ test('agent callers {list,remove,issue-api-key} parse through the real parser wi
       '--method', federatedArgs.method,
       '--subject', federatedArgs.subject,
     ], { action, agentId: 'foo', ...federatedArgs });
+    expectOk(['agent', 'callers', subcommand, 'foo', '--issuer', federatedArgs.issuer, '--method', federatedArgs.method],
+      { action, agentId: 'foo', issuer: federatedArgs.issuer, method: federatedArgs.method, subject: undefined });
   }
   // `issue` is in the same tie-class (AGENT_ID positional vs the all-optional
   // top-level `list`/`remove`) — it must keep its AGENT_ID through the parser.
@@ -1185,4 +1187,35 @@ test('agent transfer stops on a rejected preview', async (t) => {
   const { calls } = installFetch(t, { status: 403, body: { error: 'admin only' } });
   assert.equal(await runAgentTransfer({ action: 'agent-transfer', server: BRIDGE, token: TOKEN, agentId: 'foo', to: 'new', yes: true, json: true }), 1);
   assert.equal(calls.length, 1);
+});
+
+
+test('delegation CLI uses structured issuer/method policy API without a subject', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  captureStdout(t);
+  const { calls } = installFetch(t, { body: { agent_id: 'foo', allowed_callers: [] } });
+  const args = { ...SHARED, agentId: 'foo', issuer: 'did:web:router.example', method: 'urn:vicoop:auth:verse8-user:v1', subject: undefined };
+  assert.equal(await runAgentCallersAddFederated({ ...args, action: 'agent-callers-add-federated' }), 0);
+  assert.equal(await runAgentCallersRemoveFederated({ ...args, action: 'agent-callers-remove-federated' }), 0);
+  assert.deepEqual(calls.map((call) => [call.method, call.url]), [
+    ['POST', `${BRIDGE}/admin-api/agents/foo/federated-callers`],
+    ['DELETE', `${BRIDGE}/admin-api/agents/foo/federated-callers`],
+  ]);
+  assert.deepEqual(JSON.parse(calls[0].body!), { issuer: 'did:web:router.example', method: 'urn:vicoop:auth:verse8-user:v1' });
+});
+
+
+test('callers list presents subject-omitted grants in the existing federated table', async (t) => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const stdout = captureStdout(t);
+  installFetch(t, { body: {
+    allowed_callers: ['federated-delegation:v1:opaque', 'federation-restricted:v1'],
+    federation_restricted: true,
+    federated_callers: [{ principal: 'federated-delegation:v1:opaque', issuer: 'did:web:router.example', method: federatedArgs.method }],
+  } });
+  assert.equal(await runAgentCallersList(agentCallersListArgsFn('foo')), 0);
+  assert.match(stdout.read(), /FEDERATED CALLERS/);
+  assert.match(stdout.read(), /\(all subjects\)/);
+  assert.match(stdout.read(), /Restricted:/);
+  assert.doesNotMatch(stdout.read(), /FEDERATED DELEGATIONS/);
 });

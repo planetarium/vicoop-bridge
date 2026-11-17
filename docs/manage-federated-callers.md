@@ -24,8 +24,9 @@ For example:
 
 This permits only Connector `did:web:connector.example` to present the exact
 subject `slack:T123/U456` under the exact named method. There are no issuer,
-workspace, method, or subject wildcards. Register each allowed subject as a
-separate tuple.
+workspace, method, or subject wildcard strings. For exact grants, register each
+allowed subject as a separate tuple. To delegate all subjects under one exact
+issuer and method, omit `--subject` as described in [Router delegation](#delegate-user-authorization-to-a-router).
 
 `add-federated` configures receiver-owned authorization policy. It does not
 issue an access token, register the Connector globally, resolve its DID, or
@@ -313,3 +314,82 @@ The bridge retries a key miss or signature mismatch once with a bounded forced
 DID refresh. DNS, timeout, and upstream failures during either lookup return a
 retryable OAuth `server_error`; restore DID endpoint reachability before
 retrying with freshly minted assertions.
+
+## Delegate user authorization to a Router
+
+An owner can explicitly trust one exact Connector issuer and authentication
+method for an agent. This allows that Connector to authorize individual subjects
+without pre-registering every subject. Use this only for a Router that enforces
+its own user eligibility and resource policy before signing each assertion.
+
+```sh
+vicoop-client agent callers add-federated AGENT_ID \
+  --issuer did:web:router.example \
+  --method urn:vicoop:auth:verse8-user:v1
+vicoop-client agent callers list AGENT_ID --json
+vicoop-client agent callers remove-federated AGENT_ID \
+  --issuer did:web:router.example \
+  --method urn:vicoop:auth:verse8-user:v1
+```
+
+Use the existing commands without `--subject` for delegation; include it for an
+exact subject grant. Subject assertions still require an individual `sub`.
+
+The owner API exposes `POST` and `DELETE` at
+`/admin-api/agents/:id/federated-callers` with `{ "issuer": "did:web:router.example",
+"method": "urn:vicoop:auth:verse8-user:v1" }`. Both require the same owner session
+and ownership checks as exact caller management. Omit `subject` entirely for
+delegation; `null`, empty strings, and non-string values are rejected. `callers` inspection includes
+`federated_callers` (principal, issuer, method, and optional subject) and
+`federation_restricted`. A missing subject denotes issuer/method delegation;
+copy its issuer and method back to the same API to remove it.
+The structured API emits a `federated_delegation_changed` audit log with operator,
+agent, action and policy generation. No user source tokens are recorded.
+
+Delegations are explicitly typed `federated-delegation:v1:` policy entries in
+`allowed_callers`, separate from `federated:v1:` exact subjects. They contain a
+server-generated immutable UUID. Repeated addition is idempotent; removal and
+re-addition creates a new generation. Generic caller add/remove rejects these
+entries. Do not edit encoded records manually. Exact grants take precedence for
+new exchanges; a task's original authorization key is pinned. Removing an exact
+grant cannot transfer its tasks to an overlapping delegation.
+
+This is a Bridge receiver-policy extension using the existing Mentionable v0.1
+assertion wire format, not a new subject wildcard in the exact-grant format.
+Discovery advertises federation when an active exact grant or delegation is
+present; it does not publish trusted issuers or subjects. Existing connectors
+continue to submit signed client and subject assertions. All signature, type,
+audience, resource, scope, lifetime and replay checks remain in force.
+
+The Router DID is issuer/client/actor; the individual subject remains principal.
+Execution scopes use the full issuer/method/subject tuple, not the shared policy
+ID, so two users never share a workspace. Stable users retain their workspace
+across token renewal. Task and context access also checks the original policy,
+principal and actor. A re-added policy does not revive historical task/context
+bindings even though the same user's workspace identity remains stable.
+
+After the first delegation is configured, the sticky
+`federation-restricted:v1` marker keeps the agent restricted even after every
+active rule is removed. The database preserves it through policy replacement;
+it is not an authorizing principal and cannot be removed through generic caller
+commands. This deliberately differs from the legacy exact-only empty-list
+public convention. Rollback to an older server remains fail-closed for these
+unknown entries; delegation requires the upgraded server. No automatic public
+conversion or downgrade migration is provided.
+
+Revocation and token issuance serialize on the agent policy row. Resource-token
+checks and task-policy checks read PostgreSQL on each request, independently of
+best-effort registry notifications. The anonymous fast path refreshes an empty
+registry policy from the database before admitting requests. Database lookup
+errors fail closed. Cards may remain stale until notification/reconnect, but
+stale discovery cannot authorize an exchange or resource request. Already
+admitted operations and streams are not automatically canceled.
+
+Bridge access tokens last at most 300 seconds. Individual Verse8 agreement
+removal is Router's responsibility: Router stops admitting that user and issuing
+new assertions within its documented verification/cache bounds. Existing Bridge
+tokens may remain usable for their remaining lifetime unless the entire
+delegation is revoked. Bridge never receives the raw Verse8 token or queries
+agreements. Removing a delegation revokes its tokens and tombstones task bindings
+transactionally. See planetarium/vicoop-router#174 for the corresponding ingress
+contract and interoperability test.
