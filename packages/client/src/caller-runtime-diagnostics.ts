@@ -37,6 +37,7 @@ export function callerFailureDiagnostic(error: unknown): Record<string, unknown>
   // emit only fields from our typed error; arbitrary cause/message/name is unsafe.
   let current = error;
   for (let depth = 0; depth < 4 && current instanceof Error; depth++, current = current.cause) {
+    if (current instanceof CommandExecutionError) return { code: `docker_${current.code}` };
     if (current instanceof CallerDockerError) return {
       code: current.code,
       operation: current.operation,

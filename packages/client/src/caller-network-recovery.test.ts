@@ -9,7 +9,8 @@ import { CallerDockerError } from './caller-runtime-diagnostics.js';
 import { scopeDigest } from './caller-runtime-store.js';
 import type { AsyncDockerRun } from './docker-command.js';
 
-test('network exhaustion preserves retained callers and storage; only explicit validated recovery resumes allocation', async t => {
+for (const recoveryFailure of [undefined, 'create', 'start', 'exec', 'stop'])
+test(`network exhaustion and recovery failure at ${recoveryFailure ?? 'none'} preserve caller storage`, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'caller-network-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const options = CallerRuntimeConfig.parse({ image: `sha256:${'a'.repeat(64)}`, stateDirectory: directory });
@@ -29,7 +30,7 @@ test('network exhaustion preserves retained callers and storage; only explicit v
     stdout: "",
     stderr: `No such ${kind}`,
   });
-  const run: AsyncDockerRun = async (args) => {
+  const baseRun: AsyncDockerRun = async (args) => {
     calls.push([...args]);
     if (args[0] === 'network' && args[1] === 'create' && exhausted)
       return { exitCode: 1, stdout: '', stderr: 'Error response from daemon: all predefined address pools have been fully subnetted' };
@@ -153,6 +154,17 @@ test('network exhaustion preserves retained callers and storage; only explicit v
     throw new Error(`Unexpected command ${args.join(" ")}`);
   };
 
+  let failOperation: string | undefined;
+  const run: AsyncDockerRun = async (args, opts) => {
+    const result = await baseRun(args, opts);
+    if (failOperation && args[0] === failOperation) {
+      failOperation = undefined;
+      // Docker accepted the mutation but the CLI reported failure: cleanup must
+      // reconcile the real resource, rather than assuming nothing was created.
+      return { exitCode: 1, stdout: '', stderr: 'injected failure after daemon mutation' };
+    }
+    return result;
+  };
   const make = () => new DockerCallerRuntimePool('claude', options, 'agent', run);
   let pool = make();
   await pool.initialize();
@@ -209,7 +221,27 @@ test('network exhaustion preserves retained callers and storage; only explicit v
   await pool.initialize(false, true);
   exhausted = false;
   const before = calls.length;
-  await pool.recover(bob);
+  if (recoveryFailure) {
+    failOperation = recoveryFailure;
+    await assert.rejects(pool.recover(bob), /docker_nonzero_exit/);
+    assert.equal(await pool.store.allocationComplete(bob), recoveryFailure === 'stop');
+    await pool.close();
+    assert.equal(containers.get(pool.name(bob)).State.Running, false);
+    assert.deepEqual([...volumes].sort(), beforeRecoveryVolumes.sort());
+    // An accepted create requires the existing explicit recreate path. Never
+    // pretend the allocation lacked a container or overwrite its retained data.
+    pool = make();
+    await pool.initialize(false, true);
+    await assert.rejects(pool.recover(bob), /incomplete allocation/);
+    await pool.remove(bob, false);
+    await pool.close();
+    pool = make();
+    await pool.initialize();
+    await pool.acquire(bob, undefined, 'bob');
+    await pool.stop(bob);
+  } else {
+    await pool.recover(bob);
+  }
   assert.equal(await pool.store.allocationComplete(bob), true);
   assert.equal((await pool.describe(bob)).state, 'stopped');
   assert.deepEqual([...volumes].sort(), beforeRecoveryVolumes.sort());

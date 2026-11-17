@@ -41,3 +41,12 @@ test('timeout, abort and output limits are separate from nonzero network exit', 
     assert.ok(!JSON.stringify(callerFailureDiagnostic(error)).includes('SECRET'));
   }
 });
+
+test('bare typed command failures retain safe codes through cleanup causes without invented metadata', () => {
+  for (const code of ['timeout', 'aborted', 'output_limit'] as const) {
+    const failure = new CommandExecutionError(code, 'SECRET');
+    for (const error of [failure, new Error('SECRET', { cause: failure })]) {
+      assert.deepEqual(callerFailureDiagnostic(error), { code: `docker_${code}` });
+    }
+  }
+});
