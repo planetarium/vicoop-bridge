@@ -108,7 +108,7 @@ export function parseTokenExchangeJsonRpcOperation(
   const message = base.kind === 'message' ? record(params?.message) : undefined;
   const contextId = stringField(message?.contextId);
   const references = message?.referenceTaskIds;
-  if (references !== undefined && (!Array.isArray(references) || references.length > MAX_REFERENCE_TASK_IDS ||
+  if (references !== undefined && (!Array.isArray(references) ||
       references.some(id => typeof id !== 'string' || id.length === 0))) return undefined;
   return { ...base, ...(taskId !== undefined ? { taskId } : {}), ...(contextId ? { contextId } : {}), ...(references ? { referenceTaskIds: references } : {}) };
 }
