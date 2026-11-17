@@ -369,3 +369,27 @@ test('federated messages check context ownership even without a task ID', async 
     message: { contextId: 'context', referenceTaskIds: ['task'] },
   }), { name: 'message.send', kind: 'message', contextId: 'context', referenceTaskIds: ['task'] });
 });
+
+test('reference authorization bounds work, rejects malformed input, and deduplicates task reads', async () => {
+  for (const referenceTaskIds of ['task', [null], [''], Array(10_000).fill('task')]) {
+    assert.equal(parseTokenExchangeJsonRpcOperation({ method: 'message/send',
+      params: { message: { referenceTaskIds } } }), undefined);
+    assert.equal(parseTokenExchangeHttpJsonOperation('POST', '/message:send',
+      { message: { referenceTaskIds } }), undefined);
+  }
+  const caller = federatedCaller();
+  let queries = 0;
+  const underlying = authorizationSql({ actorId: caller.actorId!, principalId: caller.principalId,
+    authorizationKey: caller.tokenExchange!.allowedCaller, active: true });
+  const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
+    queries++;
+    return underlying(strings, ...values as never[]);
+  }) as unknown as Sql;
+  assert.deepEqual(await authorize(sql, 'agent-1', caller,
+    { name: 'message.send', kind: 'message', referenceTaskIds: Array(10_000).fill('task') }),
+  { ok: false, reason: 'too_many_reference_tasks' });
+  assert.equal(queries, 0);
+  assert.deepEqual(await authorize(sql, 'agent-1', caller,
+    { name: 'message.send', kind: 'message', referenceTaskIds: Array(32).fill('task') }), { ok: true });
+  assert.equal(queries, 1);
+});

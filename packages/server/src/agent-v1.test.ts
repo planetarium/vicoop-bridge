@@ -27,7 +27,8 @@ const callerRuntimeCapabilities = [
 ];
 
 function fakeSql(): Sql {
-  return (async () => []) as unknown as Sql;
+  return (async (strings: TemplateStringsArray) => strings.join('').includes('SELECT allowed_callers')
+    ? [{ allowed_callers: [] }] : []) as unknown as Sql;
 }
 
 function registerAgent(registry: Registry, allowedCallers: string[] = []): void {

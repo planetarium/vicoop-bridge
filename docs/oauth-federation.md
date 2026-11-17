@@ -224,3 +224,6 @@ precedence. Each token/task pins the authorizing policy generation while runtime
 isolation continues to use the full issuer/method/subject identity. For owner
 API/CLI configuration, revocation, discovery and rollback behavior, see
 [Delegate user authorization to a Router](manage-federated-callers.md#delegate-user-authorization-to-a-router).
+
+Federated messages accept at most 32 non-empty task IDs in `referenceTaskIds`.
+Repeated IDs are authorized once; malformed or oversized lists fail closed before task lookups.

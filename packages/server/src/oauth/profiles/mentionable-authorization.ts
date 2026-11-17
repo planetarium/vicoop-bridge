@@ -1,3 +1,4 @@
+import { MAX_REFERENCE_TASK_IDS } from '../token-exchange/authorization.js';
 import {
   isTokenExchangeAuthorizationActive,
   loadTokenExchangeTaskAuthorization,
@@ -42,6 +43,9 @@ export async function authorizeMentionableOperation({
     return { ok: false as const, reason: 'federated_task_list_not_supported' };
   }
   if (operation.kind === 'message') {
+    if ((operation.referenceTaskIds?.length ?? 0) > MAX_REFERENCE_TASK_IDS) {
+      return { ok: false as const, reason: 'too_many_reference_tasks' };
+    }
     // Context IDs and task references must not revive a revoked grant or
     // cross a subject/actor boundary under a shared delegation policy.
     if (operation.contextId) {
@@ -58,7 +62,7 @@ export async function authorizeMentionableOperation({
       `;
       if (rows[0]?.inaccessible !== false) return { ok: false as const, reason: 'context_not_accessible' };
     }
-    for (const taskId of operation.referenceTaskIds ?? []) {
+    for (const taskId of new Set(operation.referenceTaskIds ?? [])) {
       const reference = await loadTokenExchangeTaskAuthorization(sql, agentId, taskId);
       if (!reference || reference.authorizationRevoked || reference.principalId !== caller.principalId ||
           reference.actorId !== tokenExchange.actorId || reference.profileId !== tokenExchange.profileId ||

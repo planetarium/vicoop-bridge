@@ -16,6 +16,8 @@ export type TokenExchangeOperationName =
   | 'task.resubscribe'
   | 'task.push-config';
 
+export const MAX_REFERENCE_TASK_IDS = 32;
+
 export interface TokenExchangeOperation {
   name: TokenExchangeOperationName;
   kind: 'message' | 'task' | 'task-list' | 'agent';
@@ -105,7 +107,9 @@ export function parseTokenExchangeJsonRpcOperation(
       : taskIdFromParams(params);
   const message = base.kind === 'message' ? record(params?.message) : undefined;
   const contextId = stringField(message?.contextId);
-  const references = Array.isArray(message?.referenceTaskIds) ? message.referenceTaskIds.filter((id): id is string => typeof id === 'string') : undefined;
+  const references = message?.referenceTaskIds;
+  if (references !== undefined && (!Array.isArray(references) || references.length > MAX_REFERENCE_TASK_IDS ||
+      references.some(id => typeof id !== 'string' || id.length === 0))) return undefined;
   return { ...base, ...(taskId !== undefined ? { taskId } : {}), ...(contextId ? { contextId } : {}), ...(references ? { referenceTaskIds: references } : {}) };
 }
 
