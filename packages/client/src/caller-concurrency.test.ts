@@ -1,3 +1,4 @@
+import { CallerDockerError } from './caller-runtime-diagnostics.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CallerScopedBackend, type CallerWorker } from './caller-scoped-backend.js';
@@ -168,3 +169,27 @@ for (const kind of ['claude', 'codex'] as const) {
     await f.backend.close();
   });
 }
+
+test('context allocation logs safe network diagnostics and releases the slot for another caller', async t => {
+  const f = fixture('codex');
+  const logs: unknown[][] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logs.push(args); });
+  const acquire = f.pool.acquireContext.bind(f.pool);
+  f.pool.acquireContext = async (id, context, signal, principal, reserved) => {
+    if (principal !== 'alice') return acquire(id, context, signal, principal, reserved);
+    reserved();
+    throw new CallerDockerError('network create', 80, {
+      exitCode: 1, stdout: 'PRIVATE', stderr: 'all predefined address pools have been fully subnetted PRIVATE',
+    });
+  };
+  const failed = f.run(task('failed'));
+  await failed.done;
+  assert.equal((failed.frames.at(-1) as any).error.code, 'runtime_failed');
+  assert.ok(!JSON.stringify(failed.frames).includes('docker_address_pool'));
+  assert.ok(JSON.stringify(logs).includes('docker_address_pool_exhausted'));
+  assert.ok(!JSON.stringify(logs).includes('PRIVATE'));
+  const other = f.run(task('other', 'other', 'bob'));
+  await other.done;
+  assert.equal(other.frames.at(-1)?.type, 'task.complete');
+  await f.backend.close();
+});

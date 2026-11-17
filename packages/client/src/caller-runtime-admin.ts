@@ -46,6 +46,9 @@ export const callerContainerCommands = longestMatch(
   command('validate', object({ ...commonOptions(), validate: constant(true) }), {
     brief: message`Validate the configured image and retained container limits without starting workloads (daemon must be stopped).`,
   }),
+  command('recover', object({ ...commonOptions(), recoverScope: scope() }), {
+    brief: message`Resume an incomplete allocation using validated existing storage (daemon must be stopped).`,
+  }),
   command('recreate', object({ ...commonOptions(), recreateScope: scope() }), {
     brief: message`Remove a stopped caller container/network; retain its files and recreate it on the next request.`,
   }),
@@ -81,12 +84,13 @@ export async function runCallerState(args: {
   setupPending?: boolean;
   deleteScope?: string;
   recreateScope?: string;
+  recoverScope?: string;
 }) {
   for (const value of [args.inspectPrincipal, args.preparePrincipal, args.setupPrincipal])
     if (value !== undefined && (!value.trim() || value.length > 512)) throw new Error('principal ID must contain 1 to 512 characters');
-  if ([args.inspectPrincipal, args.preparePrincipal, args.setupPrincipal, args.deleteScope, args.recreateScope].filter((v) => v !== undefined).length > 1)
-    throw new Error('select either one principal operation, deletion or recreation');
-  for (const value of [args.deleteScope, args.recreateScope])
+  if ([args.inspectPrincipal, args.preparePrincipal, args.setupPrincipal, args.deleteScope, args.recreateScope, args.recoverScope].filter((v) => v !== undefined).length > 1)
+    throw new Error('select either one principal operation, deletion, recreation or recovery');
+  for (const value of [args.deleteScope, args.recreateScope, args.recoverScope])
     if (value !== undefined && !/^[a-f0-9]{64}$/.test(value))
       throw new Error('scope must be a non-empty 64-character lowercase hexadecimal digest');
   if (args.deleteScope !== undefined && args.recreateScope !== undefined)
@@ -100,9 +104,10 @@ export async function runCallerState(args: {
     config.backends?.[kind]?.caller_runtime,
   );
   const pool = new DockerCallerRuntimePool(kind, options, config.agent_id);
-  const ids = await pool.initialize(false, (args.validate ?? false) || args.preparePrincipal !== undefined || (args.setupPrincipal !== undefined && !args.setupPending));
+  const ids = await pool.initialize(false, (args.validate ?? false) || args.recoverScope !== undefined || args.preparePrincipal !== undefined || (args.setupPrincipal !== undefined && !args.setupPending));
   try {
     const setup = args.setupPrincipal === undefined ? undefined : await setupCallerEnvironment(pool, { principalId: args.setupPrincipal, version: args.setupVersion ?? '', from: args.setupFrom, replace: args.setupReplace, pending: args.setupPending });
+    if (args.recoverScope !== undefined) await pool.recover(args.recoverScope);
     if (args.preparePrincipal !== undefined) await pool.prepare(args.preparePrincipal);
     const selected = args.inspectPrincipal === undefined ? undefined : await pool.store.findPrincipal(args.inspectPrincipal);
     const selectedPreparation = args.inspectPrincipal === undefined ? undefined : await pool.store.preparation(scopeDigest(config.agent_id, args.inspectPrincipal));

@@ -1,5 +1,12 @@
 import { spawn } from 'node:child_process';
 
+export class CommandExecutionError extends Error {
+  constructor(readonly code: 'timeout' | 'aborted' | 'output_limit', message: string) {
+    super(message);
+    this.name = 'CommandExecutionError';
+  }
+}
+
 export interface DockerCommandResult {
   stdout: string;
   stderr: string;
@@ -44,7 +51,7 @@ export function runBoundedCommand(
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     return Promise.reject(new Error('command timeout must be finite and positive'));
   }
-  if (options.signal?.aborted) return Promise.reject(new Error('command aborted before start'));
+  if (options.signal?.aborted) return Promise.reject(new CommandExecutionError('aborted', 'command aborted before start'));
   return new Promise((resolve, reject) => {
     const child = spawn(command, Array.from(args), {
       stdio: [options.input === undefined ? 'ignore' : 'pipe', options.inheritOutput ? 'inherit' : 'pipe', options.inheritOutput ? 'inherit' : 'pipe'],
@@ -77,14 +84,14 @@ export function runBoundedCommand(
       // This promise does not certify that a remote Docker operation stopped.
       finish(error);
     };
-    const abort = () => stop(new Error('command aborted; Docker state may require reconciliation'));
-    const timer = setTimeout(() => stop(new Error(`command timed out after ${timeoutMs}ms; Docker state may require reconciliation`)), timeoutMs);
+    const abort = () => stop(new CommandExecutionError('aborted', 'command aborted; Docker state may require reconciliation'));
+    const timer = setTimeout(() => stop(new CommandExecutionError('timeout', `command timed out after ${timeoutMs}ms; Docker state may require reconciliation`)), timeoutMs);
     options.signal?.addEventListener('abort', abort, { once: true });
     if (options.signal?.aborted) abort();
     const collect = (target: Buffer[], chunk: Buffer) => {
       if (settled) return;
       bytes += chunk.length;
-      if (bytes > maxOutputBytes) stop(new Error('command output exceeded configured limit'));
+      if (bytes > maxOutputBytes) stop(new CommandExecutionError('output_limit', 'command output exceeded configured limit'));
       else target.push(chunk);
     };
     child.stdout?.on('data', (chunk: Buffer) => collect(stdout, chunk));

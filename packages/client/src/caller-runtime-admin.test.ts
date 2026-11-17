@@ -14,7 +14,7 @@ test('container commands default config and select caller scopes rather than leg
       if (verb === 'validate') assert.equal('validate' in result.value && result.value.validate, true);
     }
   }
-  for (const verb of ['remove', 'recreate']) {
+  for (const verb of ['remove', 'recreate', 'recover']) {
     const id = 'a'.repeat(64);
     const result = parse(containerCmd, ['container', verb, id, '--config', '/agent.json', '--backend', 'codex']);
     assert.equal(result.success, true);
@@ -24,6 +24,7 @@ test('container commands default config and select caller scopes rather than leg
       assert.equal('backend' in result.value && result.value.backend, 'codex');
       assert.equal(verb === 'remove'
         ? 'deleteScope' in result.value && result.value.deleteScope
+        : verb === 'recover' ? 'recoverScope' in result.value && result.value.recoverScope
         : 'recreateScope' in result.value && result.value.recreateScope, id);
     }
     assert.equal(parse(containerCmd, ['container', verb]).success, false);
@@ -48,7 +49,7 @@ test('legacy tools require the explicit legacy namespace and caller-state remain
 
 test('empty and malformed scope selectors fail before config or Docker access', async () => {
   for (const value of ['', 'old-name', 'a'.repeat(63), 'A'.repeat(64)]) {
-    for (const operation of ['remove', 'recreate']) {
+    for (const operation of ['remove', 'recreate', 'recover']) {
       const parsed = parse(containerCmd, ['container', operation, value]);
       assert.ok(parsed.success);
       if (parsed.value.action === 'caller-state') await assert.rejects(runCallerState({ ...parsed.value, config: '/nonexistent-config' }), /scope must be/);
