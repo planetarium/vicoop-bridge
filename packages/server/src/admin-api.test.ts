@@ -1251,14 +1251,28 @@ test('delegation owner API generations revoke tokens/tasks and never reopen publ
     const registry = new Registry();
     const app = createHttpApp({ db: sql, registry });
     const trust = { issuer: 'did:web:router.example', method: 'urn:vicoop:auth:verse8-user:v1' };
-    const mutate = (method: 'POST' | 'DELETE', token = setup.ownerToken) => app.request(`/admin-api/agents/${setup.agentId}/federated-delegations`, {
+    const mutate = (method: 'POST' | 'DELETE', token = setup.ownerToken) => app.request(`/admin-api/agents/${setup.agentId}/federated-callers`, {
       method, headers: { ...authHeaders(token), 'content-type': 'application/json' }, body: JSON.stringify(trust),
     });
     assert.equal((await mutate('POST', 'bad')).status, 401);
+    for (const subject of [null, '', 1, false]) {
+      for (const method of ['POST', 'DELETE']) {
+        const response = await app.request(`/admin-api/agents/${setup.agentId}/federated-callers`, {
+          method, headers: { ...authHeaders(setup.ownerToken), 'content-type': 'application/json' },
+          body: JSON.stringify({ ...trust, subject }),
+        });
+        assert.equal(response.status, 400);
+      }
+    }
+
     const added = await mutate('POST');
     assert.equal(added.status, 200);
     const first = await added.json() as { principal: string; allowed_callers: string[] };
     assert.ok(first.allowed_callers.includes('federation-restricted:v1'));
+    const listed = await app.request(`/admin-api/agents/${setup.agentId}/callers`, { headers: authHeaders(setup.ownerToken) });
+    assert.deepEqual((await listed.json() as { federated_callers: unknown[] }).federated_callers,
+      [{ principal: first.principal, ...trust }]);
+
     const repeated = await mutate('POST');
     assert.equal((await repeated.json() as { principal: string }).principal, first.principal);
     const token = await issueTokenExchangeAccessToken(sql, {
@@ -1272,9 +1286,9 @@ test('delegation owner API generations revoke tokens/tasks and never reopen publ
     await assert.rejects(verifyTokenExchangeAccessToken(sql, token.rawToken, setup.agentId), /revoked/);
     assert.equal((await loadTokenExchangeTaskAuthorization(sql, setup.agentId, taskId))?.authorizationRevoked, true);
     const list = await app.request(`/admin-api/agents/${setup.agentId}/callers`, { headers: authHeaders(setup.ownerToken) });
-    const policy = await list.json() as { is_public: boolean; federated_delegations: unknown[] };
+    const policy = await list.json() as { is_public: boolean; federated_callers: unknown[] };
     assert.equal(policy.is_public, false);
-    assert.deepEqual(policy.federated_delegations, []);
+    assert.deepEqual(policy.federated_callers, []);
     // Even direct policy replacement retains the sticky restricted state.
     await sql`UPDATE agents SET allowed_callers = '{}' WHERE id = ${setup.agentId}`;
     const [stored] = await sql`SELECT allowed_callers FROM agents WHERE id = ${setup.agentId}`;

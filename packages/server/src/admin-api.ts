@@ -46,10 +46,11 @@ const INVALID_PRINCIPAL_MESSAGE =
   'or a canonical federated:v1 principal.';
 
 const INVALID_FEDERATED_CALLER_MESSAGE =
-  'Invalid federated caller. Expected an exact did:web issuer, method, and subject ' +
-  'whose canonical encoding is at most 512 bytes.';
+  'Invalid federated caller. Expected an exact did:web issuer and method, with an optional non-empty subject. ' +
+  'Omit subject to delegate issuer/method authorization; the canonical encoding must be at most 512 bytes.';
 
-export interface FederatedCallerResult extends FederatedPrincipalInput {
+export interface FederatedCallerResult extends Omit<FederatedPrincipalInput, 'subject'> {
+  subject?: string;
   principal: string;
 }
 
@@ -58,7 +59,6 @@ export interface CallerListResult {
   owner_principal: string;
   allowed_callers: string[];
   federated_callers: FederatedCallerResult[];
-  federated_delegations: Array<{ id: string; issuer: string; method: string; policy: string }>;
   federation_restricted: boolean;
   is_public: boolean;
   created_at?: string;
@@ -249,9 +249,10 @@ export async function addFederatedCaller(
   registry: Registry,
   principalId: string,
   agentId: string,
-  input: FederatedPrincipalInput,
+  input: Omit<FederatedPrincipalInput, 'subject'> & { subject?: string },
 ): Promise<CallerMutationResult> {
-  const principal = formatFederatedPrincipal(input);
+  if (input.subject === undefined) return mutateFederatedDelegation(db, registry, principalId, agentId, input, true);
+  const principal = formatFederatedPrincipal({ ...input, subject: input.subject });
   if (!principal) throw new AdminApiError(INVALID_FEDERATED_CALLER_MESSAGE, 400);
   return addCaller(db, registry, principalId, agentId, principal);
 }
@@ -261,15 +262,16 @@ export async function removeFederatedCaller(
   registry: Registry,
   principalId: string,
   agentId: string,
-  input: FederatedPrincipalInput,
+  input: Omit<FederatedPrincipalInput, 'subject'> & { subject?: string },
 ): Promise<CallerMutationResult> {
-  const principal = formatFederatedPrincipal(input);
+  if (input.subject === undefined) return mutateFederatedDelegation(db, registry, principalId, agentId, input, false);
+  const principal = formatFederatedPrincipal({ ...input, subject: input.subject });
   if (!principal) throw new AdminApiError(INVALID_FEDERATED_CALLER_MESSAGE, 400);
   return removeCaller(db, registry, principalId, agentId, principal);
 }
 
 /** Add or revoke an explicit issuer/method delegation under an agent-row lock. */
-export async function mutateFederatedDelegation(
+async function mutateFederatedDelegation(
   db: Sql, registry: Registry, principalId: string, agentId: string,
   input: { issuer: string; method: string }, adding: boolean,
 ): Promise<CallerMutationResult> {
@@ -328,13 +330,11 @@ export async function listCallers(
     agent_id: policy.agent_id as string,
     owner_principal: policy.owner_principal as string,
     allowed_callers: callers,
-    federated_callers: callers.flatMap((principal) => {
-      const parsed = parseFederatedPrincipal(principal);
-      return parsed ? [{ principal, ...parsed }] : [];
-    }),
-    federated_delegations: callers.flatMap((policy) => {
-      const parsed = parseFederatedDelegation(policy);
-      return parsed ? [{ ...parsed, policy }] : [];
+    federated_callers: callers.flatMap<FederatedCallerResult>((principal) => {
+      const exact = parseFederatedPrincipal(principal);
+      if (exact) return [{ principal, ...exact }];
+      const delegated = parseFederatedDelegation(principal);
+      return delegated ? [{ principal, issuer: delegated.issuer, method: delegated.method }] : [];
     }),
     federation_restricted: callers.includes(FEDERATION_RESTRICTED),
     is_public: callers.length === 0,

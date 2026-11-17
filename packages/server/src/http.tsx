@@ -1,4 +1,3 @@
-import { mutateFederatedDelegation } from './admin-api.js';
 import { ApprovalDecision } from '@vicoop-bridge/protocol';
 import { transferAgent } from './agent-transfer.js';
 import { authorizeRequesterApproval, RequesterDecisionBody, requesterApprovalResponse } from './requester-approvals.js';
@@ -1067,7 +1066,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   });
 
   async function federatedCallerBody(c: Context): Promise<
-    | { ok: true; value: { issuer: string; method: string; subject: string } }
+    | { ok: true; value: { issuer: string; method: string; subject?: string } }
     | { ok: false; response: Response }
   > {
     let body: unknown;
@@ -1076,42 +1075,25 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     } catch {
       return {
         ok: false,
-        response: c.json({ error: 'Body must be JSON: { issuer, method, subject }' }, 400),
+        response: c.json({ error: 'Body must be JSON: { issuer, method, subject? }' }, 400),
       };
     }
     if (
       !isRecord(body) ||
       typeof body.issuer !== 'string' ||
       typeof body.method !== 'string' ||
-      typeof body.subject !== 'string' ||
+      (Object.hasOwn(body, 'subject') && typeof body.subject !== 'string') ||
       Object.keys(body).some((key) => !['issuer', 'method', 'subject'].includes(key))
     ) {
       return {
         ok: false,
-        response: c.json({ error: 'Body must be JSON: { issuer, method, subject }' }, 400),
+        response: c.json({ error: 'Body must be JSON: { issuer, method, subject? }' }, 400),
       };
     }
     return {
       ok: true,
-      value: { issuer: body.issuer, method: body.method, subject: body.subject },
+      value: { issuer: body.issuer, method: body.method, ...(typeof body.subject === 'string' ? { subject: body.subject } : {}) },
     };
-  }
-
-  for (const method of ['post', 'delete'] as const) {
-    app[method]('/admin-api/agents/:id/federated-delegations', async (c) => {
-      const auth = await authOwnerSession(c);
-      if (!auth.ok) return adminApiUnauthorized(c, auth);
-      let body: unknown;
-      try { body = await c.req.json(); } catch { return c.json({ error: 'Invalid JSON' }, 400); }
-      if (!isRecord(body) || typeof body.issuer !== 'string' || typeof body.method !== 'string' ||
-          Object.keys(body).some((key) => !['issuer', 'method'].includes(key))) {
-        return c.json({ error: 'Body must be JSON: { issuer, method }' }, 400);
-      }
-      try {
-        return c.json(await mutateFederatedDelegation(opts.db, opts.registry, auth.principalId,
-          c.req.param('id'), { issuer: body.issuer, method: body.method }, method === 'post'));
-      } catch (err) { return adminApiErrorResponse(c, err); }
-    });
   }
 
   app.post('/admin-api/agents/:id/federated-callers', async (c) => {

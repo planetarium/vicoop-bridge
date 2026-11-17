@@ -162,8 +162,8 @@ function federatedCallerCommand<
 >(name: 'add-federated' | 'remove-federated', action: A) {
   const adding = action === 'agent-callers-add-federated';
   const description = adding
-    ? message`Adds one exact (issuer, method, subject) tuple to the agent's allowed callers. The values are case-sensitive and must exactly match the Connector's later subject assertion. This changes receiver policy only: it does not mint an access token, resolve the DID, or contact the Connector. The database and this server instance update immediately; cross-instance cache propagation uses best-effort database notifications, so no daemon restart is normally needed. WARNING: when allowed_callers is empty, adding this first entry changes the agent from public to restricted.`
-    : message`Removes one exact (issuer, method, subject) tuple from the agent's allowed callers. In the same transaction, every token issued under the tuple is permanently revoked and every historical task binding is tombstoned; re-adding the tuple authorizes only future exchanges and does not restore them. The database and this server instance update immediately; cross-instance cache propagation uses best-effort database notifications. WARNING: removing the final allowed caller makes the agent public for new messages; add a replacement first if it must remain restricted.`;
+    ? message`With --subject, adds one exact (issuer, method, subject) tuple to the agent's allowed callers. The values are case-sensitive and must exactly match the Connector's later subject assertion. Omitting --subject delegates authorization for all individually identified subjects attested by this exact issuer and method. Assertions still require an individual subject. This changes receiver policy only: it does not mint an access token, resolve the DID, or contact the Connector. The database and this server instance update immediately; cross-instance cache propagation uses best-effort database notifications, so no daemon restart is normally needed. WARNING: when allowed_callers is empty, adding this first entry changes the agent from public to restricted.`
+    : message`With --subject, removes one exact (issuer, method, subject) tuple from the agent's allowed callers. In the same transaction, every token issued under the tuple is permanently revoked and every historical task binding is tombstoned; re-adding the tuple authorizes only future exchanges and does not restore them. The database and this server instance update immediately; cross-instance cache propagation uses best-effort database notifications. Omitting --subject removes issuer/method delegation and revokes its tokens and tasks; re-adding creates a new generation. Once delegation has been enabled, the agent stays restricted even after all policies are removed. Otherwise, removing the final allowed caller makes the agent public for new messages; add a replacement first if it must remain restricted.`;
   const footer = adding
     ? message`Example: vicoop-client agent callers add-federated my-agent --issuer did:web:connector.example --method urn:mentionable:auth:slack-workspace-member:v0.1 --subject slack:T123/U456. Guide: https://github.com/planetarium/vicoop-bridge/blob/main/docs/manage-federated-callers.md`
     : message`Use agent callers list AGENT_ID --json to copy the exact tuple before removal. Guide: https://github.com/planetarium/vicoop-bridge/blob/main/docs/manage-federated-callers.md`;
@@ -181,14 +181,14 @@ function federatedCallerCommand<
       method: option('--method', string({ metavar: 'URN' }), {
         description: message`Exact, case-sensitive Mentionable authentication method URN from the Connector profile. No wildcards.`,
       }),
-      subject: option('--subject', string({ metavar: 'SUBJECT' }), {
-        description: message`Exact, case-sensitive canonical platform subject from the assertion sub, e.g. slack:T123/U456.`,
-      }),
+      subject: optional(option('--subject', string({ metavar: 'SUBJECT' }), {
+        description: message`Exact, case-sensitive canonical platform subject from the assertion sub, e.g. slack:T123/U456. Omit to delegate authorization for all subjects under this exact issuer and method.`,
+      })),
     }),
     {
       brief: adding
-        ? message`Allow one exact federated Connector/method/subject caller.`
-        : message`Remove one exact federated caller and revoke its task/token authority.`,
+        ? message`Allow an exact federated caller or delegate issuer/method authorization.`
+        : message`Remove a federated grant and revoke its task/token authority.`,
       description,
       footer,
     },
@@ -203,22 +203,6 @@ const agentCallersRemoveFederatedSubCmd = federatedCallerCommand(
   'remove-federated',
   'agent-callers-remove-federated',
 );
-
-function delegationCommand<const A extends 'agent-callers-add-delegation' | 'agent-callers-remove-delegation'>(
-  name: 'add-delegation' | 'remove-delegation', action: A,
-) {
-  return command(name, object({
-    action: constant(action), ...sharedFlags,
-    agentId: argument(string({ metavar: 'AGENT_ID' })),
-    issuer: option('--issuer', string({ metavar: 'DID' })),
-    method: option('--method', string({ metavar: 'URN' })),
-  }), {
-    brief: message`Manage explicit issuer/method authorization delegation.`,
-    description: message`Trust all individually identified subjects attested by this exact issuer and authentication method for this agent. No per-user grant is needed. Removing trust revokes its tokens and tasks; re-adding creates a new policy generation. Once delegation has been enabled, removing the final policy keeps the agent restricted. Use callers list --json to inspect policy IDs.`,
-  });
-}
-const agentCallersAddDelegationSubCmd = delegationCommand('add-delegation', 'agent-callers-add-delegation');
-const agentCallersRemoveDelegationSubCmd = delegationCommand('remove-delegation', 'agent-callers-remove-delegation');
 
 // `issue-api-key` mints a static API key — a caller the bridge creates a
 // secret for, for non-interactive callers (CI, backend services) that can't
@@ -252,8 +236,6 @@ const agentCallersSubCmd = command(
     agentCallersAddSubCmd,
     agentCallersRemoveSubCmd,
     agentCallersAddFederatedSubCmd,
-    agentCallersAddDelegationSubCmd,
-    agentCallersRemoveDelegationSubCmd,
     agentCallersRemoveFederatedSubCmd,
     agentCallersIssueSubCmd,
   ),
@@ -261,19 +243,6 @@ const agentCallersSubCmd = command(
     brief: message`Manage the agent's callers — external identities and API keys.`,
   },
 );
-
-export async function runAgentCallersDelegation(
-  args: Extract<AgentCliArgs, { action: 'agent-callers-add-delegation' | 'agent-callers-remove-delegation' }>,
-): Promise<number> {
-  const session = resolveSession(args);
-  if ('error' in session) { process.stderr.write(`${session.error}\n`); return 1; }
-  const result = await callApi({ session,
-    method: args.action === 'agent-callers-add-delegation' ? 'POST' : 'DELETE',
-    path: `/admin-api/agents/${encodeURIComponent(args.agentId)}/federated-delegations`,
-    body: { issuer: args.issuer, method: args.method },
-  });
-  return emit(result, args.json, renderCallerMutation);
-}
 
 // ----- agent x402 (pricing) ---------------------------------------------------
 //
@@ -388,7 +357,7 @@ export const agentCmd = command(
   ),
   {
     brief: message`Manage agent registrations, their callers, and their pricing.`,
-    description: message`Operator-facing umbrella for agent state. Subcommands: \`transfer\`, \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, add-federated, remove-federated, add-delegation, remove-delegation, issue-api-key}\`, \`x402 {show, set, clear}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
+    description: message`Operator-facing umbrella for agent state. Subcommands: \`transfer\`, \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, add-federated, remove-federated, issue-api-key}\`, \`x402 {show, set, clear}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
     hidden: 'usage',
   },
 );
@@ -682,8 +651,7 @@ function renderCallerList(body: unknown): string {
   if (!body || typeof body !== 'object') return String(body);
   const b = body as {
     allowed_callers?: string[];
-    federated_callers?: Array<{ issuer: string; method: string; subject: string }>;
-    federated_delegations?: Array<{ id: string; issuer: string; method: string }>;
+    federated_callers?: Array<{ issuer: string; method: string; subject?: string }>;
     federation_restricted?: boolean;
   };
   const callers = b.allowed_callers ?? [];
@@ -702,9 +670,8 @@ function renderCallerList(body: unknown): string {
   const sections = [callerTable];
   if (b.federation_restricted) sections.push('Restricted: removing all active delegation policies does not make this agent public.');
   if (federated.length) sections.push('', 'FEDERATED CALLERS', renderTable(
-    ['ISSUER', 'METHOD', 'SUBJECT'], federated.map((entry) => [entry.issuer, entry.method, entry.subject])));
-  if (b.federated_delegations?.length) sections.push('', 'FEDERATED DELEGATIONS', renderTable(
-    ['POLICY ID', 'ISSUER', 'METHOD'], b.federated_delegations.map((entry) => [entry.id, entry.issuer, entry.method])));
+    ['ISSUER', 'METHOD', 'SUBJECT'], federated.map((entry) => [entry.issuer, entry.method, entry.subject ?? '(all subjects)'])));
+
   return sections.join('\n');
 }
 
@@ -929,7 +896,7 @@ async function execRemoveCaller(args: CallerCommonArgs & { principal: string }):
 interface FederatedCallerArgs extends CallerCommonArgs {
   issuer: string;
   method: string;
-  subject: string;
+  subject?: string;
 }
 
 async function execFederatedCaller(

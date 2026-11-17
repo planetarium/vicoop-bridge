@@ -24,8 +24,9 @@ For example:
 
 This permits only Connector `did:web:connector.example` to present the exact
 subject `slack:T123/U456` under the exact named method. There are no issuer,
-workspace, method, or subject wildcards. Register each allowed subject as a
-separate tuple.
+workspace, method, or subject wildcard strings. For exact grants, register each
+allowed subject as a separate tuple. To delegate all subjects under one exact
+issuer and method, omit `--subject` as described in [Router delegation](#delegate-user-authorization-to-a-router).
 
 `add-federated` configures receiver-owned authorization policy. It does not
 issue an access token, register the Connector globally, resolve its DID, or
@@ -322,20 +323,26 @@ without pre-registering every subject. Use this only for a Router that enforces
 its own user eligibility and resource policy before signing each assertion.
 
 ```sh
-vicoop-client agent callers add-delegation AGENT_ID \
+vicoop-client agent callers add-federated AGENT_ID \
   --issuer did:web:router.example \
   --method urn:vicoop:auth:verse8-user:v1
 vicoop-client agent callers list AGENT_ID --json
-vicoop-client agent callers remove-delegation AGENT_ID \
+vicoop-client agent callers remove-federated AGENT_ID \
   --issuer did:web:router.example \
   --method urn:vicoop:auth:verse8-user:v1
 ```
 
-The owner API exposes `POST` and `DELETE
-/admin-api/agents/:id/federated-delegations` with `{ "issuer": "did:web:router.example",
+Use the existing commands without `--subject` for delegation; include it for an
+exact subject grant. Subject assertions still require an individual `sub`.
+
+The owner API exposes `POST` and `DELETE` at
+`/admin-api/agents/:id/federated-callers` with `{ "issuer": "did:web:router.example",
 "method": "urn:vicoop:auth:verse8-user:v1" }`. Both require the same owner session
-and ownership checks as exact caller management. `callers` inspection includes
-`federated_delegations` (id, issuer, method, policy) and `federation_restricted`.
+and ownership checks as exact caller management. Omit `subject` entirely for
+delegation; `null`, empty strings, and non-string values are rejected. `callers` inspection includes
+`federated_callers` (principal, issuer, method, and optional subject) and
+`federation_restricted`. A missing subject denotes issuer/method delegation;
+copy its issuer and method back to the same API to remove it.
 The structured API emits a `federated_delegation_changed` audit log with operator,
 agent, action and policy generation. No user source tokens are recorded.
 
