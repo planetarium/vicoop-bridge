@@ -40,6 +40,25 @@ listing, and direct listing on an agent with federated task bindings, remain
 unsupported as before. Federated tasks require their original authorization
 profile, actor, principal, and active grant.
 
+## Checking whether an agent has drained
+
+Fleet operators must block new admissions and pause the agent before checking
+whether they can stop its service. Call
+`GET /admin-api/agents/:id/non-terminal-task-count` with the Bridge agent ID
+and an `Authorization: Bearer <owner_session>` header. The session must belong
+to the agent owner or a configured platform admin wallet. The agent can be
+offline and its caller allowlist does not affect this endpoint.
+
+A successful response, for example `{"agent_id":"worker-a","non_terminal_task_count":2}`,
+counts persisted tasks for that agent across all callers. Tasks waiting for
+input or authentication still count. Completed, failed, canceled and rejected
+tasks are terminal. The integer is a point-in-time observation. Keep admissions
+blocked while draining, and proceed only after a successful zero.
+
+A missing, invalid or wrong-audience bearer returns 401. An unknown agent ID or
+an agent outside the operator's scope returns 404. A failed task-store read
+returns 500. Treat each error as a failed drain check.
+
 ## Public agents and existing tasks
 
 Public agents still admit anonymous calls and share **new public tasks by known ID**.

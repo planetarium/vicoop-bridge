@@ -5,6 +5,7 @@ import { FEDERATION_RESTRICTED, formatFederatedDelegation, parseFederatedDelegat
 // callers share the same RLS handling, registry hot-reload, and idempotency
 // rules — without an LLM round-trip on the HTTP path.
 
+import { TERMINAL_STATES } from '@a2x/sdk';
 import type postgres from 'postgres';
 import type { Sql } from './db.js';
 import type { Registry } from './registry.js';
@@ -33,6 +34,21 @@ export class AdminApiError extends Error {
     super(message);
     this.name = 'AdminApiError';
   }
+}
+
+export async function countNonTerminalTasks(db: Sql, principalId: string, agentId: string) {
+  // Resolve ownership and count against the same snapshot, including when the
+  // agent is disconnected. Only an authorized agent row can produce a zero.
+  const [result] = await db<{ agent_id: string; non_terminal_task_count: number }[]>`
+    SELECT agents.id AS agent_id, (
+      SELECT count(*)::integer FROM infra.a2a_tasks
+      WHERE owner_agent = agents.id AND state NOT IN ${db([...TERMINAL_STATES])}
+    ) AS non_terminal_task_count
+    FROM agents
+    WHERE id = ${agentId} AND (owner_principal = ${principalId} OR ${isAdmin(principalId)})
+  `;
+  if (!result) throw new AdminApiError('Agent not found or not authorized.', 404);
+  return result;
 }
 
 // Single source of truth for the invalid-principal 400 message. Must stay
