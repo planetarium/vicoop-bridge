@@ -39,6 +39,7 @@ import {
   addCaller,
   addFederatedCaller,
   clearX402Pricing,
+  countNonTerminalTasks,
   deleteClientForOwner,
   getX402Pricing,
   getRequesterApprovalPolicy,
@@ -871,6 +872,15 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     const result = opts.registry.approvals.decide(approval.requestId, decision.data, auth.principalId);
     if (!result) return c.json({ error: 'Approval expired, consumed, or execution no longer active' }, 409);
     return c.json({ approval: result });
+  });
+
+  app.get('/admin-api/agents/:id/non-terminal-task-count', async (c) => {
+    c.header('Cache-Control', 'no-store');
+    const auth = await authOwnerSession(c);
+    if (!auth.ok) return adminApiUnauthorized(c, auth);
+    try {
+      return c.json(await countNonTerminalTasks(opts.db, auth.principalId, c.req.param('id')));
+    } catch (err) { return adminApiErrorResponse(c, err); }
   });
 
   // Owner-controlled opt-in for requester decisions on the route below.

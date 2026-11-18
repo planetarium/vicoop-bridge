@@ -1303,3 +1303,62 @@ test('delegation owner API generations revoke tokens/tasks and never reopen publ
     await sql.end();
   }
 });
+
+test('operator drain count across callers after admissions are paused', { skip: !hasDb }, async (t) => {
+  const sql = postgres(process.env.DATABASE_URL!, { connection: { lock_timeout: 1000 } });
+  const agents: SetupResult[] = [];
+  t.after(async () => {
+    try {
+      for (const agent of agents) {
+        await sql`DELETE FROM infra.a2a_tasks WHERE owner_agent = ${agent.agentId}`;
+        await teardown(sql, agent.ownerPrincipal, agent.clientId);
+      }
+    } finally {
+      await sql.end();
+    }
+  });
+  const setup = async (principal: string) => {
+    const agent = await setupOwner(sql, principal);
+    agents.push(agent);
+    return agent;
+  };
+  const target = await setup('eth:0x' + '61'.repeat(20));
+  const other = await setup('eth:0x' + '62'.repeat(20));
+  // Router admissions are external. Neither agent needs a live connection.
+  const app = createHttpApp({ db: sql, registry: new Registry() });
+  const path = (id: string) => `/admin-api/agents/${id}/non-terminal-task-count`;
+  const read = (id: string, token = target.ownerToken) =>
+    app.request(path(id), { headers: authHeaders(token) });
+
+  const states = ['submitted', 'working', 'input-required', 'auth-required',
+    'completed', 'failed', 'canceled', 'rejected'];
+  const rows = states.map((state, i) => ({
+    task_id: `${target.agentId}-${state}`, context_id: 'drain', state, task_json: {},
+    owner_agent: target.agentId, owner_principal: i % 2 ? 'caller-a' : 'caller-b',
+  }));
+  rows.push({ ...rows[0]!, task_id: other.agentId, owner_agent: other.agentId });
+  await sql`INSERT INTO infra.a2a_tasks ${sql(rows)}`;
+
+  const result = await read(target.agentId);
+  assert.equal(result.status, 200);
+  assert.deepEqual(await result.json(), { agent_id: target.agentId, non_terminal_task_count: 4 });
+  assert.equal((await app.request(path(target.agentId))).status, 401);
+  const caller = await issueSessionToken(sql, {
+    principalId: target.ownerPrincipal, provider: 'siwe', audience: 'caller',
+  });
+  assert.equal((await read(target.agentId, caller.rawToken)).status, 401);
+  assert.equal((await read(target.agentId, other.ownerToken)).status, 404);
+  assert.equal((await read(target.agentId + '-missing')).status, 404);
+
+  await sql`UPDATE infra.a2a_tasks SET state = 'completed' WHERE owner_agent = ${target.agentId}`;
+  const drained = await read(target.agentId);
+  assert.equal(drained.status, 200);
+  assert.deepEqual(await drained.json(), { agent_id: target.agentId, non_terminal_task_count: 0 });
+
+  await sql.begin(async (tx) => {
+    await tx`LOCK TABLE infra.a2a_tasks IN ACCESS EXCLUSIVE MODE`;
+    const unavailable = await read(target.agentId);
+    assert.equal(unavailable.status, 500);
+    assert.deepEqual(await unavailable.json(), { error: 'Internal error' });
+  });
+});
