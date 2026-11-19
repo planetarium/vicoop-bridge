@@ -8,7 +8,7 @@ import {
   TRACEABILITY_EXTENSION_URI,
   type Part,
 } from '@vicoop-bridge/protocol';
-import { callerFileToolSchema } from '../caller-file-delivery.js';
+import { callerFileToolSchema, MAX_FILE_REQUESTS_PER_EXECUTION, MAX_PENDING_FILE_REQUESTS, FILE_DELIVERY_REJECTION } from '../caller-file-delivery.js';
 import type { Backend } from '../backend.js';
 import {
   appendCallerContextInstruction,
@@ -974,6 +974,34 @@ function extractAgentMessageDelta(params: unknown): string {
   return '';
 }
 
+/** Bind the app-server function to one execution and bound outstanding host-side reads. */
+export function createCodexFileToolHandler(
+  send: (input: unknown, signal: AbortSignal) => Promise<object>,
+  signal: AbortSignal,
+  currentTurn: () => string | null,
+): (call: DynamicToolCallParams) => Promise<DynamicToolCallResponse> {
+  let requests = 0;
+  let pending = 0;
+  return async call => {
+    const turnId = currentTurn();
+    if (call.tool !== 'send_file' || call.namespace != null || signal.aborted ||
+        (turnId !== null && call.turnId !== turnId))
+      return { success: false, contentItems: [] };
+    if (pending >= MAX_PENDING_FILE_REQUESTS || requests >= MAX_FILE_REQUESTS_PER_EXECUTION)
+      return { success: false, contentItems: [{ type: 'inputText', text: 'Attachment request limit reached' }] };
+    pending++;
+    requests++;
+    try {
+      const receipt = await send(call.arguments, signal);
+      return { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(receipt) }] };
+    } catch {
+      return { success: false, contentItems: [{ type: 'inputText', text: FILE_DELIVERY_REJECTION }] };
+    } finally {
+      pending--;
+    }
+  };
+}
+
 export function createCodexBackend(
   opts: CodexBackendOptions = {},
 ): Backend & {close():Promise<void>} {
@@ -1935,17 +1963,7 @@ export function createCodexBackend(
             const send = fileDelivery.bind();
             const executionSignal = AbortSignal.any([signal, turnLifetime.signal]);
             registeredThreadId = threadId;
-            toolCallHandlers.set(threadId, async call => {
-              if (call.tool !== 'send_file' || call.namespace != null || executionSignal.aborted ||
-                  (activeTurnId !== null && call.turnId !== activeTurnId))
-                return { success: false, contentItems: [] };
-              try {
-                const receipt = await send(call.arguments, executionSignal);
-                return { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(receipt) }] };
-              } catch {
-                return { success: false, contentItems: [{ type: 'inputText', text: 'Attachment delivery failed' }] };
-              }
-            });
+            toolCallHandlers.set(threadId, createCodexFileToolHandler(send, executionSignal, () => activeTurnId));
           } else if (envelope) {
             registeredThreadId = threadId;
             toolCallHandlers.set(threadId, async (p) => {

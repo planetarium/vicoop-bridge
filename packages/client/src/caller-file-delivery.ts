@@ -5,6 +5,10 @@ import type { Emit } from './backend.js';
 import { inferMimeFromPath } from './backends/file-attach.js';
 import { runDockerCommand, type AsyncDockerRun } from './docker-command.js';
 
+export const MAX_FILE_REQUESTS_PER_EXECUTION = 64;
+export const MAX_PENDING_FILE_REQUESTS = 4;
+export const FILE_DELIVERY_REJECTION = 'File rejected: check allowed paths, regular-file requirement, and file/count/aggregate limits';
+
 export const CallerFileDeliveryConfig = z.object({
   allowedRoots: z.array(z.string().min(1).max(4096).refine(value =>
     value.startsWith('/workspace/') && !value.endsWith('/') && posix.normalize(value) === value && !value.includes('\0'),

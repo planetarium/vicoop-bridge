@@ -8,6 +8,7 @@ import {
   composeNativeDevInstructions,
   composeStalledToolCallNudge,
   createCodexBackend,
+  createCodexFileToolHandler,
   describeEmptyDispatchTurn,
   forcedToolChoice,
   isStaleCodexUsageUpdate,
@@ -4497,4 +4498,30 @@ test('turns without caller tools are outside the no-tool-call instrumentation an
     assert.ok(!logs.lines.some((l) => l.includes('caller-tool turn')), logs.lines.join('\n'));
     await backend.close();
   }
+});
+
+test('file function bounds concurrent and unsuccessful reads within its execution', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let reads = 0;
+  const controller = new AbortController();
+  const handle = createCodexFileToolHandler(async () => {
+    reads++;
+    await gate;
+    throw new Error('private Docker diagnostic');
+  }, controller.signal, () => 'turn');
+
+  const call = { threadId: 'thread', turnId: 'turn', callId: 'file', namespace: null, tool: 'send_file', arguments: {} };
+  const first = Array.from({ length: 4 }, () => handle(call));
+  assert.equal((await handle(call)).success, false);
+  assert.equal(reads, 4);
+  release();
+  const rejected = await Promise.all(first);
+  assert.match(JSON.stringify(rejected[0]), /allowed paths/);
+  assert.doesNotMatch(JSON.stringify(rejected), /private Docker diagnostic/);
+
+  for (let i = 4; i < 64; i++) await handle(call);
+  assert.equal(reads, 64);
+  assert.equal((await handle(call)).success, false);
+  assert.equal(reads, 64);
 });
