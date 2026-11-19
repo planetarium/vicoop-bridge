@@ -387,7 +387,24 @@ export function mountOperations(
       return action(tx, row, identity, policy);
     });
   }
-  app.get(path + '/:id', async (c) => c.json(await access(c, async (_tx, row) => view(row), true)));
+  app.get(path + '/:id', async (c) =>
+    c.json(
+      await access(
+        c,
+        async (_tx, row, identity, policy) => ({
+          ...view(row),
+          canDecide:
+            identity.operationReadRevision === undefined &&
+            row.state === 'pending' &&
+            !row.expired &&
+            !!policy &&
+            samePolicy(row, policy) &&
+            operator(policy, identity),
+        }),
+        true,
+      ),
+    ),
+  );
   app.get(path + '/:id/audit', async (c) =>
     c.json(
       await access(c, async (tx, row) => {

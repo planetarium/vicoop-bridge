@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { mergePull } from './github-merge.mjs';
 import { fileURLToPath } from 'node:url';
 import { runOnce } from './worker.mjs';
 
@@ -19,7 +19,7 @@ const job = {
   version: '1',
   state: 'executing',
   expiresAt: new Date(Date.now() + 120000).toISOString(),
-  arguments: { repository: 'org/repo', pull: 7, head: 'a'.repeat(40) },
+  arguments: { repository: 'org/repo', pull: 7, base: 'main', head: 'a'.repeat(40) },
 };
 const ok = (data) => new Response(JSON.stringify(data), { status: 200 });
 
@@ -77,36 +77,57 @@ test('empty, expired or different version cannot execute; a lost result does not
   );
   assert.equal(attempts, 1);
 });
-test('GitHub handler pins host repository, PR and expected SHA and reconciles ambiguous outcomes', () => {
-  const prelude = `const fs=require('node:fs'); globalThis.fetch=async(url,init)=>{
-    require('node:assert/strict').equal(url,'https://api.github.com/repos/org/repo/pulls/7/merge');
-    require('node:assert/strict').equal(JSON.parse(init.body).sha,'a'.repeat(40));
-    require('node:assert/strict').equal(init.method,'PUT');
-    const code=Number(process.env.FIXTURE_CODE); if(code===0)throw Error('timeout');
-    return new Response(JSON.stringify({merged:true}),{status:code});
-  };`;
-  for (const [code, expected] of [
+test('GitHub handler checks the approved base repository, branch and head before merging', async () => {
+  const github = {
+    GITHUB_REPOSITORY: 'org/repo',
+    GITHUB_BASE_BRANCH: 'main',
+    GITHUB_TOKEN: 'fixture',
+  };
+  const expected = {
+    number: 7,
+    state: 'open',
+    base: { repo: { full_name: 'org/repo' }, ref: 'main' },
+    head: { sha: job.arguments.head },
+  };
+  for (const pr of [
+    { ...expected, base: { ...expected.base, ref: 'staging' } },
+    { ...expected, base: { ...expected.base, repo: { full_name: 'old/repo' } } },
+    { ...expected, head: { sha: 'b'.repeat(40) } },
+    { ...expected, state: 'closed' },
+  ]) {
+    const calls = [];
+    assert.equal(
+      (
+        await mergePull(job, github, async (url, init) => {
+          calls.push([url, init.method ?? 'GET']);
+          return ok(pr);
+        })
+      ).state,
+      'failed',
+    );
+    assert.deepEqual(calls, [['https://api.github.com/repos/org/repo/pulls/7', 'GET']]);
+  }
+  for (const [code, state] of [
     [200, 'succeeded'],
     [409, 'failed'],
     [500, 'unknown'],
     [0, 'unknown'],
   ]) {
-    // Install the fake upstream before running the actual executable body.
-    const source =
-      prelude +
-      'import(' +
-      JSON.stringify(new URL('./github-merge.mjs', import.meta.url).href) +
-      ')';
-    const processResult = spawnSync(process.execPath, ['-e', source], {
-      input: JSON.stringify(job),
-      encoding: 'utf8',
-      env: {
-        GITHUB_TOKEN: 'fixture-only',
-        GITHUB_REPOSITORY: 'org/repo',
-        FIXTURE_CODE: String(code),
-      },
+    const calls = [];
+    const actual = await mergePull(job, github, async (url, init) => {
+      calls.push([url, init.method ?? 'GET', init.body]);
+      if (!init.method) return ok(expected);
+      if (!code) throw Error('timeout');
+      return new Response(JSON.stringify({ merged: true }), { status: code });
     });
-    assert.equal(processResult.status, 0, processResult.stderr);
-    assert.equal(JSON.parse(processResult.stdout).state, expected);
+    assert.equal(actual.state, state);
+    assert.deepEqual(calls, [
+      ['https://api.github.com/repos/org/repo/pulls/7', 'GET', undefined],
+      [
+        'https://api.github.com/repos/org/repo/pulls/7/merge',
+        'PUT',
+        JSON.stringify({ sha: job.arguments.head, merge_method: 'merge' }),
+      ],
+    ]);
   }
 });

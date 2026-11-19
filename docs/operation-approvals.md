@@ -25,6 +25,7 @@ Example server definition (replace the placeholders with deployment values):
   "fields":{
     "repository":{"type":"string","allowedValues":["example/service"]},
     "pull":{"type":"integer"},
+    "base":{"type":"string","allowedValues":["main"]},
     "head":{"type":"string"}
   }
 }]
@@ -37,16 +38,16 @@ Fields are required; extra fields are rejected. Supported values are strings, sa
 The tool emits a single A2A artifact with a new `artifactId` and one DataPart:
 
 ```json
-{"type":"vicoop.operation-proposal.v1","operation":"merge-pr","arguments":{"repository":"example/service","pull":42,"head":"<full expected SHA>"}}
+{"type":"vicoop.operation-proposal.v1","operation":"merge-pr","arguments":{"repository":"example/service","pull":42,"base":"main","head":"<full expected SHA>"}}
 ```
 
-With the original requester's agent-scoped federated bearer (`a2a:task.read`), POST `/agents/:agent/operations` with `{taskId,proposalKey,operation,arguments}`. Set `proposalKey` to that artifact's ID. The server authenticates the exact task origin and checks the stored artifact. The first registration requires the durable task to be completed or input-required. A still-working task can be retried after that transition. Failed, rejected and canceled tasks cannot register new work. Retry a 409 indicating the task is still working with the same key. A ready task whose durable snapshot lacks the artifact returns a permanent 400. A changed payload is a conflict. Store the returned request ID and the original Slack thread association durably. Replaying the same proposal key returns the same request. Ordinary chat text does not enter this flow.
+With the original requester's agent-scoped federated bearer (`a2a:task.read`), POST `/agents/:agent/operations` with `{taskId,proposalKey,operation,arguments}`. Set `proposalKey` to that artifact's ID. The server authenticates the exact task origin and checks the stored artifact. The first registration requires the durable task to be completed or input-required. A still-working task can be retried after that transition. Failed, rejected and canceled tasks cannot register new work. Retry a 409 indicating the task is still working with the same key. A ready task whose durable snapshot lacks the artifact returns a permanent 400. Each new execution on a replay-capable task replaces the preceding turn’s artifacts. Register proposals before forwarding another turn on the same task. If overlapping turns supersede an unregistered artifact, show that it could not be registered and ask the requester to propose the operation again. A changed payload is a conflict. Store the returned request ID and the original Slack thread association durably. Replaying the same proposal key returns the same request. Ordinary chat text does not enter this flow.
 
 Every operator must exchange their own fresh platform proof. An operator who is not the original requester uses an agent-scoped platform exchange. A task-bound bearer can access only its own task. Use the operator's bearer for both review and decision, not a shared bot or requester credential.
 
 | Method and path under `/agents/:agent/operations` | Purpose |
 | --- | --- |
-| GET `/:id` | Requester or registered operator reads `id, taskId, operation, version, executorId, arguments, digest, expiresAt, state, result`. Render the stored request for review. |
+| GET `/:id` | Requester or registered operator reads `id, taskId, operation, version, executorId, arguments, digest, expiresAt, state, result, canDecide`. Only show decision controls when this caller-specific `canDecide` is true. The decision endpoint independently verifies the operator and current state. |
 | POST `/:id/decision` | Operator sends `{"decision":"approve","digest":"..."}` or `deny`. The first valid decision wins. |
 | POST `/:id/cancel` | Requester can cancel unconsumed pending or approved work. |
 | GET `/:id/audit` | Requester or operator reads timestamps, decision principals, actors, grants and state transitions. |
@@ -57,7 +58,7 @@ Poll the read endpoint for results to deliver back to the originating thread. St
 
 The one-shot Node worker in [examples/operation-executor](../examples/operation-executor/) processes one item; run it periodically, using a scheduler account isolated from agent workloads. Configure `BRIDGE_URL`, `AGENT_ID`, `OPERATION`, `OPERATION_VERSION`, `EXECUTOR_TOKEN` and `OPERATION_HANDLER` (absolute path to the trusted executable). Use an HTTPS bridge origin; loopback HTTP is supported for local tests.
 
-- For `merge-pr` version `1`, select `github-merge.mjs` and set `GITHUB_REPOSITORY` and the host's scoped `GITHUB_TOKEN`. The handler pins the repository and sends the approved full head SHA with the GitHub merge request.
+- For `merge-pr` version `1`, select `github-merge.mjs` and set `GITHUB_REPOSITORY`, `GITHUB_BASE_BRANCH` and a scoped `GITHUB_TOKEN`. The handler checks the PR number, open state, repository, base branch and head immediately before submitting the approved full head SHA to GitHub. GitHub’s merge endpoint atomically checks only the head SHA. Enforce repository rules that allow the executor identity to update only the approved base branch, including for a PR retargeted between the check and merge. The executor identity must have no ruleset bypass.
 - For `argocd-sync` version `1`, select `argocd-sync.mjs` and register `application, namespace, project, revision` string arguments. Set `ARGOCD_URL`, `ARGOCD_TOKEN`, `ARGOCD_APPLICATION`, `ARGOCD_NAMESPACE`, `ARGOCD_PROJECT`, `ARGOCD_REPOSITORY`. Use a dedicated single-source Git Application with controller-managed configuration and project/RBAC restrictions on permitted repositories and destinations. The handler pins the full commit SHA. Its success result means the controller accepted the sync request. Rollout health is a later observation.
 - For site-specific work such as withdrawal approval, install the site's trusted executable and define the immutable inputs, e.g. an internal withdrawal ID and expected revision. The site adapter must atomically verify the preconditions, enforce its own limits and use the operation ID for upstream idempotency or reconciliation. The repository does not contain a withdrawal-provider integration.
 

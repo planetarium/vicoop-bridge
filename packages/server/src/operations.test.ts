@@ -244,6 +244,11 @@ test(
     }
     const [a, replay] = await Promise.all([create(0), create(0)]);
     assert.deepEqual(a, replay);
+    const canDecide = async (id: string, token: string) =>
+      z.object({ canDecide: z.boolean() }).parse(await (await get(path + '/' + id, token)).json())
+        .canDecide;
+    assert.equal(await canDecide(a.id, caller), false);
+    assert.equal(await canDecide(a.id, approver), true);
     await store.updateTask(taskId, { status: { state: TaskState.COMPLETED } });
     assert.equal((await get(path + '/' + a.id, other)).status, 404);
     const decide = (item: typeof a, token = approver, decision = 'approve') =>
@@ -322,8 +327,10 @@ test(
     ).history;
     assert.equal(audit[1].by, operator);
     assert.equal(audit[1].actor, actor);
+    assert.equal(await canDecide(a.id, approver), false);
     const b = await create(1);
     await sql`UPDATE infra.operation_requests SET expires_at=clock_timestamp() WHERE id=${b.id}`;
+    assert.equal(await canDecide(b.id, approver), false);
     assert.equal((await decide(b)).status, 409);
     assert.equal(
       requestView.parse(await (await get(path + '/' + b.id, caller)).json()).state,
@@ -421,6 +428,7 @@ test(
       requestView.parse(await (await get(path + '/' + a.id, recovered)).json()).state,
       'succeeded',
     );
+    assert.equal(await canDecide(a.id, recovered), false);
     assert.equal((await post(path + '/' + a.id + '/cancel', recovered)).status, 401);
     assert.equal((await decide(f, recovered)).status, 401);
     assert.equal((await get(path + '/' + a.id + '/audit', recovered)).status, 401);
