@@ -95,7 +95,7 @@ selection is exclusive with direct OpenAI and Azure environment settings.
 This provider profile disables Codex sub-agents and hosted web search.
 With caller file delivery enabled, A2A tasks expose `send_file` as a top-level
 function. The host validates the path and file limits and emits the attachment
-on the current task. An OpenAI-compatible caller request uses its own tools.
+on the current task.
 The upstream must support the Responses features your tasks use, including
 streaming and tool calls. The host must be able to reach it without an interactive
 login. Changing the endpoint, key or model requires restarting the bridge.
