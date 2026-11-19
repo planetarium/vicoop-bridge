@@ -5,7 +5,7 @@ import { realpath, stat } from 'node:fs/promises';
 import { CommandExecutionError, runDockerCommand, type AsyncDockerRun } from './docker-command.js';
 import { CallerRuntimeStore, scopeDigest, type CallerRuntimeLifecycle } from './caller-runtime-store.js';
 import { brokerFirewallScript } from './execution-runtime-boundary.js';
-import { PROVIDER_ENV_PATTERN } from './provider-environment.js';
+import { providerEnvironmentCheck } from './provider-environment.js';
 import { assertCallerRuntimeBackend, type CallerRuntimeOptions } from './caller-runtime-config.js';
 
 export class CallerScopeCleanupUnconfirmedError extends Error {
@@ -54,6 +54,7 @@ export class DockerCallerRuntimePool {
   private readonly containers = new Map<string, CallerContainer>();
   private readonly run: AsyncDockerRun;
   private readonly storage: CallerStorage;
+  private readonly isProviderEnvironment = providerEnvironmentCheck();
   private locked = false;
   private offline = false;
   private validateExecution = true;
@@ -120,9 +121,7 @@ export class DockerCallerRuntimePool {
         const [image] = JSON.parse(inspected.stdout);
         if (
           Object.keys(image.Config?.Volumes ?? {}).length ||
-          image.Config?.Env?.some((v: string) =>
-            PROVIDER_ENV_PATTERN.test(v.split('=', 1)[0]),
-          )
+          image.Config?.Env?.some(this.isProviderEnvironment)
         )
           throw new Error('caller image must not declare volumes or provider environment');
       }
@@ -268,9 +267,7 @@ export class DockerCallerRuntimePool {
           h.MemorySwap !== h.Memory ||
           h.PidsLimit !== this.options.pids ||
           h.NanoCpus !== this.options.cpus * 1e9)) ||
-      config.Env?.some((v: string) =>
-        PROVIDER_ENV_PATTERN.test(v.split('=', 1)[0]),
-      )
+      config.Env?.some(this.isProviderEnvironment)
     )
       fail();
     const mounts = new Map<string, string>([

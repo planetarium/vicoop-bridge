@@ -239,12 +239,12 @@ test('Azure broker maps only the pinned model, constrains routes and sanitizes f
 test('host Responses provider pins its HTTPS endpoint, model and dedicated key', async () => {
   const env: NodeJS.ProcessEnv = {
     VICOOP_CODEX_RESPONSES_BASE_URL: 'https://model.example/openai/',
-    VICOOP_CODEX_RESPONSES_MODEL: 'example/Model-1',
+    VICOOP_CODEX_RESPONSES_MODEL: 'example/Model-1:latest',
     VICOOP_CODEX_RESPONSES_API_KEY: 'fixture',
   };
   const reader = createCodexCredentialReader(env);
   const selected = await reader();
-  assert.deepEqual(selected.responsesProvider, { endpoint: 'https://model.example/openai', model: 'example/Model-1' });
+  assert.deepEqual(selected.responsesProvider, { endpoint: 'https://model.example/openai', model: 'example/Model-1:latest' });
   for (const endpoint of ['http://model.example', 'https://name@model.example', 'https://model.example/?key=foo', 'https://model.example/#fragment'])
     assert.throws(() => createCodexCredentialReader({ ...env, VICOOP_CODEX_RESPONSES_BASE_URL: endpoint }));
   for (const key of Object.keys(env))
@@ -265,7 +265,7 @@ test('host Responses provider pins its HTTPS endpoint, model and dedicated key',
     assert.equal((await request('gpt-5.4')).status, 403);
     env.VICOOP_CODEX_RESPONSES_API_KEY = 'replaced';
     assert.throws(reader, /changed/);
-    assert.equal((await request('example/Model-1')).status, 503);
+    assert.equal((await request('example/Model-1:latest')).status, 503);
     assert.equal(broker.stats.forwarded, 0);
   } finally {
     broker.revoke();

@@ -21,7 +21,7 @@ import {
 import { defaultConfigPath, writeConfig } from './config.js';
 import { runDockerCommand, type AsyncDockerRun } from './docker-command.js';
 import { createLogger, type Logger } from './logger.js';
-import { PROVIDER_ENV_PATTERN } from './provider-environment.js';
+import { providerEnvironmentCheck } from './provider-environment.js';
 
 export interface CallerContainerInitOptions extends StorageInitOptions {
   kind: InstallableBackendKind;
@@ -134,6 +134,7 @@ export async function runCallerContainerInit(
       ? createClaudeCredentialReader()
       : createCodexCredentialReader());
   await credential();
+  const isProviderEnvironment = providerEnvironmentCheck();
   log.info(
     `${opts.kind} host authentication found; credentials remain on the host.`,
   );
@@ -225,9 +226,7 @@ export async function runCallerContainerInit(
       .parse(JSON.parse(inspected.stdout));
     if (
       Object.keys(image.Config.Volumes ?? {}).length ||
-      image.Config.Env?.some((v) =>
-        PROVIDER_ENV_PATTERN.test(v.split('=', 1)[0]),
-      )
+      image.Config.Env?.some(isProviderEnvironment)
     )
       throw new Error(
         'caller image must not declare volumes or provider environment',

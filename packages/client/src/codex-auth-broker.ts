@@ -2,6 +2,7 @@ import semver from 'semver';
 import { BACKENDS_MANIFEST } from './backends-manifest.js';
 import { readFileSync, existsSync } from 'node:fs';
 import { validateHeaderName } from 'node:http';
+import { responsesHeaderReferences } from './provider-environment.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -51,7 +52,7 @@ function validateAzureModels(model: string | undefined, deployment: string | und
 }
 
 function responsesProvider(endpoint?: string, model?: string): ResponsesProvider {
-  if (!model || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/.test(model))
+  if (!model || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(model))
     throw new Error('Codex Responses provider requires an explicit model ID');
   // Accept an HTTPS base URL with an optional path prefix. Append only the
   // broker's own routes. Keep credentials and query parameters out of the URL.
@@ -72,29 +73,19 @@ const reservedHeaders = new Set([
 ]);
 
 function readResponsesHeaders(env: NodeJS.ProcessEnv) {
-  const raw = env.VICOOP_CODEX_RESPONSES_EXTRA_HEADERS;
+  const refs = responsesHeaderReferences(env.VICOOP_CODEX_RESPONSES_EXTRA_HEADERS);
   const headers: Record<string, string> = Object.create(null);
-  const sources: string[] = [];
-  if (raw !== undefined) {
-    let entries: unknown;
-    try { entries = JSON.parse(raw); } catch { throw new Error('Invalid Codex Responses extra header mapping'); }
-    if (!entries || typeof entries !== 'object' || Array.isArray(entries))
-      throw new Error('Codex Responses extra headers must map header names to environment variable names');
-    for (const [name, source] of Object.entries(entries)) {
-      try { validateHeaderName(name); } catch { throw new Error('Invalid Codex Responses header name'); }
-      const lower = name.toLowerCase();
-      if (reservedHeaders.has(lower) || Object.hasOwn(headers, lower))
-        throw new Error(`Reserved or duplicate Codex Responses header: ${name}`);
-      if (typeof source !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(source))
-        throw new Error(`Invalid environment reference for Codex Responses header: ${name}`);
-      const value = env[source];
-      if (typeof value !== 'string' || !value.trim() || /[^\x20-\x7e]/.test(value))
-        throw new Error(`Missing or invalid value for Codex Responses header: ${name}`);
-      headers[lower] = value;
-      sources.push(source);
-    }
+  for (const [name, source] of Object.entries(refs)) {
+    try { validateHeaderName(name); } catch { throw new Error('Invalid Codex Responses header name'); }
+    const lower = name.toLowerCase();
+    if (reservedHeaders.has(lower) || Object.hasOwn(headers, lower))
+      throw new Error(`Reserved or duplicate Codex Responses header: ${name}`);
+    const value = env[source];
+    if (typeof value !== 'string' || !value.trim() || /[^\x20-\x7e]/.test(value))
+      throw new Error(`Missing or invalid value for Codex Responses header: ${name}`);
+    headers[lower] = value;
   }
-  return { headers: Object.freeze(headers), sources };
+  return { headers: Object.freeze(headers), sources: Object.values(refs) };
 }
 
 export function codexProviderAppServerArgs(credential?: CodexCredential): string[] | undefined {

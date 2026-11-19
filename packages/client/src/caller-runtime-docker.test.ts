@@ -62,6 +62,16 @@ test('offline recovery accepts changed limits but rejects running or unowned res
   info.State.Running = true;
   await assert.rejects(pool().initialize(false), /stop the daemon/);
   info.State.Running = false;
+  const oldMapping = process.env.VICOOP_CODEX_RESPONSES_EXTRA_HEADERS;
+  process.env.VICOOP_CODEX_RESPONSES_EXTRA_HEADERS = '{"X-Gateway":"MODEL_GATEWAY_TOKEN"}';
+  try {
+    info.Config.Env.push('MODEL_GATEWAY_TOKEN=fixture');
+    await assert.rejects(pool().initialize(false), /boundary mismatch/);
+  } finally {
+    info.Config.Env.pop();
+    if (oldMapping === undefined) delete process.env.VICOOP_CODEX_RESPONSES_EXTRA_HEADERS;
+    else process.env.VICOOP_CODEX_RESPONSES_EXTRA_HEADERS = oldMapping;
+  }
   info.HostConfig.PublishAllPorts = true;
   await assert.rejects(pool().initialize(false), /boundary mismatch/);
   info.HostConfig.PublishAllPorts = false;

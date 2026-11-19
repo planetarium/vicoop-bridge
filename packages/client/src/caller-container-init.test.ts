@@ -244,7 +244,15 @@ test('failed image checks preserve config and remove the probe container', async
 });
 
 test('images with provider environment or anonymous volumes are rejected before execution', async (t) => {
+  const previous = process.env.VICOOP_CODEX_RESPONSES_EXTRA_HEADERS;
+  process.env.VICOOP_CODEX_RESPONSES_EXTRA_HEADERS = JSON.stringify({ 'X-Gateway-Token': 'MODEL_GATEWAY_TOKEN' });
+  t.after(() => {
+    if (previous === undefined) delete process.env.VICOOP_CODEX_RESPONSES_EXTRA_HEADERS;
+    else process.env.VICOOP_CODEX_RESPONSES_EXTRA_HEADERS = previous;
+  });
   for (const Config of [
+    { Env: ['MODEL_GATEWAY_TOKEN=fixture'] },
+    { Env: ['VICOOP_CODEX_RESPONSES_MODEL=fixture'] },
     { Env: ['ANTHROPIC_API_KEY=secret'] },
     { Env: ['VICOOP_CLAUDE_FOUNDRY_MODEL_MAP=private-mapping'] },
     { Env: ['VICOOP_CODEX_AZURE_ENDPOINT=https://fixture.openai.azure.com/openai/v1'] },
