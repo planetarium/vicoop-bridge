@@ -1211,7 +1211,7 @@ CREATE OR REPLACE FUNCTION preserve_federation_restriction() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
   IF (array_position(OLD.allowed_callers, 'federation-restricted:v1') IS NOT NULL
-      OR EXISTS (SELECT 1 FROM unnest(NEW.allowed_callers) c WHERE c LIKE 'federated-delegation:v1:%'))
+      OR EXISTS (SELECT 1 FROM unnest(OLD.allowed_callers || NEW.allowed_callers) c WHERE c LIKE 'federated-delegation:v1:%'))
      AND array_position(NEW.allowed_callers, 'federation-restricted:v1') IS NULL THEN
     NEW.allowed_callers := array_append(NEW.allowed_callers, 'federation-restricted:v1');
   END IF;

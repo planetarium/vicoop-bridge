@@ -1294,6 +1294,15 @@ test('delegation owner API generations revoke tokens/tasks and never reopen publ
     await sql`UPDATE agents SET allowed_callers = '{}' WHERE id = ${setup.agentId}`;
     const [stored] = await sql`SELECT allowed_callers FROM agents WHERE id = ${setup.agentId}`;
     assert.deepEqual(stored.allowed_callers, ['federation-restricted:v1']);
+    // Older rows may have a delegation and a NULL element but no sticky marker.
+    await sql.begin(async tx => {
+      const legacy = 'legacy-' + randomUUID();
+      await tx`INSERT INTO agents(id, owner_principal, name, token_hash, allowed_callers)
+        VALUES (${legacy}, ${owner}, 'legacy', ${legacy}, ARRAY[${first.principal}::text, NULL])`;
+      const [updated] = await tx`UPDATE agents SET allowed_callers = '{}' WHERE id = ${legacy} RETURNING allowed_callers`;
+      assert.deepEqual(updated.allowed_callers, ['federation-restricted:v1']);
+      await tx`DELETE FROM agents WHERE id = ${legacy}`;
+    });
     const second = await (await mutate('POST')).json() as { principal: string };
     assert.notEqual(second.principal, first.principal);
     await assert.rejects(verifyTokenExchangeAccessToken(sql, token.rawToken, setup.agentId), /revoked/);
