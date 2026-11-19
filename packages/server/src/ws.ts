@@ -452,11 +452,13 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         const accepted = acceptTaskFrame(frame);
         if (!accepted || accepted.kind === 'handled') return;
         const { binding: b } = accepted;
-        if (frame.artifact.extensions?.includes(OPERATION_APPROVAL_EXTENSION_URI)) {
+        const taggedProposal = frame.artifact.extensions?.includes(OPERATION_APPROVAL_EXTENSION_URI);
+        const proposalPart = frame.artifact.parts.some(part => part.kind === 'data' && part.data.type === OPERATION_PROPOSAL_TYPE);
+        if (taggedProposal || proposalPart) {
           const grant = b.operationGrant;
           const conn = opts.registry.getAgent(b.agentId);
           const [part] = frame.artifact.parts;
-          if (!grant || grant.ownerRevision !== conn?.ownerRevision ||
+          if (!taggedProposal || !grant || grant.ownerRevision !== conn?.ownerRevision ||
               !b.authorizationKey || !conn.allowedCallers.includes(b.authorizationKey) ||
               frame.append || !frame.lastChunk || frame.artifact.parts.length !== 1 ||
               part?.kind !== 'data' || part.data.type !== OPERATION_PROPOSAL_TYPE ||

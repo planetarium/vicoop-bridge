@@ -1207,14 +1207,14 @@ test('operation artifacts require the active execution grant before forwarding',
     await waitForAgent(registry, 'agent-1');
     const conn = registry.getAgent('agent-1')!;
     conn.ownerRevision = 4; conn.allowedCallers = ['requester'];
-    for (const scenario of ['allowed', 'unnegotiated', 'other-operation', 'old-owner', 'removed-grant', 'chunk']) {
+    for (const scenario of ['allowed', 'untagged', 'unnegotiated', 'other-operation', 'old-owner', 'removed-grant', 'chunk']) {
       const sink = makeSink();
       registry.bindTask({ agentId: conn.agentId, taskId: scenario, contextId: 'ctx', sink,
         executionId: scenario, nextClientSeq: 0, authorizationKey: scenario === 'removed-grant' ? 'revoked' : 'requester',
         operationGrant: scenario === 'unnegotiated' ? undefined :
           { names: ['merge-pr'], ownerRevision: scenario === 'old-owner' ? 3 : 4 } });
       ws.send(encodeFrame({ type: 'task.artifact', taskId: scenario, executionId: scenario, seq: 0,
-        lastChunk: scenario !== 'chunk', artifact: { artifactId: 'proposal', extensions: [OPERATION_APPROVAL_EXTENSION_URI],
+        lastChunk: scenario !== 'chunk', artifact: { artifactId: 'proposal', extensions: scenario === 'untagged' ? [] : [OPERATION_APPROVAL_EXTENSION_URI],
           parts: [{ kind: 'data', data: { type: OPERATION_PROPOSAL_TYPE,
             operation: scenario === 'other-operation' ? 'sync' : 'merge-pr', arguments: {} } }] } }));
       if (scenario === 'allowed') ws.send(encodeFrame({ type: 'task.complete', taskId: scenario, executionId: scenario,
