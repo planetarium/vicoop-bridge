@@ -24,7 +24,14 @@ const definition = z
     ttlSeconds: z.number().int().min(3600).max(604800),
     executorTokenSha256: z.string().regex(/^[a-f0-9]{64}$/),
     operators: z
-      .array(z.object({ principalId: z.string().min(1), actorId: z.string().min(1) }).strict())
+      .array(
+        z
+          .object({
+            principalId: z.string().min(1),
+            actorId: z.string().min(1),
+          })
+          .strict(),
+      )
       .min(1),
     fields: z.record(
       name,
@@ -37,9 +44,9 @@ const definition = z
     ),
   })
   .strict();
-type Definition = z.infer<typeof definition>;
+export type OperationDefinition = z.infer<typeof definition>;
 
-export function readOperationRegistry(raw: string | undefined): Definition[] {
+export function readOperationRegistry(raw: string | undefined): OperationDefinition[] {
   if (!raw) return [];
   const entries = z.array(definition).max(256).parse(JSON.parse(raw));
   const epochs = new Set<string>();
@@ -66,15 +73,29 @@ const registration = z
   })
   .strict();
 const decision = z
-  .object({ decision: z.enum(['approve', 'deny']), digest: z.string().regex(/^[a-f0-9]{64}$/) })
+  .object({
+    decision: z.enum(['approve', 'deny']),
+    digest: z.string().regex(/^[a-f0-9]{64}$/),
+  })
   .strict();
 const outcome = z
-  .object({ state: z.enum(['succeeded', 'failed', 'unknown']), result: z.string().max(1024) })
+  .object({
+    state: z.enum(['succeeded', 'failed', 'unknown']),
+    result: z.string().max(1024),
+  })
   .strict();
-function policyDigest(policy: Definition) {
+function policyDigest(policy: OperationDefinition) {
   // Credential rotation preserves the identity of this named executor.
   const { executorTokenSha256: _credential, ...definition } = policy;
   return hash(canonical(definition));
+}
+// Run before serving connections with the new immutable registry.
+export async function reconcileOperationPolicies(db: Sql, policies: OperationDefinition[]) {
+  const hashes = policies.map(policyDigest);
+  await db`UPDATE infra.operation_requests SET state='cancelled', result='Operation policy changed',
+    history=history||jsonb_build_object('event','policy_changed','at',clock_timestamp())
+    WHERE state IN ('pending','approved') AND expires_at > clock_timestamp()
+    AND NOT (policy_digest = ANY(${hashes}::text[]))`;
 }
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const canonical = (value: unknown): string =>
@@ -132,7 +153,9 @@ type Source = {
   authorization_profile: string;
   authorization_key: string;
   authorization_revoked_at: Date | null;
-  task_json: { artifacts?: { artifactId: string; parts?: { data?: unknown }[] }[] };
+  task_json: {
+    artifacts?: { artifactId: string; parts?: { data?: unknown }[] }[];
+  };
 };
 function view(row: RequestRow) {
   return {
@@ -148,10 +171,12 @@ function view(row: RequestRow) {
     result: row.result,
   };
 }
-async function record(db: SqlExecutor, agent: string, id: string) {
+async function record(db: SqlExecutor, agent: string, id: string, lock = false) {
   if (!z.string().uuid().safeParse(id).success) missing();
   const [row] = await db<RequestRow[]>`SELECT *, expires_at <= clock_timestamp() AS expired
-    FROM infra.operation_requests WHERE agent_id=${agent} AND id=${id} FOR UPDATE`;
+    FROM infra.operation_requests WHERE agent_id=${agent} AND id=${id} ${
+    lock ? db`FOR UPDATE` : db``
+  }`;
   return row ?? missing();
 }
 async function source(db: SqlExecutor, agent: string, task: string) {
@@ -173,7 +198,7 @@ function isRequester(row: RequestRow, user: TokenExchangeAccessToken) {
     user.allowedCaller === row.grant_key
   );
 }
-function operator(policy: Definition, user: TokenExchangeAccessToken) {
+function operator(policy: OperationDefinition, user: TokenExchangeAccessToken) {
   return policy.operators.some(
     (o) => o.principalId === user.principalId && o.actorId === user.actorId,
   );
@@ -184,7 +209,6 @@ export function mountOperations(
   db: Sql,
   policies = readOperationRegistry(process.env.VICOOP_OPERATIONS),
 ) {
-  if (!policies.length) return;
   const path = '/agents/:agent/operations';
   const workerPath = '/operation-executors/:agent/:operation';
   const limit = bodyLimit({ maxSize: 16 * 1024 });
@@ -218,21 +242,26 @@ export function mountOperations(
     if (!identity.scopes.includes('a2a:task.read')) missing();
     return identity;
   }
-  async function policyFor(tx: SqlExecutor, agent: string, operation: string) {
+  async function ownerFor(tx: SqlExecutor, agent: string) {
     const [owner] = await tx<{ owner_principal: string; owner_revision: string }[]>`
       SELECT owner_principal, owner_revision::text FROM agents WHERE id=${agent} FOR SHARE`;
     if (!owner) missing();
-    return (
-      policies.find(
-        (p) =>
-          p.agentId === agent &&
-          p.operation === operation &&
-          p.ownerPrincipal === owner.owner_principal &&
-          p.ownerRevision === Number(owner.owner_revision),
-      ) ?? missing()
+    return owner;
+  }
+  function policyFor(
+    agent: string,
+    operation: string,
+    owner: Awaited<ReturnType<typeof ownerFor>>,
+  ) {
+    return policies.find(
+      (p) =>
+        p.agentId === agent &&
+        p.operation === operation &&
+        p.ownerPrincipal === owner.owner_principal &&
+        p.ownerRevision === Number(owner.owner_revision),
     );
   }
-  function samePolicy(row: RequestRow, policy: Definition) {
+  function samePolicy(row: RequestRow, policy: OperationDefinition) {
     return (
       row.agent_owner === policy.ownerPrincipal &&
       Number(row.owner_revision) === policy.ownerRevision &&
@@ -246,7 +275,7 @@ export function mountOperations(
       await db.begin(async (tx) => {
         const identity = await user(tx, c, agent);
         if (identity.taskId && identity.taskId !== input.taskId) missing();
-        const policy = await policyFor(tx, agent, input.operation);
+        const policy = policyFor(agent, input.operation, await ownerFor(tx, agent)) ?? missing();
         const data = {
           type: 'vicoop.operation-proposal.v1',
           operation: input.operation,
@@ -289,7 +318,7 @@ export function mountOperations(
           error(409, 'Proposal task is not ready');
         const artifact =
           origin.task_json.artifacts?.filter((a) => a.artifactId === input.proposalKey) ?? [];
-        if (!artifact.length) error(409, 'Proposal artifact unavailable');
+        if (!artifact.length) error(400, 'Proposal artifact missing from ready task');
         if (
           artifact.length !== 1 ||
           artifact[0].parts?.length !== 1 ||
@@ -334,15 +363,16 @@ export function mountOperations(
       tx: SqlExecutor,
       row: RequestRow,
       identity: TokenExchangeAccessToken,
-      policy: Definition,
+      policy: OperationDefinition | undefined,
     ) => Promise<T>,
     allowRetainedOperationRead = false,
   ) {
     const agent = c.req.param('agent')!;
     return db.begin(async (tx) => {
       const identity = await user(tx, c, agent, allowRetainedOperationRead);
-      const row = await record(tx, agent, c.req.param('id')!);
-      const policy = await policyFor(tx, agent, row.operation);
+      const row = await record(tx, agent, c.req.param('id')!, c.req.method !== 'GET');
+      const owner = await ownerFor(tx, agent);
+      const policy = policyFor(agent, row.operation, owner);
       if (identity.taskId && identity.taskId !== row.task_id) missing();
       if (
         identity.operationReadRevision !== undefined &&
@@ -351,11 +381,8 @@ export function mountOperations(
           !isRequester(row, identity))
       )
         missing();
-      if (!isRequester(row, identity) && !operator(policy, identity)) missing();
-      if (
-        policy.ownerPrincipal !== row.agent_owner ||
-        policy.ownerRevision !== Number(row.owner_revision)
-      )
+      if (!isRequester(row, identity) && !(policy && operator(policy, identity))) missing();
+      if (owner.owner_principal !== row.agent_owner || owner.owner_revision !== row.owner_revision)
         missing();
       return action(tx, row, identity, policy);
     });
@@ -373,7 +400,7 @@ export function mountOperations(
     const input = await body(c, decision);
     return c.json(
       await access(c, async (tx, row, identity, policy) => {
-        if (!operator(policy, identity)) missing();
+        if (!policy || !operator(policy, identity)) missing();
         if (!samePolicy(row, policy) || input.digest !== row.digest) error(409, 'Proposal changed');
         const next = input.decision === 'approve' ? 'approved' : 'denied';
         if (
@@ -427,7 +454,7 @@ export function mountOperations(
         const p = worker(c);
         // A credential from a previous ownership revision can reconcile its
         // existing effects, but has no authority to acquire new work.
-        if (p !== (await policyFor(tx, p.agentId, p.operation))) missing();
+        if (p !== policyFor(p.agentId, p.operation, await ownerFor(tx, p.agentId))) missing();
         // One irrevocable claim; a lost HTTP response can require reconciliation,
         // but cannot cause a second dispatch. Removed grants invalidate queued jobs.
         const [row] = await tx<RequestRow[]>`WITH candidate AS (
@@ -466,7 +493,7 @@ export function mountOperations(
     return c.json(
       await db.begin(async (tx) => {
         const p = worker(c);
-        const row = await record(tx, p.agentId, c.req.param('id')!);
+        const row = await record(tx, p.agentId, c.req.param('id')!, true);
         if (
           row.operation !== p.operation ||
           row.agent_owner !== p.ownerPrincipal ||

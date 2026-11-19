@@ -1284,4 +1284,6 @@ FOR EACH ROW WHEN (OLD.allowed_callers IS DISTINCT FROM NEW.allowed_callers OR
   OLD.owner_principal IS DISTINCT FROM NEW.owner_principal)
 EXECUTE FUNCTION infra.invalidate_operation_approvals();
 -- The earlier legacy blanket infra grant can run again on an existing DB.
-REVOKE ALL ON infra.operation_requests FROM app_postgraphile, app_authenticated, PUBLIC;
+REVOKE ALL ON infra.operation_requests FROM app_anonymous, app_authenticated, PUBLIC;
+GRANT SELECT, INSERT, UPDATE ON infra.operation_requests TO app_postgraphile;
+REVOKE DELETE ON infra.operation_requests FROM app_postgraphile;

@@ -1,6 +1,7 @@
 import { watchAgentOwners } from './agent-transfer.js';
 import { serve } from '@hono/node-server';
 import { Registry } from './registry.js';
+import { readOperationRegistry, reconcileOperationPolicies } from './operations.js';
 import { createHttpApp } from './http.js';
 import { attachWsServer } from './ws.js';
 import { PostgresTaskStore } from './postgres-task-store.js';
@@ -84,9 +85,12 @@ export interface ServerOptions {
 }
 
 export async function startServer(opts: ServerOptions) {
+  const policies = readOperationRegistry(process.env.VICOOP_OPERATIONS);
+  await reconcileOperationPolicies(opts.db, policies);
   const registry = new Registry();
   const app = createHttpApp({
     registry,
+    operationPolicies: policies,
     publicUrl: opts.publicUrl,
     db: opts.db,
     google: opts.google,

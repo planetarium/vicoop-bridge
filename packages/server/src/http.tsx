@@ -62,7 +62,7 @@ import {
   rejectAgentRequest,
 } from './agent-auth.js';
 import { CALLER_TOKEN_PREFIX, OWNER_SESSION_PREFIX, verifySessionToken } from './auth/caller-token.js';
-import { mountOperations } from './operations.js';
+import { mountOperations, type OperationDefinition } from './operations.js';
 import { mountDeviceFlow } from './auth/device-flow.js';
 import { mountDeviceUi } from './auth/device-ui.js';
 import { mountTokenRevocation } from './auth/revoke.js';
@@ -107,6 +107,7 @@ import {
 } from './oauth/token-exchange/authorization.js';
 
 export interface ServerHttpOptions {
+  operationPolicies?: OperationDefinition[];
   registry: Registry;
   publicUrl?: string;
   db: Sql;
@@ -190,7 +191,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }),
   );
 
-  mountOperations(app, opts.db);
+  mountOperations(app, opts.db, opts.operationPolicies);
 
   // The built-in admin agent and every connected client agent get distinct
   // owner-scoped views of the same Postgres table. A handler can therefore

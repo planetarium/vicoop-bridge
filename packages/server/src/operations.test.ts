@@ -19,11 +19,19 @@ import {
 } from './oauth/profiles/mentionable-v0.1.js';
 import { Hono } from 'hono';
 import { z } from 'zod';
-const requestView = z.object({ id: z.string().uuid(), state: z.string(), digest: z.string() });
+const requestView = z.object({
+  id: z.string().uuid(),
+  state: z.string(),
+  digest: z.string(),
+});
 const claim = z.object({ operation: requestView.nullable() });
 const history = z.object({
   history: z.array(
-    z.object({ event: z.string(), by: z.string().optional(), actor: z.string().optional() }),
+    z.object({
+      event: z.string(),
+      by: z.string().optional(),
+      actor: z.string().optional(),
+    }),
   ),
 });
 import { PostgresTaskStore } from './postgres-task-store.js';
@@ -32,7 +40,11 @@ import {
   issueTokenExchangeAccessToken,
   verifyTokenExchangeAccessToken,
 } from './oauth/token-exchange/store.js';
-import { mountOperations, readOperationRegistry } from './operations.js';
+import {
+  mountOperations,
+  readOperationRegistry,
+  reconcileOperationPolicies,
+} from './operations.js';
 
 test(
   'registered operations bind A2A artifacts, preserve individual authority and claim a single external execution',
@@ -62,7 +74,10 @@ test(
       ttlSeconds: 86400,
       executorTokenSha256: createHash('sha256').update(executorToken).digest('hex'),
       operators: [{ principalId: operator, actorId: actor }],
-      fields: { pull: { type: 'integer' }, repo: { type: 'string', allowedValues: ['org/repo'] } },
+      fields: {
+        pull: { type: 'integer' },
+        repo: { type: 'string', allowedValues: ['org/repo'] },
+      },
     };
     const successorToken = randomUUID();
     const successor = {
@@ -81,8 +96,18 @@ test(
         ),
       /distinct executor credentials/,
     );
+    // Connect like the HTTP server, after applying migrations with the setup role.
+    const runtime = postgres(process.env.DATABASE_URL!, {
+      connection: { role: 'app_postgraphile' },
+    });
+    t.after(async () => runtime.end());
+    assert.equal((await runtime`SELECT current_user`)[0].current_user, 'app_postgraphile');
+    const exposed =
+      await sql`SELECT role FROM (VALUES ('app_anonymous'), ('app_authenticated')) AS r(role)
+      WHERE has_table_privilege(role, 'infra.operation_requests', 'SELECT,INSERT,UPDATE,DELETE')`;
+    assert.deepEqual([...exposed], []);
     const app = new Hono();
-    mountOperations(app, sql, readOperationRegistry(JSON.stringify([policy, successor])));
+    mountOperations(app, runtime, readOperationRegistry(JSON.stringify([policy, successor])));
     const path = '/agents/' + agentId + '/operations';
     const worker = '/operation-executors/' + agentId + '/merge-pr';
     t.after(async () => {
@@ -112,12 +137,15 @@ test(
     const post = (uri: string, token: string, input?: unknown) =>
       app.request(uri, {
         method: 'POST',
-        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+        headers: {
+          Authorization: 'Bearer ' + token,
+          'Content-Type': 'application/json',
+        },
         body: JSON.stringify(input ?? {}),
       });
     const get = (uri: string, token: string) =>
       app.request(uri, { headers: { Authorization: 'Bearer ' + token } });
-    const artifacts = Array.from({ length: 8 }, (_, index) => ({
+    const artifacts = Array.from({ length: 10 }, (_, index) => ({
       artifactId: randomUUID(),
       parts: [
         {
@@ -137,8 +165,14 @@ test(
       _authorizationKey: requesterGrant,
       _authorizationProfile: MENTIONABLE_OAUTH_PROFILE_ID,
     };
-    const { id: taskId } = await store.createTask({ contextId: randomUUID(), metadata });
-    await store.updateTask(taskId, { artifacts, status: { state: TaskState.WORKING } });
+    const { id: taskId } = await store.createTask({
+      contextId: randomUUID(),
+      metadata,
+    });
+    await store.updateTask(taskId, {
+      artifacts,
+      status: { state: TaskState.WORKING },
+    });
     const payload = (i: number) => ({
       taskId,
       proposalKey: artifacts[i].artifactId,
@@ -146,10 +180,18 @@ test(
       arguments: artifacts[i].parts[0].data.arguments,
     });
     assert.equal((await post(path, caller, payload(0))).status, 409);
-    const abandoned = await store.createTask({ contextId: randomUUID(), metadata });
-    await store.updateTask(abandoned.id, { artifacts, status: { state: TaskState.FAILED } });
+    const abandoned = await store.createTask({
+      contextId: randomUUID(),
+      metadata,
+    });
+    await store.updateTask(abandoned.id, {
+      artifacts,
+      status: { state: TaskState.FAILED },
+    });
     assert.equal((await post(path, caller, { ...payload(0), taskId: abandoned.id })).status, 400);
-    await store.updateTask(taskId, { status: { state: TaskState.INPUT_REQUIRED } });
+    await store.updateTask(taskId, {
+      status: { state: TaskState.INPUT_REQUIRED },
+    });
     const create = async (i: number) => {
       const r = await post(path, caller, payload(i));
       assert.equal(r.status, 200, await r.clone().text());
@@ -157,11 +199,15 @@ test(
     };
     assert.equal(
       (await post(path, caller, { ...payload(0), proposalKey: randomUUID() })).status,
-      409,
+      400,
     );
     assert.equal(
-      (await post(path, caller, { ...payload(0), arguments: { repo: 'org/repo', pull: 500 } }))
-        .status,
+      (
+        await post(path, caller, {
+          ...payload(0),
+          arguments: { repo: 'org/repo', pull: 500 },
+        })
+      ).status,
       409,
     );
     assert.equal((await post(path, other, payload(0))).status, 404);
@@ -169,14 +215,64 @@ test(
       (await post(path, await issue(requester, requesterGrant, randomUUID()), payload(0))).status,
       404,
     );
+    const pending = await create(8);
+    const approved = await create(9);
+    assert.equal(
+      (
+        await post(path + '/' + approved.id + '/decision', approver, {
+          decision: 'approve',
+          digest: approved.digest,
+        })
+      ).status,
+      200,
+    );
+    const empty = new Hono();
+    mountOperations(empty, runtime, []);
+    const changed = readOperationRegistry(JSON.stringify([{ ...policy, ttlSeconds: 3600 }]));
+    await reconcileOperationPolicies(runtime, changed);
+    await reconcileOperationPolicies(runtime, []);
+    await reconcileOperationPolicies(runtime, readOperationRegistry(JSON.stringify([policy])));
+    for (const item of [pending, approved]) {
+      const status = await empty.request(path + '/' + item.id, {
+        headers: { Authorization: 'Bearer ' + caller },
+      });
+      assert.equal(requestView.parse(await status.json()).state, 'cancelled');
+      const audit = history.parse(
+        await (await get(path + '/' + item.id + '/audit', caller)).json(),
+      );
+      assert.deepEqual(audit.history.filter((e) => e.event === 'policy_changed').length, 1);
+    }
     const [a, replay] = await Promise.all([create(0), create(0)]);
     assert.deepEqual(a, replay);
     await store.updateTask(taskId, { status: { state: TaskState.COMPLETED } });
     assert.equal((await get(path + '/' + a.id, other)).status, 404);
     const decide = (item: typeof a, token = approver, decision = 'approve') =>
-      post(path + '/' + item.id + '/decision', token, { decision, digest: item.digest });
+      post(path + '/' + item.id + '/decision', token, {
+        decision,
+        digest: item.digest,
+      });
     assert.equal((await decide(a, caller)).status, 404);
     assert.equal((await decide({ ...a, digest: '0'.repeat(64) })).status, 409);
+    // Read-only views do not wait on a concurrent operation-row writer.
+    await sql.begin(async (tx) => {
+      await tx`SELECT id FROM infra.operation_requests WHERE id=${a.id} FOR UPDATE`;
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          Promise.all(
+            ['', '/audit'].map(async (suffix) => {
+              const res = await get(path + '/' + a.id + suffix, caller);
+              assert.equal(res.status, 200);
+            }),
+          ),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(Error('reader blocked')), 2000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    });
     // A connector can poll while an operator retries the same decision.
     // Warm the pool so independent transactions actually use different sessions.
     await Promise.all(Array.from({ length: 6 }, () => sql`SELECT pg_sleep(0.01)`));
@@ -274,7 +370,12 @@ test(
               return {
                 id: actor,
                 verificationMethod: [
-                  { id: kid, type: 'JsonWebKey', controller: actor, publicKeyJwk },
+                  {
+                    id: kid,
+                    type: 'JsonWebKey',
+                    controller: actor,
+                    publicKeyJwk,
+                  },
                 ],
                 assertionMethod: [kid],
               };
