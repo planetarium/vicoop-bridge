@@ -3,7 +3,7 @@ import {
   CallerAttestationV2,
   type CallerAttestationV2 as CallerAttestationV2Value,
 } from '@vicoop-bridge/protocol';
-import type { Sql } from '../../db.js';
+import type { Sql, SqlExecutor } from '../../db.js';
 import { TOKEN_EXCHANGE_ACCESS_TOKEN_PREFIX } from './types.js';
 
 export interface TokenExchangeAccessToken {
@@ -134,7 +134,7 @@ export async function issueTokenExchangeAccessToken(
 }
 
 export async function verifyTokenExchangeAccessToken(
-  sql: Sql,
+  sql: SqlExecutor,
   rawToken: string,
   expectedAgentId: string,
 ): Promise<TokenExchangeAccessToken> {

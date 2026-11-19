@@ -211,3 +211,43 @@ test('clean reader policy rejection keeps execution reusable', async () => {
   await delivery.send({path:'/workspace/output/x'},signal);await delivery.settle();
   assert.equal(delivery.healthy(),true);
 });
+
+for (const kind of ['claude','codex'] as const) test(kind+' caller MCP proposes an immutable artifact with files disabled',async () => {
+  const {proposalEmitter} = await import('./operation-proposals.js');
+  const frames: object[]=[];
+  const controller = new AbortController();
+  const propose=proposalEmitter(['merge-pr'],'task-id',frame=>frames.push(frame),controller.signal);
+  const adapter=fileAdapter(kind,{
+    filesEnabled:false,operations:['merge-pr'],description:'',
+    bind:()=>async(input,signal,tool)=>{
+      signal.throwIfAborted(); assert.equal(tool,'propose_operation'); return propose(input);
+    },
+  });
+  const script=helperLookup+String.raw`
+    const {spawn}=require('node:child_process'),assert=require('node:assert/strict');
+    const helperProcess=spawn(process.execPath,helper.args,{stdio:['pipe','pipe','inherit']});
+    require('node:readline').createInterface({input:helperProcess.stdout}).on('line',line=>{
+      const reply=JSON.parse(line);
+      if (reply.id===1) {
+        assert.deepEqual(reply.result.tools.map(tool=>tool.name),['propose_operation']);
+        assert.deepEqual(reply.result.tools[0].inputSchema.properties.operation.enum,['merge-pr']);
+        helperProcess.stdin.write(JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',
+          params:{name:'propose_operation',arguments:{operation:'merge-pr',arguments:{pull:42}}}})+'\n');
+      } else {
+        assert.equal(JSON.parse(reply.result.content[0].text).proposed,true);
+        helperProcess.kill();process.exit(0);
+      }
+    });
+    helperProcess.stdin.write(JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/list'})+'\n');
+  `;
+  try {
+    const child=adapter.spawn(process.execPath,['-e',script,'--','--mcp-config','{"mcpServers":{}}'],{});
+    child.stdin!.end();
+    assert.equal(await new Promise(resolve=>child.on('close',resolve)),0);
+    assert.equal(frames.length,1);
+    assert.deepEqual(frames[0],{type:'task.artifact',taskId:'task-id',lastChunk:true,artifact:{
+      name:'operation-proposal',artifactId:(frames[0] as {artifact:{artifactId:string}}).artifact.artifactId,
+      parts:[{kind:'data',data:{type:'vicoop.operation-proposal.v1',operation:'merge-pr',arguments:{pull:42}}}],
+    }});
+  } finally {adapter.close();}
+});

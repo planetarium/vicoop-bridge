@@ -50,3 +50,10 @@ test('file delivery is advertised only for explicitly enabled Claude and Codex c
   }
   assert.throws(() => callerRuntimeCard(AgentCard.parse(resolveBundledCard('claude')), 'openclaw', false, true), /Claude and Codex only/);
 });
+
+test('operations-only caller agents advertise structured proposal output', () => {
+  const host = AgentCard.parse(resolveBundledCard('codex'));
+  const card = callerRuntimeCard(host, 'codex', false, false, true);
+  assert.deepEqual(card.defaultOutputModes, ['text/plain','application/json']);
+  assert.match(card.description ?? '', /operation proposals/);
+});

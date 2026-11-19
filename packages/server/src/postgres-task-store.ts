@@ -680,11 +680,12 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     await sql`
       INSERT INTO infra.a2a_tasks
         (task_id, context_id, state, task_json, owner_principal, owner_agent,
-         owner_actor, authorization_profile, authorization_key)
+         owner_actor, authorization_profile, authorization_key, operation_owner_revision)
       VALUES (
         ${task.id}, ${contextId}, ${task.status.state}, ${persisted},
         ${ownerPrincipal ?? null}, ${this.ownerAgent},
-        ${ownerActor ?? null}, ${authorizationProfile ?? null}, ${authorizationKey ?? null}
+        ${ownerActor ?? null}, ${authorizationProfile ?? null}, ${authorizationKey ?? null},
+        (SELECT owner_revision FROM agents WHERE id=${this.ownerAgent})
       )
       ON CONFLICT (task_id) DO UPDATE SET
         context_id = EXCLUDED.context_id,

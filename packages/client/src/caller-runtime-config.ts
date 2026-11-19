@@ -1,3 +1,4 @@
+import { OperationNames } from './operation-proposals.js';
 import { CallerFileDeliveryConfig, callerFilePendingBytes } from './caller-file-delivery.js';
 import { z } from 'zod';
 import { isAbsolute, posix } from 'node:path';
@@ -44,6 +45,7 @@ export const CallerRuntimeConfig = z
       .refine(entries => new Set(entries.map(entry => entry.name)).size === entries.length, 'shared volume names must be unique')
       .refine(entries => new Set(entries.map(entry => entry.volume)).size === entries.length, 'shared volumes must be unique'),
     fileDelivery: CallerFileDeliveryConfig.optional(),
+    operations: OperationNames.optional(),
     credentialProxy: CredentialProxyConfig.optional(),
     concurrency: z.object({
       perCaller: z.number().int().min(1).max(8).default(2),

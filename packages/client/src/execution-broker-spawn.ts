@@ -25,7 +25,7 @@ export function createExecutionBrokerSpawn(container: string | (() => string), o
   cleanupSpawnImpl?: typeof nodeSpawn;
   credentialProxy?: CredentialProxyOptions;
   createServiceProxies?: () => ServiceProxy[];
-  fileDelivery?: { description: string; bind(): (input: unknown, signal: AbortSignal) => Promise<object> };
+  fileDelivery?: { description: string; operations?: string[]; filesEnabled?: boolean; bind(): (input: unknown, signal: AbortSignal, tool?: string) => Promise<object> };
 }) {
   const running = new Set<() => void>();
   let stopped = false;
@@ -183,9 +183,9 @@ export function createExecutionBrokerSpawn(container: string | (() => string), o
           } else if (m.t === 'send-file') {
             if (!deliverFile || fileController.signal.aborted || m.token !== fileToken ||
                 !Number.isSafeInteger(m.id) || m.id < 1 || ++fileRequests > MAX_FILE_REQUESTS_PER_EXECUTION) { fail(); return; }
-            void deliverFile(m.input, fileController.signal).then(
+            void deliverFile(m.input, fileController.signal, m.tool).then(
               result => { if (!fileController.signal.aborted) send({t:'file-result',id:m.id,result}); },
-              () => { if (!fileController.signal.aborted) send({t:'file-result',id:m.id,result:{error:FILE_DELIVERY_REJECTION}}); },
+              () => { if (!fileController.signal.aborted) send({t:'file-result',id:m.id,result:{error:m.tool === 'propose_operation' ? 'Proposal rejected' : FILE_DELIVERY_REJECTION}}); },
             );
           } else if (m.t === 'open') {
             if (!Number.isSafeInteger(m.id) || m.id < 1 || sockets.has(m.id) || sockets.size >= 16) { fail(); return; }
@@ -265,7 +265,7 @@ export function createExecutionBrokerSpawn(container: string | (() => string), o
         services: serviceProxies.map(({name, token, origins}) => ({name, token, origins})),
         ...(serviceProxies.length ? { serviceFetchModule: CREDENTIAL_PROXY_FETCH } : {}),
         authentication: opts.authentication ?? 'oauth',
-        ...(deliverFile ? {fileDelivery:{token:fileToken,helper:CALLER_FILE_MCP,description:opts.fileDelivery!.description}} : {}), files:promptFiles.map((file,id)=>({id,argIndex:file.argIndex})) });
+        ...(deliverFile ? {fileDelivery:{token:fileToken,helper:CALLER_FILE_MCP,operations:opts.fileDelivery!.operations,filesEnabled:opts.fileDelivery!.filesEnabled,description:opts.fileDelivery!.description}} : {}), files:promptFiles.map((file,id)=>({id,argIndex:file.argIndex})) });
     })().catch(fail);
     return Object.assign(events, {
       ...(opts.backend === 'codex' ? {executionToken: broker.token} : {}),
