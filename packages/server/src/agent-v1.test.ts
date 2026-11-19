@@ -15,8 +15,11 @@ import {
 } from '@vicoop-bridge/protocol';
 import { DefaultRequestHandler, HttpJsonRequestHandler, TaskState } from '@a2x/sdk';
 import { createHttpApp } from './http.js';
+import { operationCallerScheme } from './operation-callers.js';
 import { Registry, type ClientConnection } from './registry.js';
-import type { Sql } from './db.js';
+import { ensureSchema, type Sql } from './db.js';
+import postgres from 'postgres';
+import { issueCallerToken } from './auth/caller-token.js';
 import { OAUTH_FEDERATION_EXTENSION_URI } from './oauth/profiles/mentionable-v0.1.js';
 
 const callerRuntimeCapabilities = [
@@ -101,21 +104,42 @@ test('versioned discovery exposes a v1 dual-transport card without changing v0.3
   assert.equal(v03Card.url, 'https://bridge.example/agents/v1-test-agent');
 });
 
+test('operation callers distinguish verified Google subjects, policy selectors and delegated subjects', () => {
+  const principalId = 'google:abc-XYZ_123';
+  assert.equal(operationCallerScheme({ principalId }), 'google');
+  for (const id of ['google:', 'google:sub:abc-XYZ_123', 'google:email:ana@example.com', 'google:domain:example.com']) {
+    assert.equal(operationCallerScheme({ principalId: id }), undefined);
+  }
+  assert.equal(operationCallerScheme({ principalId, actorId: 'mistyped' }), undefined);
+  assert.equal(operationCallerScheme({ principalId, actorId: 'did:web:connector.example' }), 'federated');
+});
+
 test('operation approval discovery requires overlapping runtime and current ownership policy on both card versions', async () => {
-  for (const scenario of ['enabled', 'disabled', 'other-operation', 'old-revision', 'ordinary-agent', 'no-federation']) {
+  for (const scenario of ['enabled', 'google', 'siwe', 'any-direct', 'api-key-only', 'wrong-scheme',
+    'disabled', 'other-operation', 'old-revision', 'ordinary-agent', 'no-federation', 'incomplete-scope']) {
     const registry = new Registry();
     const caller = formatFederatedPrincipal({ issuer: 'did:web:connector.example', subject: 'slack:T/U',
       method: 'urn:mentionable:auth:slack-workspace-member:v0.1' })!;
-    registerAgent(registry, scenario === 'no-federation' ? [] : [caller]);
+    const wallet = 'eth:0x0000000000000000000000000000000000000003';
+    const grants: Record<string, string[]> = {
+      google: ['google:domain:example.com'], siwe: [wallet], 'any-direct': [],
+      'api-key-only': ['apikey:service'], 'wrong-scheme': [wallet], 'no-federation': [],
+    };
+    registerAgent(registry, grants[scenario] ?? [caller]);
     const conn = registry.getAgent('v1-test-agent')!;
     conn.ownerRevision = 7;
-    conn.protocolCapabilities = scenario === 'ordinary-agent' ? [] : callerRuntimeCapabilities;
+    conn.protocolCapabilities = scenario === 'ordinary-agent' ? [] : callerRuntimeCapabilities.filter(capability =>
+      (scenario !== 'incomplete-scope' || capability !== TASK_REPLAY_CAPABILITY) &&
+      (scenario !== 'google' || capability !== FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY));
     conn.agentCard.capabilities = { extensions: [{ uri: OPERATION_APPROVAL_EXTENSION_URI,
       required: true, params: { operations: ['merge-pr'], registrationUrl: 'https://untrusted.example' } }] };
     const policy = {
       agentId: conn.agentId, ownerPrincipal: conn.ownerPrincipal, ownerRevision: scenario === 'old-revision' ? 6 : 7,
       operation: scenario === 'other-operation' ? 'sync' : 'merge-pr', version: '1', executorId: 'host',
-      executorTokenSha256: '0'.repeat(64), operators: [], ttlSeconds: 3600, fields: {},
+      executorTokenSha256: '0'.repeat(64), ttlSeconds: 3600, fields: {},
+      operators: ['google', 'any-direct', 'wrong-scheme', 'api-key-only'].includes(scenario) ? [{ principalId: 'google:abc-XYZ_123' }]
+        : scenario === 'siwe' ? [{ principalId: wallet }]
+        : [{ principalId: 'slack:T/U2', actorId: 'did:web:connector.example' }],
     };
     const app = createHttpApp({ registry, db: fakeSql(), publicUrl: 'https://bridge.example',
       operationPolicies: scenario === 'disabled' ? [] : [policy] });
@@ -124,7 +148,7 @@ test('operation approval discovery requires overlapping runtime and current owne
       assert.equal(response.status, 200);
       const card = await response.json() as AgentCard;
       const matches = card.capabilities?.extensions?.filter(e => e.uri === OPERATION_APPROVAL_EXTENSION_URI) ?? [];
-      assert.equal(matches.length, scenario === 'enabled' ? 1 : 0, scenario);
+      assert.equal(matches.length, ['enabled', 'google', 'siwe', 'any-direct'].includes(scenario) ? 1 : 0, scenario);
       if (matches.length) {
         assert.equal(matches[0]!.required, false);
         assert.deepEqual(matches[0]!.params, { registrationUrl: 'https://bridge.example/agents/v1-test-agent/operations' });
@@ -285,17 +309,23 @@ test('CORS preflight allows the A2A-Version request header', async () => {
   assert.match(response.headers.get('Access-Control-Allow-Headers') ?? '', /A2A-Version/i);
 });
 
-for (const { callerRuntime, federated, apiKeyOnly = false } of [
+for (const { callerRuntime, federated, apiKeyOnly = false, direct } of [
   { callerRuntime: false, federated: true },
   { callerRuntime: false, federated: false },
   { callerRuntime: true, federated: true },
   { callerRuntime: true, federated: false },
   { callerRuntime: false, federated: false, apiKeyOnly: true },
   { callerRuntime: true, federated: false, apiKeyOnly: true },
+  { callerRuntime: true, federated: false, direct: 'google' },
+  { callerRuntime: true, federated: false, direct: 'siwe' },
+  { callerRuntime: true, federated: false, direct: 'google-with-slack-operator' },
 ]) {
-test(`${federated ? 'federated' : apiKeyOnly ? 'API-key-only' : 'mixed-policy API-key'} message tokens bind tasks on all three A2A ingress paths (${callerRuntime ? 'caller runtime' : 'host runtime'})`, async () => {
+test(`${direct ?? (federated ? 'federated' : apiKeyOnly ? 'API-key-only' : 'mixed-policy API-key')} message tokens bind tasks on all three A2A ingress paths (${callerRuntime ? 'caller runtime' : 'host runtime'})`, async () => {
   const profileId = 'https://mentionable.dev/ns/oauth-federation/v0.1';
-  const principalId = federated ? 'slack:T123/U456' : 'apikey:direct-caller-554';
+  const principalId = federated ? 'slack:T123/U456' : direct === 'siwe' ? 'eth:0x0000000000000000000000000000000000000003'
+    : direct ? 'google:abc-XYZ_123' : 'apikey:direct-caller-554';
+  const directGrant = direct?.startsWith('google') ? 'google:sub:abc-XYZ_123' : principalId;
+  const canPropose = callerRuntime && (federated || direct === 'google' || direct === 'siwe');
   const actorId = 'did:web:connector.example';
   const authorizationKey = formatFederatedPrincipal({
     issuer: actorId, subject: 'slack:T123/U456',
@@ -384,7 +414,7 @@ test(`${federated ? 'federated' : apiKeyOnly ? 'API-key-only' : 'mixed-policy AP
     ownerPrincipal: 'eth:0x0000000000000000000000000000000000000001',
     ownerRevision: 0,
     agentCard,
-    allowedCallers: apiKeyOnly ? [principalId] : [authorizationKey, ...(!federated ? [principalId] : [])],
+    allowedCallers: apiKeyOnly ? [principalId] : [authorizationKey, ...(!federated ? [directGrant] : [])],
     protocolCapabilities: callerRuntime ? callerRuntimeCapabilities : [CALLER_CONTEXT_V2_CAPABILITY],
     ws,
     connectedAt: Date.now(),
@@ -392,9 +422,11 @@ test(`${federated ? 'federated' : apiKeyOnly ? 'API-key-only' : 'mixed-policy AP
   const app = createHttpApp({ registry, db: sql, publicUrl: 'https://bridge.example', operationPolicies: [{
     agentId: 'v1-test-agent', ownerPrincipal: 'eth:0x0000000000000000000000000000000000000001',
     ownerRevision: 0, operation: 'merge-pr', version: '1', executorId: 'host', executorTokenSha256: '0'.repeat(64),
-    operators: [], ttlSeconds: 3600, fields: {},
+    operators: direct === 'google' ? [{ principalId: 'google:987' }]
+      : direct === 'siwe' ? [{ principalId: 'eth:0x0000000000000000000000000000000000000004' }]
+      : [{ principalId: 'slack:T123/U789', actorId }], ttlSeconds: 3600, fields: {},
   }] });
-  const authorization = `Bearer ${federated ? 'vbc_oauth_test' : 'vbc_caller_direct-554'}`;
+  const authorization = `Bearer ${federated ? 'vbc_oauth_test' : `vbc_caller_${principalId}`}`;
   // Authentication succeeds without opting into unrelated extensions, even
   // when a mixed policy also advertises federation.
   const message = (id: string) => ({
@@ -435,7 +467,7 @@ test(`${federated ? 'federated' : apiKeyOnly ? 'API-key-only' : 'mixed-policy AP
   for (const [path, init] of requests) {
     const response = await app.request(path, init);
     assert.ok(response.status >= 200 && response.status < 300, `${path}: ${await response.text()}`);
-    const activated = callerRuntime && federated && path !== '/agents/v1-test-agent/v1';
+    const activated = canPropose && path !== '/agents/v1-test-agent/v1';
     for (const header of ['X-A2A-Extensions', 'A2A-Extensions']) {
       assert.equal(response.headers.get(header), activated ? OPERATION_APPROVAL_EXTENSION_URI : null);
     }
@@ -443,7 +475,7 @@ test(`${federated ? 'federated' : apiKeyOnly ? 'API-key-only' : 'mixed-policy AP
   assert.equal(submittedBindings.length, 3);
   assert.equal(assignments.length, 3);
   for (const assignment of assignments) {
-    assert.deepEqual(assignment.operationNames, callerRuntime && federated && assignment.message.messageId !== 'm-v1-rpc'
+    assert.deepEqual(assignment.operationNames, canPropose && assignment.message.messageId !== 'm-v1-rpc'
       ? ['merge-pr'] : undefined);
     assert.deepEqual(assignment.caller, {
       principal: { id: principalId }, ...(federated ? { actor: { id: actorId } } : {}),
@@ -545,3 +577,82 @@ test('authentication discovery follows live caller policy on every public card s
     }
   }
 });
+
+test('direct continuations offer operations only with their live original task grant',
+  { skip: !process.env.DATABASE_URL }, async (t) => {
+    const db = postgres(process.env.DATABASE_URL!, { onnotice() {} });
+    await ensureSchema(db);
+    const registry = new Registry();
+    const agentId = 'resume-ops-' + crypto.randomUUID();
+    const owner = 'owner-' + crypto.randomUUID();
+    const principal = 'google:147';
+    const exact = 'google:sub:147', domain = 'google:domain:bridge.test';
+    const caller = await issueCallerToken(db, { principalId: principal, provider: 'google', email: 'reader@bridge.test' });
+    t.after(async () => {
+      await db`DELETE FROM infra.a2a_tasks WHERE owner_agent=${agentId}`;
+      await db`DELETE FROM agents WHERE id=${agentId}`;
+      await db`DELETE FROM callers WHERE id=${caller.callerId}`;
+      await db.end();
+    });
+    await db`INSERT INTO agents(id,owner_principal,name,token_hash,allowed_callers)
+      VALUES(${agentId},${owner},'resumed operations',${agentId},${[exact, domain]})`;
+    const turns: Array<{ taskId: string; grant?: string; operations?: string[] }> = [];
+    const ws = {
+      close() {},
+      send(raw: string) {
+        const parsed = JSON.parse(raw);
+        if (parsed.type !== 'task.assign') return;
+        const frame = TaskAssignFrame.parse(parsed);
+        const binding = registry.getBinding(frame.taskId)!;
+        turns.push({ taskId: frame.taskId, grant: binding.operationGrant?.grantKey, operations: frame.operationNames });
+        queueMicrotask(() => {
+          binding.sink.pushStatus({ taskId: frame.taskId, contextId: frame.contextId,
+            final: true, status: { state: TaskState.INPUT_REQUIRED } });
+          binding.sink.finish();
+        });
+      },
+    } as unknown as WebSocket;
+    registry.registerAgent({
+      agentId, clientId: 'resume-client', ownerPrincipal: owner, ownerRevision: 0, ws,
+      protocolCapabilities: callerRuntimeCapabilities, allowedCallers: [exact, domain], connectedAt: Date.now(),
+      agentCard: { name: agentId, description: 'resumable operations', version: '1', protocolVersion: '0.3.0',
+        skills: [], capabilities: { extensions: [{ uri: OPERATION_APPROVAL_EXTENSION_URI, params: { operations: ['deploy'] } }] } },
+    });
+    const app = createHttpApp({ db, registry, publicUrl: 'https://bridge.test', operationPolicies: [{
+      agentId, ownerPrincipal: owner, ownerRevision: 0, operation: 'deploy', version: '1', executorId: 'host',
+      ttlSeconds: 3600, executorTokenSha256: '0'.repeat(64), operators: [{ principalId: 'google:148' }], fields: {},
+    }] });
+    const send = async (taskId?: string) => {
+      const previousCount = turns.length;
+      const response = await app.request('/agents/' + agentId, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + caller.rawToken,
+          'X-A2A-Extensions': OPERATION_APPROVAL_EXTENSION_URI },
+        body: JSON.stringify({ jsonrpc: '2.0', id: crypto.randomUUID(), method: 'message/send', params: {
+          message: { messageId: crypto.randomUUID(), role: 'user', parts: [{ kind: 'text', text: 'continue' }], taskId },
+        } }),
+      });
+      const reply = await response.json() as { error?: unknown };
+      assert.equal(reply.error, undefined, JSON.stringify(reply));
+      assert.equal(turns.length, previousCount + 1, 'ordinary chat must still dispatch');
+      const turn = turns[previousCount]!;
+      if (taskId) assert.equal(turn.taskId, taskId);
+      assert.equal(response.headers.get('X-A2A-Extensions'), turn.grant ? OPERATION_APPROVAL_EXTENSION_URI : null);
+      assert.deepEqual(turn.operations, turn.grant ? ['deploy'] : undefined);
+      return turn;
+    };
+    const setGrants = async (grants: string[]) => {
+      await db`UPDATE agents SET allowed_callers=${grants} WHERE id=${agentId}`;
+      registry.updateAllowedCallers(agentId, grants);
+    };
+    const first = await send();
+    assert.equal(first.grant, exact);
+    await setGrants([domain, exact]);
+    assert.equal((await send(first.taskId)).grant, exact);
+    await setGrants([domain]);
+    await setGrants([domain, exact]);
+    assert.equal((await send(first.taskId)).grant, undefined);
+    const older = await send();
+    assert.equal(older.grant, domain);
+    await db`UPDATE infra.a2a_tasks SET operation_owner_revision=operation_owner_revision+1 WHERE task_id=${older.taskId}`;
+    assert.equal((await send(older.taskId)).grant, undefined);
+  });

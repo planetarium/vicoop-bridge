@@ -1,5 +1,6 @@
 import { parseFederatedDelegation } from './auth/federated-delegation.js';
 import type { OperationDefinition } from './operations.js';
+import { matchingOperationNames, type OperationCallerScheme } from './operation-callers.js';
 import { OPERATION_APPROVAL_EXTENSION_URI, APPROVAL_EXTENSION_URI, REMOTE_APPROVAL_CAPABILITY } from '@vicoop-bridge/protocol';
 import {
   A2A_TRANSPORTS,
@@ -79,13 +80,8 @@ export function buildAgentA2XServer(
 
   // Policy belongs to the server. Re-evaluate at dispatch in case a slow turn
   // waited on billing or storage across an ownership change or reconnect.
-  function operationNamesFor(current: ClientConnection): string[] {
-    const declaredNames = current.agentCard.capabilities?.extensions
-      ?.find(e => e.uri === OPERATION_APPROVAL_EXTENSION_URI)?.params?.operations;
-    if (!current.protocolCapabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) || !Array.isArray(declaredNames)) return [];
-    return (opts.operationPolicies ?? []).filter(p => p.agentId === current.agentId &&
-      p.ownerPrincipal === current.ownerPrincipal && p.ownerRevision === current.ownerRevision &&
-      declaredNames.includes(p.operation)).map(p => p.operation);
+  function operationNamesFor(current: ClientConnection, scheme: OperationCallerScheme): string[] {
+    return matchingOperationNames(current, opts.operationPolicies ?? [], scheme);
   }
 
   const executor = new WSForwardingExecutor(
@@ -171,7 +167,9 @@ export function buildAgentA2XServer(
       conn.protocolCapabilities.includes(FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY)
     )) &&
     (principals.some((p) => p?.kind === 'federated') || conn.allowedCallers.some((p) => parseFederatedDelegation(p) !== null));
-  if (bridgeWillEmitOAuthFederation && operationNamesFor(conn).length) {
+  if ((bridgeWillEmitOAuthFederation && operationNamesFor(conn, 'federated').length) ||
+      (allowsGoogle && operationNamesFor(conn, 'google').length) ||
+      (allowsEthereum && operationNamesFor(conn, 'siwe').length)) {
     a2xServer.addExtension({
       uri: OPERATION_APPROVAL_EXTENSION_URI, required: false,
       description: 'Propose a registered host operation for independent operator review.',

@@ -62,7 +62,8 @@ import {
   rejectAgentRequest,
 } from './agent-auth.js';
 import { CALLER_TOKEN_PREFIX, OWNER_SESSION_PREFIX, verifySessionToken } from './auth/caller-token.js';
-import { mountOperations, readOperationRegistry, type OperationDefinition } from './operations.js';
+import { matchingOperationNames, operationCallerScheme } from './operation-callers.js';
+import { directOperationGrants, mountOperations, readOperationRegistry, type OperationDefinition } from './operations.js';
 import { mountDeviceFlow } from './auth/device-flow.js';
 import { mountDeviceUi } from './auth/device-ui.js';
 import { mountTokenRevocation } from './auth/revoke.js';
@@ -192,7 +193,6 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   );
 
   const operationPolicies = opts.operationPolicies ?? readOperationRegistry(process.env.VICOOP_OPERATIONS);
-  mountOperations(app, opts.db, operationPolicies);
 
   // The built-in admin agent and every connected client agent get distinct
   // owner-scoped views of the same Postgres table. A handler can therefore
@@ -420,11 +420,29 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       message.extensions = [...new Set([...existing, ...requestedExtensions])];
     }
 
+    const scheme = caller && operationCallerScheme(caller);
+    const operationNames = scheme ? matchingOperationNames(conn, operationPolicies, scheme) : [];
+    const directGrants = caller && !caller.tokenExchange && operationNames.length
+      ? directOperationGrants(conn.allowedCallers, caller) : [];
+    let directGrantKey: string | undefined = directGrants[0];
+    if (directGrantKey && caller && typeof message.taskId === 'string' &&
+        requestedExtensions.includes(OPERATION_APPROVAL_EXTENSION_URI)) {
+      // A continuation uses the original grant. A removed and re-added grant
+      // cannot revive this task's proposal rights.
+      const [origin] = await opts.db<{ operation_grant_key: string }[]>`
+        SELECT t.operation_grant_key FROM infra.a2a_tasks t JOIN agents a ON a.id=t.owner_agent
+        WHERE t.owner_agent=${conn.agentId} AND t.task_id=${message.taskId}
+          AND t.owner_principal=${caller.principalId} AND t.operation_owner_revision=a.owner_revision
+          AND t.operation_grant_key=ANY(${directGrants}::text[])
+          AND infra.operation_grant_active(t.operation_grant_key, a.allowed_callers)`;
+      directGrantKey = origin?.operation_grant_key;
+    }
     if (Array.isArray(message.extensions) && message.extensions.includes(OPERATION_APPROVAL_EXTENSION_URI)) {
       const card = getAgentForConn(conn).getAgentCard() as AgentCardV03;
       // Message.extensions describes the content. Only the transport activation
-      // header opts this federated turn into offering the proposal tool.
-      if (caller?.tokenExchange && requestedExtensions.includes(OPERATION_APPROVAL_EXTENSION_URI) &&
+      // header opts this turn into offering the proposal tool.
+      if ((caller?.tokenExchange || directGrantKey) && operationNames.length &&
+          requestedExtensions.includes(OPERATION_APPROVAL_EXTENSION_URI) &&
           card.capabilities.extensions?.some(ext => ext.uri === OPERATION_APPROVAL_EXTENSION_URI)) {
         c.header(A2A_EXTENSIONS_HEADER, OPERATION_APPROVAL_EXTENSION_URI, { append: true });
         c.header(A2A_EXTENSIONS_LEGACY_HEADER, OPERATION_APPROVAL_EXTENSION_URI, { append: true });
@@ -475,6 +493,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     if (caller !== undefined) {
       const authorizationMetadata = {
         _principalId: caller.principalId,
+        ...(directGrantKey ? { _operationGrantKey: directGrantKey } : {}),
         ...(caller.actorId !== undefined ? { _actorId: caller.actorId } : {}),
         ...(caller.tokenExchange?.allowedCaller !== undefined
           ? { _authorizationKey: caller.tokenExchange.allowedCaller }
@@ -599,6 +618,8 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       );
     }
   }
+
+  mountOperations(app, opts.db, operationPolicies, siweDomain);
 
   if (opts.publicUrl) {
     mountTokenExchangeRoutes(app, {

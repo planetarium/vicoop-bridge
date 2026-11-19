@@ -6,6 +6,12 @@ import { HTTPException } from 'hono/http-exception';
 import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
 import type { Sql, SqlExecutor } from './db.js';
+import { CALLER_TOKEN_PREFIX, hashCallerToken } from './auth/caller-token.js';
+import { parseFederatedDelegation } from './auth/federated-delegation.js';
+import { matchPrincipal, parseFederatedPrincipal, type VerifiedCaller } from './auth/principal.js';
+import { verifySiweBearerToken } from './auth/siwe-bearer.js';
+import { TOKEN_EXCHANGE_ACCESS_TOKEN_PREFIX } from './oauth/token-exchange/types.js';
+import { operationCallerScheme } from './operation-callers.js';
 import {
   verifyTokenExchangeAccessToken,
   type TokenExchangeAccessToken,
@@ -29,9 +35,10 @@ const definition = z
         z
           .object({
             principalId: z.string().min(1),
-            actorId: z.string().min(1),
+            actorId: z.string().min(1).optional(),
           })
-          .strict(),
+          .strict().refine(operator => operationCallerScheme(operator) !== undefined,
+            { message: 'Direct operators require a canonical Google or SIWE principal' }),
       )
       .min(1),
     fields: z.record(
@@ -90,6 +97,15 @@ function policyDigest(policy: OperationDefinition) {
   const { executorTokenSha256: _credential, ...definition } = policy;
   return hash(canonical(definition));
 }
+// Methods belong to the grant, not the OAuth profile. A connector can attest
+// several distinct types of identity under the same profile and actor DID.
+function federatedMethod(grant: string, principal: string, actor: string): string | undefined {
+  const exact = parseFederatedPrincipal(grant);
+  if (exact) return exact.issuer === actor && exact.subject === principal ? exact.method : undefined;
+  const delegation = parseFederatedDelegation(grant);
+  return delegation?.issuer === actor ? delegation.method : undefined;
+}
+
 // Run before serving connections with the new immutable registry.
 export async function reconcileOperationPolicies(db: Sql, policies: OperationDefinition[]) {
   const hashes = policies.map(policyDigest);
@@ -98,6 +114,29 @@ export async function reconcileOperationPolicies(db: Sql, policies: OperationDef
       ELSE 'policy_changed' END, 'at',clock_timestamp())
     WHERE state IN ('pending','approved') AND expires_at > clock_timestamp()
     AND (NOT (policy_digest = ANY(${hashes}::text[])) OR (state='approved' AND requester=decided_principal))`;
+  // Older deployments did not compare methods. Upgrade only live, unclaimed
+  // decisions and bound each transaction; workers skip them until verified.
+  for (;;) {
+    const checked = await db.begin(async tx => {
+      const rows = await tx<Pick<RequestRow, 'id' | 'requester' | 'actor' | 'grant_key' |
+        'decided_principal' | 'decided_actor' | 'decided_by'>[]>`
+        SELECT id, requester, actor, grant_key, decided_principal, decided_actor, decided_by
+        FROM infra.operation_requests WHERE state='approved' AND NOT decision_scheme_verified
+          AND expires_at > clock_timestamp() ORDER BY id LIMIT 128 FOR UPDATE`;
+      if (!rows.length) return 0;
+      const valid = rows.filter(row => {
+        if (!row.actor || !row.decided_actor || !row.decided_by || !row.decided_principal) return false;
+        const method = federatedMethod(row.grant_key, row.requester, row.actor);
+        return method !== undefined && method === federatedMethod(row.decided_by, row.decided_principal, row.decided_actor);
+      }).map(row => row.id);
+      await tx`UPDATE infra.operation_requests SET decision_scheme_verified=true WHERE id=ANY(${valid}::uuid[])`;
+      await tx`UPDATE infra.operation_requests SET state='cancelled', result='Incompatible approval identity',
+        history=history||jsonb_build_object('event','identity_scheme_changed','at',clock_timestamp())
+        WHERE id=ANY(${rows.map(row => row.id)}::uuid[]) AND NOT decision_scheme_verified`;
+      return rows.length;
+    });
+    if (!checked) break;
+  }
 }
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const canonical = (value: unknown): string =>
@@ -130,7 +169,7 @@ type RequestRow = {
   artifact_id: string;
   requester: string;
   requester_revoked: boolean;
-  actor: string;
+  actor: string | null;
   profile: string;
   grant_key: string;
   executor_id: string;
@@ -151,9 +190,10 @@ type RequestRow = {
 type Source = {
   state: string;
   owner_principal: string;
-  owner_actor: string;
-  authorization_profile: string;
-  authorization_key: string;
+  owner_actor: string | null;
+  authorization_profile: string | null;
+  authorization_key: string | null;
+  operation_grant_key: string | null;
   authorization_revoked_at: Date | null;
   task_json: {
     artifacts?: { artifactId: string; extensions?: string[]; parts?: { data?: unknown }[] }[];
@@ -185,30 +225,47 @@ async function source(db: SqlExecutor, agent: string, task: string) {
   const [row] = await db<
     Source[]
   >`SELECT t.state, t.owner_principal, t.owner_actor, t.authorization_profile,
-    t.authorization_key, t.authorization_revoked_at, t.task_json FROM infra.a2a_tasks t
-    JOIN agents a ON a.id=t.owner_agent AND t.authorization_key=ANY(a.allowed_callers)
+    t.authorization_key, t.operation_grant_key, t.authorization_revoked_at, t.task_json FROM infra.a2a_tasks t
+    JOIN agents a ON a.id=t.owner_agent
     WHERE t.owner_agent=${agent} AND t.task_id=${task} AND t.operation_owner_revision=a.owner_revision AND t.created_at>=a.created_at FOR SHARE OF t,a`;
   if (!row || row.authorization_revoked_at) missing();
   return row;
 }
-function isRequester(row: RequestRow, user: TokenExchangeAccessToken) {
+type OperationUser = Pick<TokenExchangeAccessToken, 'principalId' | 'profileId' | 'taskId' | 'operationReadRevision'> & {
+  actorId: string | null;
+  grants: string[];
+  federatedMethod?: string;
+  canDecide: boolean;
+  canCancel: boolean;
+};
+
+// A verified direct caller can use an open caller-runtime agent. The sentinel
+// records that exact policy so restricting and then reopening it revokes old work.
+export function directOperationGrants(allowedCallers: string[], caller: VerifiedCaller): string[] {
+  const scheme = operationCallerScheme(caller);
+  if (caller.tokenExchange || (scheme !== 'google' && scheme !== 'siwe')) return [];
+  return allowedCallers.length === 0 ? ['public'] : allowedCallers.filter(entry => matchPrincipal(entry, caller));
+}
+
+function isRequester(row: RequestRow, user: OperationUser) {
   return (
     !row.requester_revoked &&
     user.principalId === row.requester &&
     user.actorId === row.actor &&
     user.profileId === row.profile &&
-    user.allowedCaller === row.grant_key
+    user.grants.includes(row.grant_key)
   );
 }
-function hasPlatformDecisionCredential(user: TokenExchangeAccessToken) {
-  return user.taskId === undefined && user.scopes.includes('a2a:message.send');
-}
-function eligibleOperator(row: RequestRow, policy: OperationDefinition, user: TokenExchangeAccessToken) {
-  // The platform subject includes the Slack workspace and user. A second
-  // connector or a different grant cannot turn that same person into a reviewer.
-  if (row.requester === user.principalId) return false;
+function eligibleOperator(row: RequestRow, policy: OperationDefinition, user: OperationUser) {
+  // Until accounts can be linked, decisions stay within the requester's
+  // authentication scheme. A second connector or grant cannot make the
+  // same platform subject independent of the requester.
+  if (row.requester === user.principalId || row.profile !== user.profileId ||
+      (row.actor === null) !== (user.actorId === null)) return false;
+  if (row.actor !== null && user.federatedMethod !== federatedMethod(row.grant_key, row.requester, row.actor))
+    return false;
   return policy.operators.some(
-    (o) => o.principalId === user.principalId && o.actorId === user.actorId,
+    (o) => o.principalId === user.principalId && (o.actorId ?? null) === user.actorId,
   );
 }
 
@@ -216,6 +273,7 @@ export function mountOperations(
   app: Hono,
   db: Sql,
   policies = readOperationRegistry(process.env.VICOOP_OPERATIONS),
+  siweDomain?: string,
 ) {
   const path = '/agents/:agent/operations';
   const workerPath = '/operation-executors/:agent/:operation';
@@ -235,20 +293,57 @@ export function mountOperations(
     c: Context,
     agent: string,
     allowRetainedOperationRead = false,
-  ) {
-    // Take policy then credential locks in the same order as revocation.
-    if (!token(c)) error(401, 'Invalid credential');
-    await db`SELECT id FROM agents WHERE id=${agent} FOR SHARE`;
-    // The verifier stamps last_used_at on this transaction. Acquire its write
-    // lock immediately so parallel reviews never need to upgrade shared locks.
-    await db`SELECT id FROM infra.oauth_token_exchange_access_tokens WHERE token_hash=${hash(
-      token(c),
-    )} FOR UPDATE`;
-    const identity = await verifyTokenExchangeAccessToken(db, token(c), agent, {
-      allowRetainedOperationRead,
-    }).catch(() => error(401, 'Invalid credential'));
-    if (!identity.scopes.includes('a2a:task.read')) missing();
-    return identity;
+  ): Promise<OperationUser> {
+    // Serialize policy and credential changes with sensitive actions. Avoid
+    // the ordinary caller-session cache here so revocations are immediate.
+    const bearer = token(c);
+    if (!bearer) error(401, 'Invalid credential');
+    const [agentRow] = await db<{ allowed_callers: string[] }[]>`
+      SELECT allowed_callers FROM agents WHERE id=${agent} FOR SHARE`;
+    if (!agentRow) missing();
+    if (bearer.startsWith(TOKEN_EXCHANGE_ACCESS_TOKEN_PREFIX)) {
+      await db`SELECT id FROM infra.oauth_token_exchange_access_tokens
+        WHERE token_hash=${hash(bearer)} FOR UPDATE`;
+      const identity = await verifyTokenExchangeAccessToken(db, bearer, agent, {
+        allowRetainedOperationRead,
+      }).catch(() => error(401, 'Invalid credential'));
+      if (!identity.scopes.includes('a2a:task.read')) missing();
+      const method = federatedMethod(identity.allowedCaller, identity.principalId, identity.actorId);
+      if (!method) missing();
+      return {
+        ...identity,
+        federatedMethod: method,
+        grants: [identity.allowedCaller],
+        canDecide: identity.taskId === undefined && identity.scopes.includes('a2a:message.send'),
+        canCancel: identity.scopes.includes('a2a:task.cancel'),
+      };
+    }
+    let caller: VerifiedCaller;
+    if (bearer.startsWith(CALLER_TOKEN_PREFIX)) {
+      const [session] = await db<{ principal_id: string; provider: string; email: string | null }[]>`
+        SELECT principal_id, provider, email FROM callers WHERE token_hash=${hashCallerToken(bearer)}
+          AND audience='caller' AND NOT revoked AND expires_at > clock_timestamp() FOR SHARE`;
+      if (!session || (session.provider !== 'google' && session.provider !== 'siwe') ||
+          operationCallerScheme({ principalId: session.principal_id }) !== session.provider) {
+        error(401, 'Invalid credential');
+      }
+      caller = {
+        principalId: session.principal_id,
+        email: session.email ?? undefined,
+        emailVerified: session.email !== null,
+      };
+    } else if (siweDomain) {
+      const verified = await verifySiweBearerToken(bearer, { domain: siweDomain })
+        .catch(() => error(401, 'Invalid credential'));
+      caller = { principalId: `eth:${verified.address}` };
+    } else {
+      error(401, 'Invalid credential');
+    }
+    const profileId = operationCallerScheme(caller);
+    if (profileId !== 'siwe' && profileId !== 'google') error(401, 'Invalid credential');
+    const grants = directOperationGrants(agentRow.allowed_callers, caller);
+    if (!grants.length) missing();
+    return { principalId: caller.principalId, actorId: null, profileId, grants, canDecide: true, canCancel: true };
   }
   async function ownerFor(tx: SqlExecutor, agent: string) {
     const [owner] = await tx<{ owner_principal: string; owner_revision: string }[]>`
@@ -289,7 +384,16 @@ export function mountOperations(
           operation: input.operation,
           arguments: input.arguments,
         };
-        const g = identity.allowedCaller;
+        const existing = async () =>
+          (
+            await tx<RequestRow[]>`SELECT *,expires_at <= clock_timestamp() AS expired
+        FROM infra.operation_requests WHERE agent_id=${agent} AND task_id=${input.taskId} AND artifact_id=${input.proposalKey}`
+          )[0];
+        const prior = await existing();
+        if (prior && !isRequester(prior, identity)) missing();
+        const origin = prior ? undefined : await source(tx, agent, input.taskId);
+        const g = prior?.grant_key ?? origin?.operation_grant_key ?? origin?.authorization_key;
+        if (!g || !identity.grants.includes(g)) missing();
         const policyHash = policyDigest(policy);
         const digest = hash(
           canonical({
@@ -303,21 +407,16 @@ export function mountOperations(
             data,
           }),
         );
-        const existing = async () =>
-          (
-            await tx<RequestRow[]>`SELECT *,expires_at <= clock_timestamp() AS expired
-        FROM infra.operation_requests WHERE agent_id=${agent} AND task_id=${input.taskId} AND artifact_id=${input.proposalKey}`
-          )[0];
-        const prior = await existing();
-        if (prior && !isRequester(prior, identity)) missing();
         if (prior && prior.digest === digest) return view(prior);
         if (prior) error(409, 'Proposal changed');
-        const origin = await source(tx, agent, input.taskId);
+        const scheme = identity.actorId === null ? identity.profileId : 'federated';
+        if (!policy.operators.some(operator => operationCallerScheme(operator) === scheme)) missing();
         if (
-          origin.owner_principal !== identity.principalId ||
+          !origin || origin.owner_principal !== identity.principalId ||
           origin.owner_actor !== identity.actorId ||
-          origin.authorization_profile !== identity.profileId ||
-          origin.authorization_key !== identity.allowedCaller
+          (identity.actorId === null
+            ? origin.authorization_profile !== null || origin.authorization_key !== null || origin.operation_grant_key !== g
+            : origin.authorization_profile !== identity.profileId || origin.authorization_key !== g)
         )
           missing();
         if (['failed', 'canceled', 'rejected'].includes(origin.state))
@@ -371,7 +470,7 @@ export function mountOperations(
     action: (
       tx: SqlExecutor,
       row: RequestRow,
-      identity: TokenExchangeAccessToken,
+      identity: OperationUser,
       policy: OperationDefinition | undefined,
     ) => Promise<T>,
     allowRetainedOperationRead = false,
@@ -403,7 +502,7 @@ export function mountOperations(
         async (_tx, row, identity, policy) => ({
           ...view(row),
           canDecide:
-            hasPlatformDecisionCredential(identity) &&
+            identity.canDecide &&
             row.state === 'pending' &&
             !row.expired &&
             !!policy &&
@@ -426,22 +525,22 @@ export function mountOperations(
     const input = await body(c, decision);
     return c.json(
       await access(c, async (tx, row, identity, policy) => {
-        if (!policy || !eligibleOperator(row, policy, identity) || !hasPlatformDecisionCredential(identity)) missing();
+        if (!policy || !eligibleOperator(row, policy, identity) || !identity.canDecide) missing();
         if (!samePolicy(row, policy) || input.digest !== row.digest) error(409, 'Proposal changed');
         const next = input.decision === 'approve' ? 'approved' : 'denied';
         if (
           row.decision === input.decision &&
-          row.decided_by === identity.allowedCaller &&
+          row.decided_by !== null && identity.grants.includes(row.decided_by) &&
           row.decided_principal === identity.principalId &&
           row.decided_actor === identity.actorId
         )
           return view(row);
         if (row.state !== 'pending') error(409, 'Decision already taken');
         const updated =
-          await tx`UPDATE infra.operation_requests SET state=${next}, decision=${input.decision}, decided_by=${identity.allowedCaller},
-        decided_principal=${identity.principalId}, decided_actor=${identity.actorId},
+          await tx`UPDATE infra.operation_requests SET state=${next}, decision=${input.decision}, decided_by=${identity.grants[0]},
+        decided_principal=${identity.principalId}, decided_actor=${identity.actorId}, decision_scheme_verified=true,
         history=history||jsonb_build_object('event',${next}::text,'by',${identity.principalId}::text,
-          'actor',${identity.actorId}::text,'grant',${identity.allowedCaller}::text,'at',clock_timestamp())
+          'actor',${identity.actorId}::text,'grant',${identity.grants[0]}::text,'at',clock_timestamp())
         WHERE id=${row.id} AND expires_at > clock_timestamp() RETURNING id`;
         if (!updated.length) error(409, 'Expired');
         return view(await record(tx, row.agent_id, row.id));
@@ -451,12 +550,12 @@ export function mountOperations(
   app.post(path + '/:id/cancel', async (c) =>
     c.json(
       await access(c, async (tx, row, identity) => {
-        if (!isRequester(row, identity) || !identity.scopes.includes('a2a:task.cancel')) missing();
+        if (!isRequester(row, identity) || !identity.canCancel) missing();
         if (row.state === 'cancelled') return view(row);
         if (row.expired || !['pending', 'approved'].includes(row.state))
           error(409, 'Already expired or consumed');
         await tx`UPDATE infra.operation_requests SET state='cancelled', history=history||jsonb_build_object(
-      'event','cancelled','by',${identity.principalId}::text,'actor',${identity.actorId}::text,'grant',${identity.allowedCaller}::text,'at',clock_timestamp()) WHERE id=${row.id}`;
+      'event','cancelled','by',${identity.principalId}::text,'actor',${identity.actorId}::text,'grant',${row.grant_key}::text,'at',clock_timestamp()) WHERE id=${row.id}`;
         return view(await record(tx, row.agent_id, row.id));
       }),
     ),
@@ -486,8 +585,9 @@ export function mountOperations(
         const [row] = await tx<RequestRow[]>`WITH candidate AS (
       SELECT r.id FROM infra.operation_requests r JOIN agents a ON a.id=r.agent_id
       WHERE r.agent_id=${p.agentId} AND r.operation=${p.operation} AND r.state='approved'
-      AND r.decided_principal <> r.requester
-      AND r.grant_key=ANY(a.allowed_callers) AND r.decided_by=ANY(a.allowed_callers)
+      AND r.decision_scheme_verified AND r.decided_principal <> r.requester
+      AND infra.operation_grant_active(r.grant_key, a.allowed_callers)
+      AND infra.operation_grant_active(r.decided_by, a.allowed_callers)
       AND r.policy_digest=${policyDigest(p)} AND r.expires_at > clock_timestamp()
       ORDER BY r.expires_at,r.id LIMIT 1 FOR UPDATE OF r SKIP LOCKED)
       UPDATE infra.operation_requests r SET state='executing', history=history||jsonb_build_object(

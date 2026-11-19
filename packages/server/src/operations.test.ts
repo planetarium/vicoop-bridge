@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import postgres from 'postgres';
 import { SignJWT, generateKeyPair, exportJWK } from 'jose';
+import { formatFederatedDelegation } from './auth/federated-delegation.js';
 import { formatFederatedPrincipal } from './auth/principal.js';
 import { mountTokenExchangeRoutes } from './oauth/token-exchange/routes.js';
 import {
@@ -57,12 +58,16 @@ test(
       owner = 'eth:' + randomUUID(),
       actor = 'did:web:test-connector.example';
     const secondActor = 'did:web:second-connector.example';
+    const slackMethod = 'urn:mentionable:auth:slack-member:v0.1';
+    const otherMethod = 'urn:example:employee';
+    const otherGrant = formatFederatedDelegation({ id: randomUUID(), issuer: actor, method: otherMethod })!;
+    const secondGrant = formatFederatedDelegation({ id: randomUUID(), issuer: secondActor, method: slackMethod })!;
     const operator = 'slack:T/O',
       requester = 'slack:T/R',
-      sharedGrant = 'grant-' + randomUUID(),
+      sharedGrant = formatFederatedDelegation({ id: randomUUID(), issuer: actor, method: slackMethod })!,
       requesterGrant = formatFederatedPrincipal({
         issuer: actor,
-        method: 'urn:mentionable:auth:slack-member:v0.1',
+        method: slackMethod,
         subject: requester,
       })!;
     const executorToken = randomUUID();
@@ -121,7 +126,7 @@ test(
       await sql.end();
     });
     await sql`INSERT INTO agents(id,owner_principal,name,token_hash,allowed_callers)
-    VALUES(${agentId},${owner},'ops test',${agentId},${[requesterGrant, sharedGrant]})`;
+    VALUES(${agentId},${owner},'ops test',${agentId},${[requesterGrant, sharedGrant, otherGrant, secondGrant]})`;
     const issue = async (principalId: string, allowedCaller: string, task?: string,
       scopes = task ? ['a2a:task.read'] : ['a2a:task.read', 'a2a:message.send', 'a2a:task.cancel'], actorId = actor) =>
       (
@@ -151,7 +156,7 @@ test(
       });
     const get = (uri: string, token: string) =>
       app.request(uri, { headers: { Authorization: 'Bearer ' + token } });
-    const artifacts = Array.from({ length: 10 }, (_, index) => ({
+    const artifacts = Array.from({ length: 12 }, (_, index) => ({
       artifactId: randomUUID(),
       extensions: [OPERATION_APPROVAL_EXTENSION_URI],
       parts: [
@@ -199,6 +204,16 @@ test(
     await store.updateTask(taskId, {
       status: { state: TaskState.INPUT_REQUIRED },
     });
+    const directOnly = new Hono();
+    mountOperations(directOnly, runtime, readOperationRegistry(JSON.stringify([{
+      ...policy, operators: [{ principalId: 'google:314159' }],
+    }])));
+    const incompatiblePolicy = await directOnly.request(path, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + caller, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload(0)),
+    });
+    assert.equal(incompatiblePolicy.status, 404, 'an older task cannot register after its reviewer scheme is removed');
     // A generic JSON artifact is not an operation proposal, even when its data looks identical.
     const unmarked = { ...artifacts[0], artifactId: randomUUID(), extensions: [] };
     await store.updateTask(taskId, { artifacts: [...artifacts, unmarked] });
@@ -237,11 +252,25 @@ test(
       ).status,
       200,
     );
+    const oldSameMethod = await create(10);
+    const oldOtherMethod = await create(11);
+    for (const item of [oldSameMethod, oldOtherMethod]) {
+      assert.equal((await post(path + '/' + item.id + '/decision', approver, {
+        decision: 'approve', digest: item.digest,
+      })).status, 200);
+    }
+    await sql`UPDATE infra.operation_requests SET decision_scheme_verified=false
+      WHERE id=ANY(${[oldSameMethod.id, oldOtherMethod.id]}::uuid[])`;
+    await sql`UPDATE infra.operation_requests SET decided_by=${otherGrant} WHERE id=${oldOtherMethod.id}`;
     // Old revisions could record a decision when the requester was also an
     // allowlisted operator. Do not dispatch that already-approved work.
     await sql`UPDATE infra.operation_requests SET decided_principal=requester WHERE id=${approved.id}`;
     assert.equal(claim.parse(await (await post(worker + '/claim', executorToken)).json()).operation, null);
     await reconcileOperationPolicies(runtime, readOperationRegistry(JSON.stringify([policy])));
+    assert.equal(claim.parse(await (await post(worker + '/claim', executorToken)).json()).operation?.id, oldSameMethod.id);
+    assert.equal((await post(worker + '/' + oldSameMethod.id + '/result', executorToken,
+      { state: 'succeeded', result: 'Done' })).status, 200);
+    assert.equal(requestView.parse(await (await get(path + '/' + oldOtherMethod.id, caller)).json()).state, 'cancelled');
     const empty = new Hono();
     mountOperations(empty, runtime, []);
     const changed = readOperationRegistry(JSON.stringify([{ ...policy, ttlSeconds: 3600 }]));
@@ -276,7 +305,10 @@ test(
         decision,
         digest: item.digest,
       });
-    for (const asRequester of [caller, await issue(requester, sharedGrant), await issue(requester, sharedGrant, undefined, undefined, secondActor)]) {
+    const wrongMethod = await issue(operator, otherGrant);
+    assert.equal((await get(path + '/' + a.id, wrongMethod)).status, 404);
+    assert.equal((await decide(a, wrongMethod)).status, 404);
+    for (const asRequester of [caller, await issue(requester, sharedGrant), await issue(requester, secondGrant, undefined, undefined, secondActor)]) {
       for (const decision of ['approve', 'deny']) {
         assert.equal((await decide(a, asRequester, decision)).status, 404);
       }

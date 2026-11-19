@@ -1,3 +1,4 @@
+import { operationGrantIsActive } from './operation-callers.js';
 import { randomUUID } from 'node:crypto';
 import type {
   Artifact,
@@ -43,6 +44,7 @@ interface TaskAuthorizationBinding {
   actorId?: string;
   profileId?: string;
   authorizationKey?: string;
+  operationGrantKey?: string;
 }
 
 function authorizationBindingFromMetadata(
@@ -57,6 +59,7 @@ function authorizationBindingFromMetadata(
     actorId: stringValue('_actorId'),
     profileId: stringValue('_authorizationProfile'),
     authorizationKey: stringValue('_authorizationKey'),
+    operationGrantKey: stringValue('_operationGrantKey'),
   };
 }
 
@@ -91,6 +94,7 @@ function stripMessageMetadata(msg: Message): Message {
     _actorId,
     _authorizationProfile,
     _authorizationKey,
+    _operationGrantKey,
     [IDENTITY_VC_PRESENTED_METADATA_KEY]: _presented,
     ...rest
   } = metadata;
@@ -99,6 +103,7 @@ function stripMessageMetadata(msg: Message): Message {
   void _actorId;
   void _authorizationProfile;
   void _authorizationKey;
+  void _operationGrantKey;
   void _presented;
   const clean = Object.keys(rest).length ? rest : undefined;
   if (clean) return { ...msg, metadata: clean };
@@ -115,6 +120,7 @@ function stripTaskMetadata(metadata: Record<string, unknown> | undefined) {
     _actorId,
     _authorizationProfile,
     _authorizationKey,
+    _operationGrantKey,
     [IDENTITY_VC_PRESENTED_METADATA_KEY]: _presented,
     ...rest
   } = metadata;
@@ -123,6 +129,7 @@ function stripTaskMetadata(metadata: Record<string, unknown> | undefined) {
   void _actorId;
   void _authorizationProfile;
   void _authorizationKey;
+  void _operationGrantKey;
   void _presented;
   return Object.keys(rest).length > 0 ? rest : undefined;
 }
@@ -250,7 +257,22 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
       // A caller cannot pre-seed the server-owned dispatch marker.
       metadata: withExecutionMarker(stripTaskMetadata(params.metadata), undefined),
     };
-    await this.writeTask(task, this.sql, authorizationBinding);
+    const grant = authorizationBinding.operationGrantKey;
+    if (grant && this.ownerAgent !== undefined) {
+      // Serialize the initial grant binding with allowlist edits. Later task
+      // writes must never restore a grant cleared by revocation.
+      const agentId = this.ownerAgent;
+      await this.sql.begin(async tx => {
+        const [agent] = await tx<{ allowed_callers: string[] }[]>`
+          SELECT allowed_callers FROM agents WHERE id = ${agentId} FOR SHARE`;
+        const allowed = agent && operationGrantIsActive(grant, agent.allowed_callers);
+        await this.writeTask(task, tx, {
+          ...authorizationBinding, operationGrantKey: allowed ? grant : undefined,
+        });
+      });
+    } else {
+      await this.writeTask(task, this.sql, authorizationBinding);
+    }
     // A freshly-created task is SUBMITTED, never terminal, so retention is a
     // no-op here — skip it entirely.
     return task;
@@ -680,12 +702,12 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
     await sql`
       INSERT INTO infra.a2a_tasks
         (task_id, context_id, state, task_json, owner_principal, owner_agent,
-         owner_actor, authorization_profile, authorization_key, operation_owner_revision)
+         owner_actor, authorization_profile, authorization_key, operation_grant_key, operation_owner_revision)
       VALUES (
         ${task.id}, ${contextId}, ${task.status.state}, ${persisted},
         ${ownerPrincipal ?? null}, ${this.ownerAgent},
         ${ownerActor ?? null}, ${authorizationProfile ?? null}, ${authorizationKey ?? null},
-        (SELECT owner_revision FROM agents WHERE id=${this.ownerAgent})
+        ${initialBinding?.operationGrantKey ?? null}, (SELECT owner_revision FROM agents WHERE id=${this.ownerAgent})
       )
       ON CONFLICT (task_id) DO UPDATE SET
         context_id = EXCLUDED.context_id,

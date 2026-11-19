@@ -1,3 +1,4 @@
+import { operationGrantIsActive } from './operation-callers.js';
 import { approvalStatus } from './tool-approvals.js';
 import { APPROVAL_EXTENSION_URI, REMOTE_APPROVAL_CAPABILITY } from '@vicoop-bridge/protocol';
 import { WebSocketServer, type WebSocket } from 'ws';
@@ -459,7 +460,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           const conn = opts.registry.getAgent(b.agentId);
           const [part] = frame.artifact.parts;
           if (!taggedProposal || !grant || grant.ownerRevision !== conn?.ownerRevision ||
-              !b.authorizationKey || !conn.allowedCallers.includes(b.authorizationKey) ||
+              !operationGrantIsActive(grant.grantKey, conn.allowedCallers) ||
               frame.append || !frame.lastChunk || frame.artifact.parts.length !== 1 ||
               part?.kind !== 'data' || part.data.type !== OPERATION_PROPOSAL_TYPE ||
               typeof part.data.operation !== 'string' || !grant.names.includes(part.data.operation)) {

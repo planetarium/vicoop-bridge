@@ -31,6 +31,7 @@ import {
 } from '@vicoop-bridge/protocol';
 import { IDENTITY_VC_PRESENTED_METADATA_KEY } from './identity-vc/types.js';
 import { resolveExecutionScope } from './execution-scope.js';
+import { operationCallerScheme, operationGrantIsActive, type OperationCallerScheme } from './operation-callers.js';
 import {
   createCanonicalCallerContext,
   selectCallerContextVersion,
@@ -238,7 +239,7 @@ export class WSForwardingExecutor extends AgentExecutor {
     // Absent in tests and on deployments without a DB-backed payment path;
     // the gate is then never installed and every agent is free.
     private readonly x402: X402ExecutorOptions | undefined = undefined,
-    private readonly operationNamesFor?: (conn: ClientConnection) => string[],
+    private readonly operationNamesFor?: (conn: ClientConnection, scheme: OperationCallerScheme) => string[],
   ) {
     super({
       runner: NOOP_RUNNER,
@@ -428,6 +429,9 @@ export class WSForwardingExecutor extends AgentExecutor {
       typeof rawMetadata?._authorizationProfile === 'string'
         ? rawMetadata._authorizationProfile
         : undefined;
+    const directOperationGrant = typeof rawMetadata?._operationGrantKey === 'string'
+      ? rawMetadata._operationGrantKey : undefined;
+    if (rawMetadata) delete rawMetadata._operationGrantKey;
     const presented = rawMetadata?.[IDENTITY_VC_PRESENTED_METADATA_KEY];
     if (rawMetadata) delete rawMetadata[IDENTITY_VC_PRESENTED_METADATA_KEY];
     const forwardMetadata = stripInternalMetadata(rawMetadata);
@@ -572,11 +576,14 @@ export class WSForwardingExecutor extends AgentExecutor {
       this.abortControllers.set(taskId, ac);
       task.history = history;
       const connection = this.registry.getAgent(this.agentId);
-      const operationNames = connection?.ownerRevision !== undefined && executionScope?.policy === 'federated-principal-v1' &&
-        requestedExtensions?.includes(OPERATION_APPROVAL_EXTENSION_URI)
-        ? this.operationNamesFor?.(connection) : undefined;
-      if (operationNames?.length && connection?.ownerRevision !== undefined)
-        binding.operationGrant = { names: operationNames, ownerRevision: connection.ownerRevision };
+      const scheme = executionScope && principalId ? operationCallerScheme({ principalId, actorId }) : undefined;
+      const grantKey = scheme === 'federated' ? authorizationKey : directOperationGrant;
+      const operationNames = connection?.ownerRevision !== undefined && scheme && grantKey &&
+        operationGrantIsActive(grantKey, connection.allowedCallers) && requestedExtensions?.includes(OPERATION_APPROVAL_EXTENSION_URI)
+        ? this.operationNamesFor?.(connection, scheme) : undefined;
+      if (operationNames?.length && connection?.ownerRevision !== undefined && grantKey) {
+        binding.operationGrant = { names: operationNames, ownerRevision: connection.ownerRevision, grantKey };
+      }
       sent = this.registry.sendToAgent(this.agentId, {
         type: 'task.assign', taskId,
         ...(executionId !== undefined ? { executionId } : {}), contextId,

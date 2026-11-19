@@ -1224,6 +1224,9 @@ FOR EACH ROW EXECUTE FUNCTION preserve_federation_restriction();
 
 -- Only newly created tasks can establish the agent ownership epoch for a proposal.
 ALTER TABLE infra.a2a_tasks ADD COLUMN IF NOT EXISTS operation_owner_revision bigint;
+-- The grant used for a direct caller's negotiated proposal rights. Keep
+-- this separate from the OAuth authorization that governs ordinary task access.
+ALTER TABLE infra.a2a_tasks ADD COLUMN IF NOT EXISTS operation_grant_key text;
 
 -- Operator-reviewed work runs independently of the originating agent execution.
 CREATE TABLE IF NOT EXISTS infra.operation_requests (
@@ -1234,7 +1237,7 @@ CREATE TABLE IF NOT EXISTS infra.operation_requests (
   task_id text NOT NULL,
   artifact_id text NOT NULL,
   requester text NOT NULL,
-  actor text NOT NULL,
+  actor text,
   profile text NOT NULL,
   grant_key text NOT NULL,
   operation text NOT NULL,
@@ -1254,26 +1257,45 @@ CREATE TABLE IF NOT EXISTS infra.operation_requests (
   history jsonb NOT NULL,
   UNIQUE (agent_id, task_id, artifact_id)
 );
+-- A direct caller acts for itself and has no delegated connector.
+ALTER TABLE infra.operation_requests ALTER COLUMN actor DROP NOT NULL;
+-- Existing approvals predate the comparison of requester and reviewer methods.
+-- Startup reconciliation verifies their grants before a worker may claim them.
+ALTER TABLE infra.operation_requests ADD COLUMN IF NOT EXISTS decision_scheme_verified boolean NOT NULL DEFAULT false;
 -- Preserve the original requester's revocation after its A2A task is pruned.
 ALTER TABLE infra.operation_requests ADD COLUMN IF NOT EXISTS requester_revoked boolean NOT NULL DEFAULT false;
 ALTER TABLE infra.oauth_token_exchange_access_tokens ADD COLUMN IF NOT EXISTS operation_read_revision bigint;
 CREATE INDEX IF NOT EXISTS operation_requests_queue ON infra.operation_requests
   (agent_id,operation,expires_at) WHERE state = 'approved';
 
+-- Open caller-runtime agents still verify identity. An open grant stops
+-- being effective when an allowlist is installed, even for a listed user.
+CREATE OR REPLACE FUNCTION infra.operation_grant_active(grant_key text, allowed_callers text[])
+RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS $$
+  SELECT CASE WHEN grant_key = 'public' THEN cardinality(allowed_callers) = 0
+    ELSE grant_key = ANY(allowed_callers) END
+$$;
+REVOKE ALL ON FUNCTION infra.operation_grant_active(text,text[]) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION infra.operation_grant_active(text,text[]) TO app_postgraphile;
+
 -- Revocation must survive a later grant re-add or ownership transfer back.
 -- The private ledger can outlive the retention window of the A2A task.
 CREATE OR REPLACE FUNCTION infra.invalidate_operation_approvals() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, infra AS $$
 BEGIN
+  UPDATE infra.a2a_tasks SET operation_grant_key=NULL
+  WHERE owner_agent=OLD.id AND operation_grant_key IS NOT NULL AND
+    (OLD.owner_principal IS DISTINCT FROM NEW.owner_principal OR
+     NOT infra.operation_grant_active(operation_grant_key, NEW.allowed_callers));
   UPDATE infra.operation_requests SET requester_revoked=true
   WHERE agent_id=OLD.id AND NOT requester_revoked AND
-    (OLD.owner_principal IS DISTINCT FROM NEW.owner_principal OR NOT (grant_key=ANY(NEW.allowed_callers)));
+    (OLD.owner_principal IS DISTINCT FROM NEW.owner_principal OR NOT infra.operation_grant_active(grant_key, NEW.allowed_callers));
   UPDATE infra.operation_requests SET state='cancelled',
     history=history||jsonb_build_object('event','policy_revoked','at',clock_timestamp())
   WHERE agent_id=OLD.id AND state IN ('pending','approved') AND
     (OLD.owner_principal IS DISTINCT FROM NEW.owner_principal OR
-     NOT (grant_key=ANY(NEW.allowed_callers)) OR
-     (decided_by IS NOT NULL AND NOT (decided_by=ANY(NEW.allowed_callers))));
+     NOT infra.operation_grant_active(grant_key, NEW.allowed_callers) OR
+     (decided_by IS NOT NULL AND NOT infra.operation_grant_active(decided_by, NEW.allowed_callers)));
   RETURN NULL;
 END;
 $$;
