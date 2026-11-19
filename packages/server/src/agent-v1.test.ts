@@ -149,7 +149,7 @@ test('operation approval discovery requires overlapping runtime and current owne
       assert.equal(response.status, 200);
       const card = await response.json() as AgentCard;
       const matches = card.capabilities?.extensions?.filter(e => e.uri === OPERATION_APPROVAL_EXTENSION_URI) ?? [];
-      assert.equal(matches.length, ['enabled', 'google', 'siwe', 'any-direct'].includes(scenario) ? 1 : 0, scenario);
+      assert.equal(matches.length, ['enabled', 'google', 'siwe', 'any-direct', 'wrong-scheme', 'wrong-method', 'no-federation'].includes(scenario) ? 1 : 0, scenario);
       if (matches.length) {
         assert.equal(matches[0]!.required, false);
         assert.deepEqual(matches[0]!.params, { registrationUrl: 'https://bridge.example/agents/v1-test-agent/operations' });
@@ -327,7 +327,7 @@ test(`${direct ?? (otherMethod ? 'federated with a mismatched proof method' : fe
   const principalId = federated ? 'slack:T123/U456' : direct === 'siwe' ? 'eth:0x0000000000000000000000000000000000000003'
     : direct ? 'google:abc-XYZ_123' : 'apikey:direct-caller-554';
   const directGrant = direct?.startsWith('google') ? 'google:sub:abc-XYZ_123' : principalId;
-  const canPropose = callerRuntime && !otherMethod && (federated || direct === 'google' || direct === 'siwe');
+  const canPropose = callerRuntime && (federated || direct !== undefined);
   const actorId = 'did:web:connector.example';
   const slackGrant = formatFederatedPrincipal({ issuer: actorId, subject: 'slack:T123/U456',
     method: 'urn:mentionable:auth:slack-workspace-member:v0.1' })!;

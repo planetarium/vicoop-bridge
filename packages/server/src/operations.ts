@@ -241,11 +241,7 @@ function isRequester(row: RequestRow, user: OperationUser) {
     user.grants.includes(row.grant_key)
   );
 }
-function eligibleOperator(row: RequestRow, policy: OperationDefinition, user: OperationUser) {
-  if (row.profile !== user.profileId ||
-      (row.actor === null) !== (user.actorId === null)) return false;
-  if (row.actor !== null && user.federatedMethod !== federatedMethod(row.grant_key, row.requester, row.actor))
-    return false;
+function eligibleOperator(policy: OperationDefinition, user: OperationUser) {
   return policy.operators.some(
     (o) => o.principalId === user.principalId && (o.actorId ?? null) === user.actorId &&
       operationOperatorMethod(o) === user.federatedMethod,
@@ -392,10 +388,6 @@ export function mountOperations(
         );
         if (prior && prior.digest === digest) return view(prior);
         if (prior) error(409, 'Proposal changed');
-        const scheme = identity.actorId === null ? identity.profileId : 'federated';
-        if (!policy.operators.some(operator =>
-          operationCallerScheme(operator) === scheme && operationOperatorMethod(operator) === identity.federatedMethod,
-        )) missing();
         if (
           !origin || origin.owner_principal !== identity.principalId ||
           origin.owner_actor !== identity.actorId ||
@@ -474,7 +466,7 @@ export function mountOperations(
           !isRequester(row, identity))
       )
         missing();
-      if (!isRequester(row, identity) && !(policy && eligibleOperator(row, policy, identity))) missing();
+      if (!isRequester(row, identity) && !(policy && eligibleOperator(policy, identity))) missing();
       if (owner.owner_principal !== row.agent_owner || owner.owner_revision !== row.owner_revision)
         missing();
       return action(tx, row, identity, policy);
@@ -492,7 +484,7 @@ export function mountOperations(
             !row.expired &&
             !!policy &&
             samePolicy(row, policy) &&
-            eligibleOperator(row, policy, identity),
+            eligibleOperator(policy, identity),
         }),
         true,
       ),
@@ -510,7 +502,7 @@ export function mountOperations(
     const input = await body(c, decision);
     return c.json(
       await access(c, async (tx, row, identity, policy) => {
-        if (!policy || !eligibleOperator(row, policy, identity) || !identity.canDecide) missing();
+        if (!policy || !eligibleOperator(policy, identity) || !identity.canDecide) missing();
         if (!samePolicy(row, policy) || input.digest !== row.digest) error(409, 'Proposal changed');
         const next = input.decision === 'approve' ? 'approved' : 'denied';
         if (

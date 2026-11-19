@@ -207,15 +207,17 @@ test(
     await store.updateTask(taskId, {
       status: { state: TaskState.INPUT_REQUIRED },
     });
-    // One connector can issue the same subject using two methods. A request
-    // under the second method must use an operator enrolled under that method.
+    // Each operator must prove its own enrolled method, regardless of the proposal origin.
     const alternateCaller = await issue(requester, otherGrant);
     const alternateTask = await store.createTask({
       metadata: { ...metadata, _authorizationKey: otherGrant },
     });
     await store.updateTask(alternateTask.id, { artifacts, status: { state: TaskState.COMPLETED } });
     const alternatePayload = { ...payload(0), taskId: alternateTask.id };
-    assert.equal((await post(path, alternateCaller, alternatePayload)).status, 404);
+    const crossMethod = requestView.parse(await (await post(path, alternateCaller, alternatePayload)).json());
+    assert.equal((await post(path + '/' + crossMethod.id + '/decision', approver, {
+      decision: 'deny', digest: crossMethod.digest,
+    })).status, 200);
     const alternateApprover = await issue('employee:ops', otherGrant);
     const mixed = new Hono();
     mountOperations(mixed, runtime, [{
@@ -225,7 +227,7 @@ test(
       method: 'POST', headers: { Authorization: 'Bearer ' + bearer, 'Content-Type': 'application/json' },
       body: JSON.stringify(input),
     });
-    const mixedRequest = requestView.parse(await (await mixedPost(path, alternateCaller, alternatePayload)).json());
+    const mixedRequest = requestView.parse(await (await mixedPost(path, alternateCaller, { ...payload(1), taskId: alternateTask.id })).json());
     const mixedDecision = path + '/' + mixedRequest.id + '/decision';
     const decision = { decision: 'deny', digest: mixedRequest.digest };
     assert.equal((await mixedPost(mixedDecision, alternateCaller, decision)).status, 404);
@@ -234,12 +236,12 @@ test(
     mountOperations(directOnly, runtime, readOperationRegistry(JSON.stringify([{
       ...policy, operators: [{ principalId: 'google:314159' }],
     }])));
-    const incompatiblePolicy = await directOnly.request(path, {
+    const directOperatorPolicy = await directOnly.request(path, {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + caller, 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload(0)),
+      body: JSON.stringify(payload(7)),
     });
-    assert.equal(incompatiblePolicy.status, 404, 'an older task cannot register after its reviewer scheme is removed');
+    assert.equal(directOperatorPolicy.status, 200, 'a federated requester can register with a direct-only operator list');
     // A generic JSON artifact is not an operation proposal, even when its data looks identical.
     const unmarked = { ...artifacts[0], artifactId: randomUUID(), extensions: [] };
     await store.updateTask(taskId, { artifacts: [...artifacts, unmarked] });

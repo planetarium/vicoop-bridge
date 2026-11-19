@@ -26,7 +26,7 @@ import { PostgresTaskStore } from './postgres-task-store.js';
 const view = z.object({ id: z.string(), state: z.string(), digest: z.string() });
 
 test(
-  'direct operation APIs bind requests and decisions to authorized individuals in the same scheme',
+  'direct operation APIs bind requests and decisions to individually authorized callers across authentication schemes',
   { skip: !process.env.DATABASE_URL },
   async (t) => {
     const sql = postgres(process.env.DATABASE_URL!, { onnotice() {} });
@@ -132,6 +132,8 @@ test(
       app.request(path + '/' + id, {
         headers: { Authorization: 'Bearer ' + token },
       });
+    const canDecide = async (id: string, token: string) =>
+      z.object({ canDecide: z.boolean() }).parse(await (await get(id, token)).json()).canDecide;
     const store = new PostgresTaskStore(sql, { ownerAgent: agentId });
     async function proposal(principal: string, grant: string, actorId?: string) {
       const task = await store.createTask({
@@ -169,22 +171,23 @@ test(
 
     const federatedRequest = await register(slackToken, await proposal(slack, slackGrant, actor));
     for (const token of [reviewer, walletReviewer]) {
-      assert.equal((await get(federatedRequest.id, token)).status, 404);
-      assert.equal((await decide(federatedRequest, token)).status, 404);
+      assert.equal(await canDecide(federatedRequest.id, token), true);
     }
+    assert.equal((await decide(federatedRequest, walletReviewer)).status, 200);
+    const job = await post('/operation-executors/' + agentId + '/deploy/claim', executor, {});
+    assert.equal(z.object({ operation: view }).parse(await job.json()).operation.id, federatedRequest.id);
 
     const googleProposal = await proposal(google, grants[0]);
     assert.equal((await post(path, reviewer, googleProposal)).status, 404);
     const googleRequest = await register(googleToken, googleProposal);
-    for (const token of [outsider, walletReviewer, slackToken]) {
-      assert.equal((await get(googleRequest.id, token)).status, 404);
-      assert.equal((await decide(googleRequest, token)).status, 404);
-    }
+    assert.equal((await get(googleRequest.id, outsider)).status, 404);
+    assert.equal((await decide(googleRequest, outsider)).status, 404);
     for (const token of [ownerSession, apiKey, await credential(googleOperator, 'google', { ttlMs: -1 })]) {
       assert.equal((await decide(googleRequest, token)).status, 401);
     }
     const ownRequest = await register(outsider, await proposal(unlisted, grants[2]));
     assert.equal((await decide(ownRequest, outsider)).status, 404);
+    assert.equal((await decide(ownRequest, slackToken)).status, 200);
     assert.equal((await get(googleRequest.id, googleToken)).status, 200);
     assert.equal((await get(googleRequest.id, reviewer)).status, 200);
     const revokedReviewer = await credential(googleOperator, 'google');
@@ -213,7 +216,7 @@ test(
     const walletProposal = await proposal(eth, eth);
     assert.equal((await post(path, await signedBearer('other.test'), walletProposal)).status, 401);
     const walletRequest = await register(await signedBearer(domain), walletProposal);
-    assert.equal((await decide(walletRequest, reviewer)).status, 404);
+    assert.equal(await canDecide(walletRequest.id, reviewer), true);
     assert.equal((await decide(walletRequest, walletToken)).status, 200);
     assert.equal((await post(path + '/' + walletRequest.id + '/cancel', walletReviewer, {})).status, 404);
     assert.equal((await post(path + '/' + walletRequest.id + '/cancel', walletToken, {})).status, 200);

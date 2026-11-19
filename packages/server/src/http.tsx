@@ -421,7 +421,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }
 
     const scheme = caller && operationCallerScheme(caller);
-    const operationNames = scheme ? matchingOperationNames(conn, operationPolicies, scheme, caller?.tokenExchange?.allowedCaller) : [];
+    const operationNames = scheme ? matchingOperationNames(conn, operationPolicies, scheme) : [];
     const directGrants = caller && !caller.tokenExchange && operationNames.length
       ? directOperationGrants(conn.allowedCallers, caller) : [];
     let directGrantKey: string | undefined = directGrants[0];
