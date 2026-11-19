@@ -172,7 +172,7 @@ export function buildAgentA2XServer(
       (allowsEthereum && operationNamesFor(conn, 'siwe').length)) {
     a2xServer.addExtension({
       uri: OPERATION_APPROVAL_EXTENSION_URI, required: false,
-      description: 'Propose a registered host operation for independent operator review.',
+      description: 'Propose a registered host operation for operator review.',
       params: { registrationUrl: `${opts.publicUrl ?? ''}/agents/${encodeURIComponent(conn.agentId)}/operations` },
     });
   }

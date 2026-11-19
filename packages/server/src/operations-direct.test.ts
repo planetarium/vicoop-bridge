@@ -183,7 +183,8 @@ test(
     for (const token of [ownerSession, apiKey, await credential(googleOperator, 'google', { ttlMs: -1 })]) {
       assert.equal((await decide(googleRequest, token)).status, 401);
     }
-    assert.equal((await decide(googleRequest, googleToken)).status, 404);
+    const ownRequest = await register(outsider, await proposal(unlisted, grants[2]));
+    assert.equal((await decide(ownRequest, outsider)).status, 404);
     assert.equal((await get(googleRequest.id, googleToken)).status, 200);
     assert.equal((await get(googleRequest.id, reviewer)).status, 200);
     const revokedReviewer = await credential(googleOperator, 'google');
@@ -212,9 +213,8 @@ test(
     const walletProposal = await proposal(eth, eth);
     assert.equal((await post(path, await signedBearer('other.test'), walletProposal)).status, 401);
     const walletRequest = await register(await signedBearer(domain), walletProposal);
-    assert.equal((await decide(walletRequest, walletToken)).status, 404);
     assert.equal((await decide(walletRequest, reviewer)).status, 404);
-    assert.equal((await decide(walletRequest, walletReviewer)).status, 200);
+    assert.equal((await decide(walletRequest, walletToken)).status, 200);
     assert.equal((await post(path + '/' + walletRequest.id + '/cancel', walletReviewer, {})).status, 404);
     assert.equal((await post(path + '/' + walletRequest.id + '/cancel', walletToken, {})).status, 200);
 

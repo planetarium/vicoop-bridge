@@ -82,7 +82,6 @@ test(
       executorTokenSha256: createHash('sha256').update(executorToken).digest('hex'),
       operators: [
         { principalId: operator, actorId: actor }, { principalId: requester, actorId: actor },
-        { principalId: requester, actorId: secondActor },
       ],
       fields: {
         pull: { type: 'integer' },
@@ -242,6 +241,22 @@ test(
       404,
     );
     const pending = await create(8);
+    const oldSameMethod = await create(10);
+    const oldOtherMethod = await create(11);
+    for (const [item, token] of [[oldSameMethod, caller], [oldOtherMethod, approver]] as const) {
+      assert.equal((await post(path + '/' + item.id + '/decision', token, {
+        decision: 'approve', digest: item.digest,
+      })).status, 200);
+    }
+    await sql`UPDATE infra.operation_requests SET decision_scheme_verified=false
+      WHERE id=ANY(${[oldSameMethod.id, oldOtherMethod.id]}::uuid[])`;
+    await sql`UPDATE infra.operation_requests SET decided_by=${otherGrant} WHERE id=${oldOtherMethod.id}`;
+    assert.equal(claim.parse(await (await post(worker + '/claim', executorToken)).json()).operation, null);
+    await reconcileOperationPolicies(runtime, readOperationRegistry(JSON.stringify([policy])));
+    assert.equal(claim.parse(await (await post(worker + '/claim', executorToken)).json()).operation?.id, oldSameMethod.id);
+    assert.equal((await post(worker + '/' + oldSameMethod.id + '/result', executorToken,
+      { state: 'succeeded', result: 'Done' })).status, 200);
+    assert.equal(requestView.parse(await (await get(path + '/' + oldOtherMethod.id, caller)).json()).state, 'cancelled');
     const approved = await create(9);
     assert.equal(
       (
@@ -252,25 +267,6 @@ test(
       ).status,
       200,
     );
-    const oldSameMethod = await create(10);
-    const oldOtherMethod = await create(11);
-    for (const item of [oldSameMethod, oldOtherMethod]) {
-      assert.equal((await post(path + '/' + item.id + '/decision', approver, {
-        decision: 'approve', digest: item.digest,
-      })).status, 200);
-    }
-    await sql`UPDATE infra.operation_requests SET decision_scheme_verified=false
-      WHERE id=ANY(${[oldSameMethod.id, oldOtherMethod.id]}::uuid[])`;
-    await sql`UPDATE infra.operation_requests SET decided_by=${otherGrant} WHERE id=${oldOtherMethod.id}`;
-    // Old revisions could record a decision when the requester was also an
-    // allowlisted operator. Do not dispatch that already-approved work.
-    await sql`UPDATE infra.operation_requests SET decided_principal=requester WHERE id=${approved.id}`;
-    assert.equal(claim.parse(await (await post(worker + '/claim', executorToken)).json()).operation, null);
-    await reconcileOperationPolicies(runtime, readOperationRegistry(JSON.stringify([policy])));
-    assert.equal(claim.parse(await (await post(worker + '/claim', executorToken)).json()).operation?.id, oldSameMethod.id);
-    assert.equal((await post(worker + '/' + oldSameMethod.id + '/result', executorToken,
-      { state: 'succeeded', result: 'Done' })).status, 200);
-    assert.equal(requestView.parse(await (await get(path + '/' + oldOtherMethod.id, caller)).json()).state, 'cancelled');
     const empty = new Hono();
     mountOperations(empty, runtime, []);
     const changed = readOperationRegistry(JSON.stringify([{ ...policy, ttlSeconds: 3600 }]));
@@ -285,14 +281,14 @@ test(
       const audit = history.parse(
         await (await get(path + '/' + item.id + '/audit', caller)).json(),
       );
-      assert.deepEqual(audit.history.filter((e) => e.event === (item === approved ? 'self_approval_revoked' : 'policy_changed')).length, 1);
+      assert.deepEqual(audit.history.filter((e) => e.event === 'policy_changed').length, 1);
     }
     const [a, replay] = await Promise.all([create(0), create(0)]);
     assert.deepEqual(a, replay);
     const canDecide = async (id: string, token: string) =>
       z.object({ canDecide: z.boolean() }).parse(await (await get(path + '/' + id, token)).json())
         .canDecide;
-    assert.equal(await canDecide(a.id, caller), false);
+    assert.equal(await canDecide(a.id, caller), true);
     assert.equal(await canDecide(a.id, approver), true);
     const readOnlyOperator = await issue(operator, sharedGrant, undefined, ['a2a:task.read']);
     const taskScopedOperator = await issue(operator, sharedGrant, taskId, ['a2a:task.read', 'a2a:message.send']);
@@ -308,11 +304,8 @@ test(
     const wrongMethod = await issue(operator, otherGrant);
     assert.equal((await get(path + '/' + a.id, wrongMethod)).status, 404);
     assert.equal((await decide(a, wrongMethod)).status, 404);
-    for (const asRequester of [caller, await issue(requester, sharedGrant), await issue(requester, secondGrant, undefined, undefined, secondActor)]) {
-      for (const decision of ['approve', 'deny']) {
-        assert.equal((await decide(a, asRequester, decision)).status, 404);
-      }
-    }
+    const unlistedActor = await issue(requester, secondGrant, undefined, undefined, secondActor);
+    assert.equal((await decide(a, unlistedActor)).status, 404);
     assert.equal((await decide(a, readOnlyOperator)).status, 404);
     assert.equal((await decide(a, taskScopedOperator)).status, 404);
     assert.equal((await post(path + '/' + a.id + '/cancel', await issue(requester, requesterGrant, taskId))).status, 404);
@@ -399,7 +392,7 @@ test(
     assert.equal((await decide(c)).status, 200);
     assert.equal((await post(path + '/' + c.id + '/cancel', caller)).status, 200);
     const d = await create(3);
-    assert.equal((await decide(d, approver, 'deny')).status, 200);
+    assert.equal((await decide(d, caller, 'deny')).status, 200);
     const e = await create(4);
     assert.equal((await decide(e)).status, 200);
     await sql`UPDATE agents SET allowed_callers=${[requesterGrant]} WHERE id=${agentId}`;

@@ -110,10 +110,9 @@ function federatedMethod(grant: string, principal: string, actor: string): strin
 export async function reconcileOperationPolicies(db: Sql, policies: OperationDefinition[]) {
   const hashes = policies.map(policyDigest);
   await db`UPDATE infra.operation_requests SET state='cancelled', result='Operation policy changed',
-    history=history||jsonb_build_object('event', CASE WHEN requester=decided_principal THEN 'self_approval_revoked'
-      ELSE 'policy_changed' END, 'at',clock_timestamp())
+    history=history||jsonb_build_object('event', 'policy_changed', 'at',clock_timestamp())
     WHERE state IN ('pending','approved') AND expires_at > clock_timestamp()
-    AND (NOT (policy_digest = ANY(${hashes}::text[])) OR (state='approved' AND requester=decided_principal))`;
+    AND NOT (policy_digest = ANY(${hashes}::text[]))`;
   // Older deployments did not compare methods. Upgrade only live, unclaimed
   // decisions and bound each transaction; workers skip them until verified.
   for (;;) {
@@ -257,10 +256,7 @@ function isRequester(row: RequestRow, user: OperationUser) {
   );
 }
 function eligibleOperator(row: RequestRow, policy: OperationDefinition, user: OperationUser) {
-  // Until accounts can be linked, decisions stay within the requester's
-  // authentication scheme. A second connector or grant cannot make the
-  // same platform subject independent of the requester.
-  if (row.requester === user.principalId || row.profile !== user.profileId ||
+  if (row.profile !== user.profileId ||
       (row.actor === null) !== (user.actorId === null)) return false;
   if (row.actor !== null && user.federatedMethod !== federatedMethod(row.grant_key, row.requester, row.actor))
     return false;
@@ -585,7 +581,7 @@ export function mountOperations(
         const [row] = await tx<RequestRow[]>`WITH candidate AS (
       SELECT r.id FROM infra.operation_requests r JOIN agents a ON a.id=r.agent_id
       WHERE r.agent_id=${p.agentId} AND r.operation=${p.operation} AND r.state='approved'
-      AND r.decision_scheme_verified AND r.decided_principal <> r.requester
+      AND r.decision_scheme_verified
       AND infra.operation_grant_active(r.grant_key, a.allowed_callers)
       AND infra.operation_grant_active(r.decided_by, a.allowed_callers)
       AND r.policy_digest=${policyDigest(p)} AND r.expires_at > clock_timestamp()

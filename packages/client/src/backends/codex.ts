@@ -1480,7 +1480,7 @@ export function createCodexBackend(
         const hostTools = fileDelivery ? [
           ...(fileDelivery.filesEnabled !== false ? [{ name: 'send_file', description: fileDelivery.description, inputSchema: callerFileToolSchema }] : []),
           ...(fileDelivery.operations?.length ? [{ name: 'propose_operation',
-            description: 'Propose an operation for independent human review and host execution.',
+            description: 'Propose an operation for operator review and host execution.',
             inputSchema: { type: 'object', properties: { operation: { type: 'string', enum: fileDelivery.operations }, arguments: { type: 'object' } },
               required: ['operation', 'arguments'], additionalProperties: false },
           }] : []),
