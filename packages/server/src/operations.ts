@@ -187,9 +187,11 @@ export function mountOperations(
     // Take policy then credential locks in the same order as revocation.
     if (!token(c)) error(401, 'Invalid credential');
     await db`SELECT id FROM agents WHERE id=${agent} FOR SHARE`;
+    // The verifier stamps last_used_at on this transaction. Acquire its write
+    // lock immediately so parallel reviews never need to upgrade shared locks.
     await db`SELECT id FROM infra.oauth_token_exchange_access_tokens WHERE token_hash=${hash(
       token(c),
-    )} FOR SHARE`;
+    )} FOR UPDATE`;
     const identity = await verifyTokenExchangeAccessToken(db, token(c), agent).catch(() =>
       error(401, 'Invalid credential'),
     );

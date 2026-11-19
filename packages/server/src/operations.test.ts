@@ -134,8 +134,15 @@ test(
       post(path + '/' + item.id + '/decision', token, { decision, digest: item.digest });
     assert.equal((await decide(a, caller)).status, 404);
     assert.equal((await decide({ ...a, digest: '0'.repeat(64) })).status, 409);
-    assert.equal((await decide(a)).status, 200);
-    assert.equal((await decide(a)).status, 200);
+    // A connector can poll while an operator retries the same decision.
+    // Warm the pool so independent transactions actually use different sessions.
+    await Promise.all(Array.from({ length: 6 }, () => sql`SELECT pg_sleep(0.01)`));
+    const reviews = await Promise.all(
+      Array.from({ length: 6 }, (_, i) =>
+        i % 2 === 0 ? decide(a) : get(path + '/' + a.id, approver),
+      ),
+    );
+    for (const review of reviews) assert.equal(review.status, 200, await review.text());
     assert.equal((await decide(a, approver, 'deny')).status, 409);
     assert.equal((await post(worker + '/claim', caller)).status, 401);
     const claims = await Promise.all(
