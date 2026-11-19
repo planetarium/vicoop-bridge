@@ -1,5 +1,11 @@
 # @vicoop-bridge/client
 
+## 0.51.0
+
+### Minor Changes
+
+- 0c0ce7c: Caller-isolated Claude and Codex can expose an A2A-negotiated propose_operation tool for operator-reviewed external work.
+
 ## 0.50.0
 
 ### Minor Changes
