@@ -1,9 +1,9 @@
-// Real Azure + caller Docker + WebSocket bridge + HTTP A2A attachment retrieval.
+// Real Codex provider + caller Docker + WebSocket bridge + HTTP A2A attachment retrieval.
 // Creates and drops its own randomly named database. By default its PostgreSQL
 // server is also a disposable Docker container. To use an existing local server,
 // set VICOOP_SMOKE_DATABASE_URL to an admin connection and explicitly opt in with
 // VICOOP_SMOKE_CREATE_DATABASE=1. No schema or rows are written to that admin DB.
-// Requires Docker and protected host Azure env. Never point this at production.
+// Requires Docker and protected host provider credentials. Never point this at production.
 import assert from 'node:assert/strict';
 import { randomUUID, createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -24,10 +24,10 @@ import { CallerRuntimeConfig } from '../../client/src/caller-runtime-config.js';
 import { runDockerCommand } from '../../client/src/docker-command.js';
 import { DockerCallerRuntimePool } from '../../client/src/caller-runtime-docker.js';
 
-const image = process.env.VICOOP_AZURE_SMOKE_IMAGE;
-assert.ok(image, 'Set VICOOP_AZURE_SMOKE_IMAGE to a pinned real Codex caller image');
-assert.ok(process.env.AZURE_OPENAI_API_KEY, 'Set host-only Azure authentication');
-const secret = process.env.AZURE_OPENAI_API_KEY;
+const image = process.env.VICOOP_SMOKE_CODEX_IMAGE ?? process.env.VICOOP_AZURE_SMOKE_IMAGE;
+assert.ok(image, 'Set VICOOP_SMOKE_CODEX_IMAGE to a pinned real Codex caller image');
+const secret = process.env.VICOOP_CODEX_RESPONSES_API_KEY ?? process.env.AZURE_OPENAI_API_KEY;
+assert.ok(secret, 'Set host-only Responses or Azure provider authentication');
 const id = `azure-a2a-${randomUUID()}`;
 const databaseContainer = `${id}-postgres`;
 const databaseName = `vicoop_azure_smoke_${randomUUID().replaceAll('-', '')}`;
@@ -105,7 +105,7 @@ try {
   backend = await createCallerRuntime({kind:'codex', agentId:id, config,
     codex:{approvalDecision:'accept', initializeTimeoutMs:30000}});
   client = new Client({serverUrl:base.replace('http:','ws:'), token, agentId:id, backendKind:'codex', backend,
-    agentCard:{name:id, description:'Azure attachment smoke',version:'1',protocolVersion:'0.3.0',capabilities:{streaming:true}},
+    agentCard:{name:id, description:'Codex attachment smoke',version:'1',protocolVersion:'0.3.0',capabilities:{streaming:true}},
     logSink: {log: captureLog, warn: captureLog, error: captureLog}});
   client.start();
   await waitFor(() => !!registry.getAgent(id), 'client registration');
@@ -122,8 +122,8 @@ try {
     const accepted = await rpc('message/send', {message:{kind:'message',role:'user',messageId:randomUUID(),
       ...(contextId ? {contextId}:{}),parts:[{kind:'text',text}]},configuration:{blocking:false}});
     let task: any;
-    await waitFor(async () => {task=await rpc('tasks/get',{id:accepted.id}); return ['completed','failed','canceled','rejected'].includes(task.status.state);}, 'Azure A2A task', 240000);
-    assert.equal(task.status.state,'completed','Azure A2A task did not complete');
+    await waitFor(async () => {task=await rpc('tasks/get',{id:accepted.id}); return ['completed','failed','canceled','rejected'].includes(task.status.state);}, 'Codex A2A task', 240000);
+    assert.equal(task.status.state,'completed','Codex A2A task did not complete');
     return task;
   }
   const bytes = Buffer.from('Azure A2A attachment probe\u0000\u0001\u00ff\n', 'utf8');
@@ -143,7 +143,7 @@ try {
   assert.ok(resumedText.includes(resumeNonce), 'resumed task did not recall the random nonce');
   assert.ok(!JSON.stringify(resumed).includes('conversationReset'), 'ordinary resume unexpectedly reset the conversation');
   assert.ok(!credentialInLogs, 'provider credential exposed in captured logs');
-  report = {success:true,transport:'HTTP A2A v0.3 + WebSocket',provider:'Azure OpenAI',
+  report = {success:true,transport:'HTTP A2A v0.3 + WebSocket',provider:process.env.VICOOP_CODEX_RESPONSES_BASE_URL ? 'self-hosted Responses' : 'Azure OpenAI',
     attachmentBytes:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex'),initialFile:true,resumedFile:true,conversationResume:true};
 } finally {
   const failures: string[] = [];

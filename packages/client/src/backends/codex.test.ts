@@ -1456,7 +1456,7 @@ test('openai-compat dynamicTools: item/tool/call → chat_completion envelope on
               turnId: 'turn-1',
               callId: 'call_xyz',
               namespace: null,
-              tool: 'fetch',
+              tool: 'send_file',
               arguments: { url: 'https://example.com' },
             },
           });
@@ -1513,7 +1513,14 @@ test('openai-compat dynamicTools: item/tool/call → chat_completion envelope on
       }
     },
   }));
-  const backend = createCodexBackend({ spawn: fake.spawn });
+  // A caller-defined function can have the same name as the host's A2A tool.
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    functionFileDelivery: {
+      description: 'Deliver a local attachment',
+      bind() { throw new Error('Caller tool must never bind host file delivery'); },
+    },
+  });
   const { emit, frames } = collect();
   await backend.handle(
     assign('fetch example.com', 'ctx-oai', {
@@ -1532,7 +1539,7 @@ test('openai-compat dynamicTools: item/tool/call → chat_completion envelope on
                 {
                   type: 'function',
                   function: {
-                    name: 'fetch',
+                    name: 'send_file',
                     description: 'Fetch a URL',
                     parameters: {
                       type: 'object',
@@ -1604,7 +1611,7 @@ test('openai-compat dynamicTools: item/tool/call → chat_completion envelope on
     assert.equal(message.tool_calls?.length, 1);
     assert.equal(message.tool_calls?.[0]?.id, 'call_xyz');
     assert.equal(message.tool_calls?.[0]?.type, 'function');
-    assert.equal(message.tool_calls?.[0]?.function?.name, 'fetch');
+    assert.equal(message.tool_calls?.[0]?.function?.name, 'send_file');
     // OpenAI spec requires `arguments` to be a JSON-encoded string.
     const argsRaw = message.tool_calls?.[0]?.function?.arguments;
     assert.equal(typeof argsRaw, 'string');
@@ -1682,7 +1689,7 @@ test('openai-compat dynamicTools: item/tool/call → chat_completion envelope on
     | undefined;
   const dynTools = tsFrame?.params?.dynamicTools;
   assert.ok(Array.isArray(dynTools) && dynTools.length === 1);
-  assert.equal(dynTools?.[0]?.name, 'fetch');
+  assert.equal(dynTools?.[0]?.name, 'send_file');
 
   // developerInstructions must contain only the user's system text (no
   // envelope-teaching block, no JSON contract block, no `tool_calls` literal).

@@ -105,7 +105,7 @@ export async function createCallerRuntime(args: {
               ttlMs: config.taskTimeoutMs,
               credentialProxy: config.credentialProxy,
               codexCatalog,
-              fileDelivery,
+              fileDelivery: codexSelected?.responsesProvider ? undefined : fileDelivery,
               createBroker: () => {
                 const providerBroker = createCodexAuthBroker({
                   credential: codexCredential!,
@@ -154,6 +154,7 @@ export async function createCallerRuntime(args: {
             })
           : createCodexExecutionBackend({
               ...args.codex,
+              functionFileDelivery: codexSelected?.responsesProvider ? fileDelivery : undefined,
               ...(providerModel ? {
                 appServerArgs: codexProviderAppServerArgs(codexSelected),
                 readCodexConfigToml: async () => `model=${JSON.stringify(providerModel)}`,

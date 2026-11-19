@@ -80,11 +80,21 @@ The broker accepts the configured model ID and supplies the key as a Bearer
 token to the configured origin. The container uses an execution grant. Provider
 selection is exclusive with direct OpenAI and Azure environment settings.
 The self-hosted profile disables Codex sub-agents and hosted web search.
-Codex advertises MCP tools (including native file delivery) as Responses
-namespace tools. File delivery requires an upstream that supports that tool type.
+With caller file delivery enabled, A2A tasks expose `send_file` as a top-level
+function. The host validates the path and file limits and emits the attachment
+on the current task. An OpenAI-compatible caller request uses its own tools.
 The upstream must support the Responses features your tasks use, including
 streaming and tool calls. The host must be able to reach it without an interactive
 login. Changing the endpoint, key or model requires restarting the bridge.
+
+To verify file receipt with this provider, export the three provider settings
+above and run the HTTP A2A smoke with a pinned Codex caller image. It compares
+the consumer-visible attachment bytes on both a fresh and a resumed task.
+
+```sh
+VICOOP_SMOKE_CODEX_IMAGE=sha256:YOUR_REAL_CALLER_IMAGE_ID \
+  pnpm exec tsx packages/server/scripts/azure-codex-a2a-smoke.ts
+```
 
 ## Azure OpenAI caller containers
 
