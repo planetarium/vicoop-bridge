@@ -2,6 +2,20 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import postgres from 'postgres';
+import { SignJWT, generateKeyPair, exportJWK } from 'jose';
+import { formatFederatedPrincipal } from './auth/principal.js';
+import { mountTokenExchangeRoutes } from './oauth/token-exchange/routes.js';
+import {
+  createMentionableOAuthProfile,
+  MENTIONABLE_OAUTH_PROFILE_ID,
+  OAUTH_FEDERATION_CLAIM_TASK_ID,
+  OAUTH_FEDERATION_TYP_CLIENT_ASSERTION,
+  OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION,
+  OAUTH_GRANT_TYPE_TOKEN_EXCHANGE,
+  OAUTH_TOKEN_TYPE_ACCESS_TOKEN,
+  OAUTH_TOKEN_TYPE_JWT,
+  OAUTH_CLIENT_ASSERTION_TYPE_JWT_BEARER,
+} from './oauth/profiles/mentionable-v0.1.js';
 import { Hono } from 'hono';
 import { z } from 'zod';
 const requestView = z.object({ id: z.string().uuid(), state: z.string(), digest: z.string() });
@@ -13,7 +27,10 @@ const history = z.object({
 });
 import { PostgresTaskStore } from './postgres-task-store.js';
 import { ensureSchema } from './db.js';
-import { issueTokenExchangeAccessToken } from './oauth/token-exchange/store.js';
+import {
+  issueTokenExchangeAccessToken,
+  verifyTokenExchangeAccessToken,
+} from './oauth/token-exchange/store.js';
 import { mountOperations, readOperationRegistry } from './operations.js';
 
 test(
@@ -28,7 +45,11 @@ test(
     const operator = 'slack:T/O',
       requester = 'slack:T/R',
       sharedGrant = 'grant-' + randomUUID(),
-      requesterGrant = 'grant-' + randomUUID();
+      requesterGrant = formatFederatedPrincipal({
+        issuer: actor,
+        method: 'urn:mentionable:auth:slack-member:v0.1',
+        subject: requester,
+      })!;
     const executorToken = randomUUID();
     const policy = {
       agentId,
@@ -58,7 +79,7 @@ test(
         await issueTokenExchangeAccessToken(sql, {
           agentId,
           resource: 'https://bridge.example/agents/' + agentId,
-          profileId: 'mentionable',
+          profileId: MENTIONABLE_OAUTH_PROFILE_ID,
           principalId,
           actorId: actor,
           allowedCaller,
@@ -98,7 +119,7 @@ test(
         _principalId: requester,
         _actorId: actor,
         _authorizationKey: requesterGrant,
-        _authorizationProfile: 'mentionable',
+        _authorizationProfile: MENTIONABLE_OAUTH_PROFILE_ID,
       },
     });
     await store.updateTask(taskId, { artifacts });
@@ -214,6 +235,87 @@ test(
       claim.parse(await (await post(worker + '/claim', executorToken)).json()).operation?.id,
       f.id,
     );
+    // Cron has only a signed task continuation, even when it is recovering a
+    // terminal result days after the original Slack event and token expired.
+    const keys = await generateKeyPair('EdDSA');
+    const kid = actor + '#test';
+    const publicKeyJwk = await exportJWK(keys.publicKey);
+    const publicUrl = 'https://bridge.test';
+    const authorizationServer = new Hono();
+    mountTokenExchangeRoutes(authorizationServer, {
+      sql,
+      publicUrl,
+      profiles: [
+        createMentionableOAuthProfile({
+          resolver: {
+            async resolve() {
+              return {
+                id: actor,
+                verificationMethod: [
+                  { id: kid, type: 'JsonWebKey', controller: actor, publicKeyJwk },
+                ],
+                assertionMethod: [kid],
+              };
+            },
+          },
+        }),
+      ],
+    });
+    const exchange = async (subject = requester, task = taskId, scope = 'a2a:task.read') => {
+      const signed = (typ: string, sub: string, fields: Record<string, string> = {}) =>
+        new SignJWT(fields)
+          .setProtectedHeader({ alg: 'EdDSA', typ, kid })
+          .setIssuer(actor)
+          .setSubject(sub)
+          .setAudience(publicUrl + '/oauth/token')
+          .setJti(randomUUID())
+          .setIssuedAt()
+          .setExpirationTime('2m')
+          .sign(keys.privateKey);
+      return authorizationServer.request('/oauth/token', {
+        method: 'POST',
+        body: new URLSearchParams({
+          grant_type: OAUTH_GRANT_TYPE_TOKEN_EXCHANGE,
+          subject_token_type: OAUTH_TOKEN_TYPE_JWT,
+          requested_token_type: OAUTH_TOKEN_TYPE_ACCESS_TOKEN,
+          client_id: actor,
+          client_assertion_type: OAUTH_CLIENT_ASSERTION_TYPE_JWT_BEARER,
+          client_assertion: await signed(OAUTH_FEDERATION_TYP_CLIENT_ASSERTION, actor),
+          subject_token: await signed(OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION, subject, {
+            [OAUTH_FEDERATION_CLAIM_TASK_ID]: task,
+          }),
+          resource: publicUrl + '/agents/' + agentId,
+          scope,
+        }),
+      });
+    };
+    const response = await exchange();
+    assert.equal(response.status, 200, await response.clone().text());
+    const recovered = z
+      .object({ access_token: z.string() })
+      .parse(await response.json()).access_token;
+    assert.equal(
+      requestView.parse(await (await get(path + '/' + a.id, recovered)).json()).state,
+      'succeeded',
+    );
+    assert.equal((await post(path + '/' + a.id + '/cancel', recovered)).status, 401);
+    assert.equal((await decide(f, recovered)).status, 401);
+    assert.equal((await get(path + '/' + a.id + '/audit', recovered)).status, 401);
+    assert.equal((await post(path, recovered, payload(0))).status, 401);
+    await assert.rejects(
+      verifyTokenExchangeAccessToken(sql, recovered, agentId),
+      /restricted to operation status/,
+    );
+    assert.equal((await exchange(operator)).status, 400);
+    assert.equal((await exchange(requester, randomUUID())).status, 400);
+    assert.equal((await exchange(requester, taskId, 'a2a:task.read a2a:task.cancel')).status, 400);
+    await sql`UPDATE agents SET allowed_callers=${[sharedGrant]} WHERE id=${agentId}`;
+    await sql`UPDATE agents SET allowed_callers=${[
+      requesterGrant,
+      sharedGrant,
+    ]} WHERE id=${agentId}`;
+    assert.equal((await exchange()).status, 400);
+    assert.equal((await get(path + '/' + a.id, recovered)).status, 404);
     await sql`UPDATE agents SET owner_principal=${'new-' + owner} WHERE id=${agentId}`;
     await sql`UPDATE agents SET owner_principal=${owner} WHERE id=${agentId}`;
     assert.equal((await get(path + '/' + a.id, caller)).status, 404);

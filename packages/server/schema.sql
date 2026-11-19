@@ -1254,6 +1254,9 @@ CREATE TABLE IF NOT EXISTS infra.operation_requests (
   history jsonb NOT NULL,
   UNIQUE (agent_id, task_id, artifact_id)
 );
+-- Preserve the original requester's revocation after its A2A task is pruned.
+ALTER TABLE infra.operation_requests ADD COLUMN IF NOT EXISTS requester_revoked boolean NOT NULL DEFAULT false;
+ALTER TABLE infra.oauth_token_exchange_access_tokens ADD COLUMN IF NOT EXISTS operation_read_revision bigint;
 CREATE INDEX IF NOT EXISTS operation_requests_queue ON infra.operation_requests
   (agent_id,operation,expires_at) WHERE state = 'approved';
 
@@ -1262,6 +1265,9 @@ CREATE INDEX IF NOT EXISTS operation_requests_queue ON infra.operation_requests
 CREATE OR REPLACE FUNCTION infra.invalidate_operation_approvals() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, infra AS $$
 BEGIN
+  UPDATE infra.operation_requests SET requester_revoked=true
+  WHERE agent_id=OLD.id AND NOT requester_revoked AND
+    (OLD.owner_principal IS DISTINCT FROM NEW.owner_principal OR NOT (grant_key=ANY(NEW.allowed_callers)));
   UPDATE infra.operation_requests SET state='cancelled',
     history=history||jsonb_build_object('event','policy_revoked','at',clock_timestamp())
   WHERE agent_id=OLD.id AND state IN ('pending','approved') AND

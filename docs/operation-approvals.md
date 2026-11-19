@@ -51,7 +51,7 @@ Every operator must exchange their own fresh platform proof. An operator who is 
 | POST `/:id/cancel` | Requester can cancel unconsumed pending or approved work. |
 | GET `/:id/audit` | Requester or operator reads timestamps, decision principals, actors, grants and state transitions. |
 
-Poll the read endpoint for results to deliver back to the originating thread. States are `pending`, `approved`, `denied`, `cancelled`, `expired`, `executing`, `succeeded`, `failed` or `unknown`. Expiry is calculated from the server clock until claim. The host checks the deadline again immediately before submission. The persisted operation can outlive its A2A task.
+Poll the read endpoint for results to deliver back to the originating thread. States are `pending`, `approved`, `denied`, `cancelled`, `expired`, `executing`, `succeeded`, `failed` or `unknown`. Expiry is calculated from the server clock until claim. The host checks the deadline again immediately before submission. The persisted operation can outlive its A2A task. For background polling, exchange a freshly signed task-continuation assertion for only `a2a:task.read`. When the task has been pruned, the original requester, connector actor, live grant and ownership revision must still match the operation ledger. The resulting bearer is restricted to this task's operation status reads. It cannot fetch A2A tasks, decide, cancel or retrieve the audit log. Removing and re-adding the requester grant permanently revokes recovery of those prior operations.
 
 ## Run the designated executor
 

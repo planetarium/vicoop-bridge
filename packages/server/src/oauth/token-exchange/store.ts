@@ -17,6 +17,7 @@ export interface TokenExchangeAccessToken {
   attestation?: CallerAttestationV2Value;
   scopes: string[];
   taskId?: string;
+  operationReadRevision?: string;
   expiresAt: Date;
 }
 
@@ -87,6 +88,7 @@ export async function issueTokenExchangeAccessToken(
     attestation?: CallerAttestationV2Value;
     scopes: string[];
     taskId?: string;
+    operationReadRevision?: string;
     expiresAt: Date;
   },
 ): Promise<{ rawToken: string; token: TokenExchangeAccessToken }> {
@@ -98,12 +100,12 @@ export async function issueTokenExchangeAccessToken(
   const rows = await sql<{ id: string }[]>`
     INSERT INTO infra.oauth_token_exchange_access_tokens
       (token_hash, profile_id, agent_id, resource, principal_id, actor_id, allowed_caller,
-       attestation, scopes, task_id, expires_at)
+       attestation, scopes, task_id, expires_at, operation_read_revision)
     SELECT
       ${hashToken(rawToken)}, ${input.profileId}, a.id, ${input.resource}, ${input.principalId},
       ${input.actorId}, ${input.allowedCaller},
       ${input.attestation ? sql.json(input.attestation) : null},
-      ${input.scopes}, ${input.taskId ?? null}, ${input.expiresAt}
+      ${input.scopes}, ${input.taskId ?? null}, ${input.expiresAt}, ${input.operationReadRevision ?? null}
     FROM (
       SELECT id
       FROM agents
@@ -128,6 +130,7 @@ export async function issueTokenExchangeAccessToken(
       ...(input.attestation !== undefined ? { attestation: input.attestation } : {}),
       scopes: input.scopes,
       ...(input.taskId !== undefined ? { taskId: input.taskId } : {}),
+      ...(input.operationReadRevision !== undefined ? { operationReadRevision: input.operationReadRevision } : {}),
       expiresAt: input.expiresAt,
     },
   };
@@ -137,6 +140,7 @@ export async function verifyTokenExchangeAccessToken(
   sql: SqlExecutor,
   rawToken: string,
   expectedAgentId: string,
+  options: { allowRetainedOperationRead?: boolean } = {},
 ): Promise<TokenExchangeAccessToken> {
   if (!rawToken.startsWith(TOKEN_EXCHANGE_ACCESS_TOKEN_PREFIX)) {
     throw new TokenExchangeTokenError('Invalid OAuth token-exchange token format');
@@ -153,6 +157,7 @@ export async function verifyTokenExchangeAccessToken(
       attestation: unknown | null;
       scopes: string[];
       task_id: string | null;
+      operation_read_revision: string | null;
       expires_at: Date;
       revoked: boolean;
       policy_active: boolean;
@@ -160,7 +165,7 @@ export async function verifyTokenExchangeAccessToken(
   >`
     SELECT t.id, t.profile_id, t.agent_id, t.resource, t.principal_id, t.actor_id,
            t.allowed_caller, t.attestation, t.scopes, t.task_id,
-           t.expires_at, t.revoked,
+           t.operation_read_revision::text, t.expires_at, t.revoked,
            (t.allowed_caller = ANY(a.allowed_callers)) AS policy_active
     FROM infra.oauth_token_exchange_access_tokens t
     JOIN agents a ON a.id = t.agent_id
@@ -171,6 +176,10 @@ export async function verifyTokenExchangeAccessToken(
   if (!row) throw new TokenExchangeTokenError('OAuth token-exchange token not found');
   if (row.agent_id !== expectedAgentId) {
     throw new TokenExchangeTokenError('OAuth token-exchange token resource mismatch');
+  }
+  if (row.operation_read_revision != null &&
+      (!options.allowRetainedOperationRead || !row.task_id || row.scopes.length !== 1 || row.scopes[0] !== 'a2a:task.read')) {
+    throw new TokenExchangeTokenError('Bearer restricted to operation status');
   }
   if (row.resource === null || row.principal_id === null || row.allowed_caller === null) {
     throw new TokenExchangeTokenError(
@@ -205,6 +214,7 @@ export async function verifyTokenExchangeAccessToken(
     ...(attestation?.success === true ? { attestation: attestation.data } : {}),
     scopes: row.scopes,
     ...(row.task_id !== null ? { taskId: row.task_id } : {}),
+    ...(row.operation_read_revision != null ? { operationReadRevision: row.operation_read_revision } : {}),
     expiresAt: row.expires_at,
   };
 }
@@ -250,6 +260,23 @@ export async function loadTokenExchangeTaskAuthorization(
     ...(row.authorization_key !== null ? { authorizationKey: row.authorization_key } : {}),
     authorizationRevoked: row.authorization_revoked === true,
   };
+}
+
+// Retained approval records authorize only their original requester's operation
+// status. Never use this lookup for ordinary A2A task access.
+export async function loadRetainedOperationGrant(
+  sql: Sql, agentId: string, taskId: string, principalId: string, actorId: string, profileId: string,
+): Promise<{ authorizationKey: string; ownerRevision: string } | null> {
+  const rows = await sql<{ grant_key: string; owner_revision: string }[]>`
+    SELECT DISTINCT r.grant_key, r.owner_revision::text
+    FROM infra.operation_requests r JOIN agents a ON a.id = r.agent_id
+    WHERE r.agent_id = ${agentId} AND r.task_id = ${taskId} AND r.requester = ${principalId}
+      AND r.actor = ${actorId} AND r.profile = ${profileId}
+      AND r.agent_owner = a.owner_principal AND r.owner_revision = a.owner_revision
+      AND r.grant_key = ANY(a.allowed_callers) AND NOT r.requester_revoked
+    LIMIT 2
+  `;
+  return rows.length === 1 ? { authorizationKey: rows[0].grant_key, ownerRevision: rows[0].owner_revision } : null;
 }
 
 export async function isTokenExchangeAuthorizationActive(

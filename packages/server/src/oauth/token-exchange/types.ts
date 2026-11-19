@@ -42,6 +42,7 @@ export interface TokenExchangeAuthorization {
   authorizationKey: string;
   scopes: string[];
   taskId?: string;
+  operationReadRevision?: string;
   attestation?: CallerAttestationV2;
   replays: TokenExchangeReplay[];
   kind: string;

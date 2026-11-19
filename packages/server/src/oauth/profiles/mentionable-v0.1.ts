@@ -10,6 +10,7 @@ import {
   OAUTH_FEDERATION_CLOCK_SKEW_SECONDS,
   OAUTH_FEDERATION_EXTENSION_URI,
   OAUTH_FEDERATION_SCOPES,
+  OAUTH_FEDERATION_SCOPE_TASK_READ,
   OAUTH_FEDERATION_TYP_SUBJECT_ASSERTION,
   OAUTH_FEDERATION_TYP_TASK_CONTINUATION_ASSERTION,
   OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_PRIVATE_KEY_JWT,
@@ -27,6 +28,7 @@ import type { DidDocumentResolver, ResolvedDidDocument } from '../../identity-vc
 import {
   consumeTokenExchangeReplays,
   loadTokenExchangeTaskAuthorization,
+  loadRetainedOperationGrant,
   TokenExchangeReplayError,
 } from '../token-exchange/store.js';
 import type {
@@ -225,6 +227,7 @@ export function createMentionableOAuthProfile(
       let policyCandidate: TokenExchangePolicyCandidate | undefined;
       let issuerDocument: IssuerDidDocument | undefined;
       let issuerDocumentFor: string | undefined;
+      let operationReadRevision: string | undefined;
       let trustedTask:
         | {
             principalId: string;
@@ -240,6 +243,7 @@ export function createMentionableOAuthProfile(
           authorizationKey = undefined;
           policyCandidate = undefined;
           trustedTask = undefined;
+          operationReadRevision = undefined;
           const attemptReplays: Array<{ issuer: string; jti: string }> = [];
           const attemptReplayKeys = new Set<string>();
           const result = await verifyTokenExchange(form, {
@@ -278,6 +282,18 @@ export function createMentionableOAuthProfile(
                 let task;
                 try {
                   task = await loadTokenExchangeTaskAuthorization(sql, agentId, candidate.taskId);
+                  // A connector can keep recovering operation results after A2A
+                  // retention removes the task. Never replace a present task's
+                  // authorization, or broaden this evidence into A2A authority.
+                  if (!task && candidate.scopes.length === 1 && candidate.scopes[0] === OAUTH_FEDERATION_SCOPE_TASK_READ) {
+                    const origin = await loadRetainedOperationGrant(sql, agentId, candidate.taskId,
+                      candidate.subject, candidate.issuer, MENTIONABLE_OAUTH_PROFILE_ID);
+                    if (origin) {
+                      task = { principalId: candidate.subject, actorId: candidate.issuer, profileId: MENTIONABLE_OAUTH_PROFILE_ID,
+                        authorizationKey: origin.authorizationKey, authorizationRevoked: false };
+                      operationReadRevision = origin.ownerRevision;
+                    }
+                  }
                 } catch (error) {
                   throw new MentionablePolicyStoreError('task policy lookup failed', {
                     cause: error,
@@ -495,6 +511,7 @@ export function createMentionableOAuthProfile(
 
       return {
         ok: true,
+        ...(operationReadRevision !== undefined ? { operationReadRevision } : {}),
         principalId: context.principal,
         actorId: context.actor,
         authorizationKey: authorizationKey!,

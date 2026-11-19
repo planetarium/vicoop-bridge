@@ -96,6 +96,7 @@ type RequestRow = {
   task_id: string;
   artifact_id: string;
   requester: string;
+  requester_revoked: boolean;
   actor: string;
   profile: string;
   grant_key: string;
@@ -152,6 +153,7 @@ async function source(db: SqlExecutor, agent: string, task: string) {
 }
 function isRequester(row: RequestRow, user: TokenExchangeAccessToken) {
   return (
+    !row.requester_revoked &&
     user.principalId === row.requester &&
     user.actorId === row.actor &&
     user.profileId === row.profile &&
@@ -183,7 +185,12 @@ export function mountOperations(
       limit,
     );
   }
-  async function user(db: SqlExecutor, c: Context, agent: string) {
+  async function user(
+    db: SqlExecutor,
+    c: Context,
+    agent: string,
+    allowRetainedOperationRead = false,
+  ) {
     // Take policy then credential locks in the same order as revocation.
     if (!token(c)) error(401, 'Invalid credential');
     await db`SELECT id FROM agents WHERE id=${agent} FOR SHARE`;
@@ -192,9 +199,9 @@ export function mountOperations(
     await db`SELECT id FROM infra.oauth_token_exchange_access_tokens WHERE token_hash=${hash(
       token(c),
     )} FOR UPDATE`;
-    const identity = await verifyTokenExchangeAccessToken(db, token(c), agent).catch(() =>
-      error(401, 'Invalid credential'),
-    );
+    const identity = await verifyTokenExchangeAccessToken(db, token(c), agent, {
+      allowRetainedOperationRead,
+    }).catch(() => error(401, 'Invalid credential'));
     if (!identity.scopes.includes('a2a:task.read')) missing();
     return identity;
   }
@@ -306,13 +313,21 @@ export function mountOperations(
       identity: TokenExchangeAccessToken,
       policy: Definition,
     ) => Promise<T>,
+    allowRetainedOperationRead = false,
   ) {
     const agent = c.req.param('agent')!;
     return db.begin(async (tx) => {
-      const identity = await user(tx, c, agent);
+      const identity = await user(tx, c, agent, allowRetainedOperationRead);
       const row = await record(tx, agent, c.req.param('id')!);
       const policy = await policyFor(tx, agent, row.operation);
       if (identity.taskId && identity.taskId !== row.task_id) missing();
+      if (
+        identity.operationReadRevision !== undefined &&
+        (identity.operationReadRevision !== row.owner_revision ||
+          identity.taskId !== row.task_id ||
+          !isRequester(row, identity))
+      )
+        missing();
       if (!isRequester(row, identity) && !operator(policy, identity)) missing();
       if (
         policy.ownerPrincipal !== row.agent_owner ||
@@ -322,7 +337,7 @@ export function mountOperations(
       return action(tx, row, identity, policy);
     });
   }
-  app.get(path + '/:id', async (c) => c.json(await access(c, async (_tx, row) => view(row))));
+  app.get(path + '/:id', async (c) => c.json(await access(c, async (_tx, row) => view(row), true)));
   app.get(path + '/:id/audit', async (c) =>
     c.json(
       await access(c, async (tx, row) => {
@@ -414,7 +429,10 @@ export function mountOperations(
           AND owner_revision=${p.ownerRevision} AND executor_id=${p.executorId}
           AND state IN ('executing','unknown') AND (${after}::uuid IS NULL OR id > ${after}::uuid)
           ORDER BY id LIMIT 101`;
-        return {operations:rows.slice(0,100).map(view),next:rows.length>100 ? rows[99].id : null};
+        return {
+          operations: rows.slice(0, 100).map(view),
+          next: rows.length > 100 ? rows[99].id : null,
+        };
       }),
     ),
   );
