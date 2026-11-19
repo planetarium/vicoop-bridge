@@ -3,7 +3,9 @@ import {
   FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY,
   OPERATION_APPROVAL_EXTENSION_URI,
   supportsExecutionScopeV1,
+  parseFederatedPrincipal,
 } from '@vicoop-bridge/protocol';
+import { parseFederatedDelegation } from './auth/federated-delegation.js';
 import type { OperationDefinition } from './operations.js';
 import type { ClientConnection } from './registry.js';
 
@@ -26,10 +28,16 @@ export function operationCallerScheme(caller: {
   return undefined;
 }
 
+export function operationOperatorMethod(operator: { actorId?: string; method?: string }): string | undefined {
+  if (operator.actorId) return operator.method ?? 'urn:mentionable:auth:slack-workspace-member:v0.1';
+  return undefined;
+}
+
 export function matchingOperationNames(
   conn: ClientConnection,
   policies: readonly OperationDefinition[],
   scheme: OperationCallerScheme,
+  grantKey?: string,
 ): string[] {
   const capabilities = conn.protocolCapabilities;
   if (!capabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) || !supportsExecutionScopeV1(capabilities) ||
@@ -37,9 +45,15 @@ export function matchingOperationNames(
   const declared = conn.agentCard.capabilities?.extensions
     ?.find(e => e.uri === OPERATION_APPROVAL_EXTENSION_URI)?.params?.operations;
   if (!Array.isArray(declared)) return [];
+  // Cards describe all admitted methods. A negotiated turn uses just its verified grant.
+  const methods = scheme === 'federated' ? new Set((grantKey ? [grantKey] : conn.allowedCallers)
+    .filter((grant): grant is string => typeof grant === 'string')
+    .map(grant => parseFederatedPrincipal(grant)?.method ?? parseFederatedDelegation(grant)?.method)
+    .filter((method): method is string => method !== undefined)) : undefined;
   return policies.filter(p => p.agentId === conn.agentId && p.ownerPrincipal === conn.ownerPrincipal &&
     p.ownerRevision === conn.ownerRevision && declared.includes(p.operation) &&
-    p.operators.some(operator => operationCallerScheme(operator) === scheme)).map(p => p.operation);
+    p.operators.some(operator => operationCallerScheme(operator) === scheme &&
+      (!methods || methods.has(operationOperatorMethod(operator)!)))).map(p => p.operation);
 }
 
 export function operationGrantIsActive(grantKey: string, allowedCallers: readonly string[]): boolean {

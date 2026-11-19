@@ -1289,7 +1289,8 @@ test('delegation owner API generations revoke tokens/tasks and never reopen publ
     const policy = await list.json() as { is_public: boolean; federated_callers: unknown[] };
     assert.equal(policy.is_public, false);
     assert.deepEqual(policy.federated_callers, []);
-    // Even direct policy replacement retains the sticky restricted state.
+    // NULL entries in a replacement array cannot clear the sticky restriction.
+    await sql`UPDATE agents SET allowed_callers = ARRAY[NULL]::text[] WHERE id = ${setup.agentId}`;
     await sql`UPDATE agents SET allowed_callers = '{}' WHERE id = ${setup.agentId}`;
     const [stored] = await sql`SELECT allowed_callers FROM agents WHERE id = ${setup.agentId}`;
     assert.deepEqual(stored.allowed_callers, ['federation-restricted:v1']);

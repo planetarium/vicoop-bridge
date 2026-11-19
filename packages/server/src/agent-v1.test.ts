@@ -116,7 +116,7 @@ test('operation callers distinguish verified Google subjects, policy selectors a
 
 test('operation approval discovery requires overlapping runtime and current ownership policy on both card versions', async () => {
   for (const scenario of ['enabled', 'google', 'siwe', 'any-direct', 'api-key-only', 'wrong-scheme',
-    'disabled', 'other-operation', 'old-revision', 'ordinary-agent', 'no-federation', 'incomplete-scope']) {
+    'disabled', 'other-operation', 'old-revision', 'ordinary-agent', 'no-federation', 'incomplete-scope', 'wrong-method']) {
     const registry = new Registry();
     const caller = formatFederatedPrincipal({ issuer: 'did:web:connector.example', subject: 'slack:T/U',
       method: 'urn:mentionable:auth:slack-workspace-member:v0.1' })!;
@@ -139,7 +139,8 @@ test('operation approval discovery requires overlapping runtime and current owne
       executorTokenSha256: '0'.repeat(64), ttlSeconds: 3600, fields: {},
       operators: ['google', 'any-direct', 'wrong-scheme', 'api-key-only'].includes(scenario) ? [{ principalId: 'google:abc-XYZ_123' }]
         : scenario === 'siwe' ? [{ principalId: wallet }]
-        : [{ principalId: 'slack:T/U2', actorId: 'did:web:connector.example' }],
+        : [{ principalId: 'slack:T/U2', actorId: 'did:web:connector.example',
+          ...(scenario === 'wrong-method' ? { method: 'urn:example:employee' } : {}) }],
     };
     const app = createHttpApp({ registry, db: fakeSql(), publicUrl: 'https://bridge.example',
       operationPolicies: scenario === 'disabled' ? [] : [policy] });
@@ -309,10 +310,11 @@ test('CORS preflight allows the A2A-Version request header', async () => {
   assert.match(response.headers.get('Access-Control-Allow-Headers') ?? '', /A2A-Version/i);
 });
 
-for (const { callerRuntime, federated, apiKeyOnly = false, direct } of [
+for (const { callerRuntime, federated, apiKeyOnly = false, direct, otherMethod = false } of [
   { callerRuntime: false, federated: true },
   { callerRuntime: false, federated: false },
   { callerRuntime: true, federated: true },
+  { callerRuntime: true, federated: true, otherMethod: true },
   { callerRuntime: true, federated: false },
   { callerRuntime: false, federated: false, apiKeyOnly: true },
   { callerRuntime: true, federated: false, apiKeyOnly: true },
@@ -320,17 +322,18 @@ for (const { callerRuntime, federated, apiKeyOnly = false, direct } of [
   { callerRuntime: true, federated: false, direct: 'siwe' },
   { callerRuntime: true, federated: false, direct: 'google-with-slack-operator' },
 ]) {
-test(`${direct ?? (federated ? 'federated' : apiKeyOnly ? 'API-key-only' : 'mixed-policy API-key')} message tokens bind tasks on all three A2A ingress paths (${callerRuntime ? 'caller runtime' : 'host runtime'})`, async () => {
+test(`${direct ?? (otherMethod ? 'federated with a mismatched proof method' : federated ? 'federated' : apiKeyOnly ? 'API-key-only' : 'mixed-policy API-key')} message tokens bind tasks on all three A2A ingress paths (${callerRuntime ? 'caller runtime' : 'host runtime'})`, async () => {
   const profileId = 'https://mentionable.dev/ns/oauth-federation/v0.1';
   const principalId = federated ? 'slack:T123/U456' : direct === 'siwe' ? 'eth:0x0000000000000000000000000000000000000003'
     : direct ? 'google:abc-XYZ_123' : 'apikey:direct-caller-554';
   const directGrant = direct?.startsWith('google') ? 'google:sub:abc-XYZ_123' : principalId;
-  const canPropose = callerRuntime && (federated || direct === 'google' || direct === 'siwe');
+  const canPropose = callerRuntime && !otherMethod && (federated || direct === 'google' || direct === 'siwe');
   const actorId = 'did:web:connector.example';
-  const authorizationKey = formatFederatedPrincipal({
-    issuer: actorId, subject: 'slack:T123/U456',
-    method: 'urn:mentionable:auth:slack-workspace-member:v0.1',
-  })!;
+  const slackGrant = formatFederatedPrincipal({ issuer: actorId, subject: 'slack:T123/U456',
+    method: 'urn:mentionable:auth:slack-workspace-member:v0.1' })!;
+  const authorizationKey = otherMethod ? formatFederatedPrincipal({
+    issuer: actorId, subject: 'slack:T123/U456', method: 'urn:example:employee',
+  })! : slackGrant;
   const tasks = new Map<string, Record<string, unknown>>();
   const dispatchIds = new Map<string, string>();
   const submittedBindings: unknown[][] = [];
@@ -414,7 +417,7 @@ test(`${direct ?? (federated ? 'federated' : apiKeyOnly ? 'API-key-only' : 'mixe
     ownerPrincipal: 'eth:0x0000000000000000000000000000000000000001',
     ownerRevision: 0,
     agentCard,
-    allowedCallers: apiKeyOnly ? [principalId] : [authorizationKey, ...(!federated ? [directGrant] : [])],
+    allowedCallers: apiKeyOnly ? [principalId] : [authorizationKey, ...(otherMethod ? [slackGrant] : []), ...(!federated ? [directGrant] : [])],
     protocolCapabilities: callerRuntime ? callerRuntimeCapabilities : [CALLER_CONTEXT_V2_CAPABILITY],
     ws,
     connectedAt: Date.now(),

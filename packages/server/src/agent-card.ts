@@ -80,8 +80,8 @@ export function buildAgentA2XServer(
 
   // Policy belongs to the server. Re-evaluate at dispatch in case a slow turn
   // waited on billing or storage across an ownership change or reconnect.
-  function operationNamesFor(current: ClientConnection, scheme: OperationCallerScheme): string[] {
-    return matchingOperationNames(current, opts.operationPolicies ?? [], scheme);
+  function operationNamesFor(current: ClientConnection, scheme: OperationCallerScheme, grantKey?: string): string[] {
+    return matchingOperationNames(current, opts.operationPolicies ?? [], scheme, grantKey);
   }
 
   const executor = new WSForwardingExecutor(

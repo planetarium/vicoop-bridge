@@ -239,7 +239,7 @@ export class WSForwardingExecutor extends AgentExecutor {
     // Absent in tests and on deployments without a DB-backed payment path;
     // the gate is then never installed and every agent is free.
     private readonly x402: X402ExecutorOptions | undefined = undefined,
-    private readonly operationNamesFor?: (conn: ClientConnection, scheme: OperationCallerScheme) => string[],
+    private readonly operationNamesFor?: (conn: ClientConnection, scheme: OperationCallerScheme, grantKey?: string) => string[],
   ) {
     super({
       runner: NOOP_RUNNER,
@@ -580,7 +580,7 @@ export class WSForwardingExecutor extends AgentExecutor {
       const grantKey = scheme === 'federated' ? authorizationKey : directOperationGrant;
       const operationNames = connection?.ownerRevision !== undefined && scheme && grantKey &&
         operationGrantIsActive(grantKey, connection.allowedCallers) && requestedExtensions?.includes(OPERATION_APPROVAL_EXTENSION_URI)
-        ? this.operationNamesFor?.(connection, scheme) : undefined;
+        ? this.operationNamesFor?.(connection, scheme, grantKey) : undefined;
       if (operationNames?.length && connection?.ownerRevision !== undefined && grantKey) {
         binding.operationGrant = { names: operationNames, ownerRevision: connection.ownerRevision, grantKey };
       }

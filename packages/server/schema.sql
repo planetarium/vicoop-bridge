@@ -1210,9 +1210,9 @@ COMMENT ON COLUMN agents.owner_revision IS E'@omit create,update';
 CREATE OR REPLACE FUNCTION preserve_federation_restriction() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
-  IF ('federation-restricted:v1' = ANY(OLD.allowed_callers)
+  IF (array_position(OLD.allowed_callers, 'federation-restricted:v1') IS NOT NULL
       OR EXISTS (SELECT 1 FROM unnest(NEW.allowed_callers) c WHERE c LIKE 'federated-delegation:v1:%'))
-     AND NOT ('federation-restricted:v1' = ANY(NEW.allowed_callers)) THEN
+     AND array_position(NEW.allowed_callers, 'federation-restricted:v1') IS NULL THEN
     NEW.allowed_callers := array_append(NEW.allowed_callers, 'federation-restricted:v1');
   END IF;
   RETURN NEW;
@@ -1259,9 +1259,6 @@ CREATE TABLE IF NOT EXISTS infra.operation_requests (
 );
 -- A direct caller acts for itself and has no delegated connector.
 ALTER TABLE infra.operation_requests ALTER COLUMN actor DROP NOT NULL;
--- Existing approvals predate the comparison of requester and reviewer methods.
--- Startup reconciliation verifies their grants before a worker may claim them.
-ALTER TABLE infra.operation_requests ADD COLUMN IF NOT EXISTS decision_scheme_verified boolean NOT NULL DEFAULT false;
 -- Preserve the original requester's revocation after its A2A task is pruned.
 ALTER TABLE infra.operation_requests ADD COLUMN IF NOT EXISTS requester_revoked boolean NOT NULL DEFAULT false;
 ALTER TABLE infra.oauth_token_exchange_access_tokens ADD COLUMN IF NOT EXISTS operation_read_revision bigint;
@@ -1273,7 +1270,7 @@ CREATE INDEX IF NOT EXISTS operation_requests_queue ON infra.operation_requests
 CREATE OR REPLACE FUNCTION infra.operation_grant_active(grant_key text, allowed_callers text[])
 RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS $$
   SELECT CASE WHEN grant_key = 'public' THEN cardinality(allowed_callers) = 0
-    ELSE grant_key = ANY(allowed_callers) END
+    ELSE COALESCE(grant_key = ANY(allowed_callers), false) END
 $$;
 REVOKE ALL ON FUNCTION infra.operation_grant_active(text,text[]) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION infra.operation_grant_active(text,text[]) TO app_postgraphile;

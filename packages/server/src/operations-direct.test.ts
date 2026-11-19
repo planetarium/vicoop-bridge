@@ -52,7 +52,7 @@ test(
       slack = 'slack:T/U',
       slackGrant = formatFederatedPrincipal({
         issuer: actor,
-        method: 'urn:mentionable:auth:slack-member:v0.1',
+        method: 'urn:mentionable:auth:slack-workspace-member:v0.1',
         subject: slack,
       })!;
     const domain = 'bridge.test';
@@ -220,7 +220,10 @@ test(
 
     // Removing a direct grant invalidates decisions and source tasks even after restoring access.
     const pending = await proposal(googleOperator, grants[1]);
-    await sql`UPDATE agents SET allowed_callers=${grants.filter((g) => g !== grants[1])} WHERE id=${agentId}`;
+    // Legacy text arrays can contain NULL elements. An absent grant must still
+    // be revoked permanently even when SQL ANY would return NULL.
+    await sql`UPDATE agents SET allowed_callers=array_append(${grants.filter((g) => g !== grants[1])}::text[], NULL::text)
+      WHERE id=${agentId}`;
     assert.ok([401, 404].includes((await get(googleRequest.id, reviewer)).status));
     await sql`UPDATE agents SET allowed_callers=${grants} WHERE id=${agentId}`;
     assert.equal((await post(path, reviewer, pending)).status, 404);

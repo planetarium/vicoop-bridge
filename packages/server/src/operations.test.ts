@@ -46,6 +46,7 @@ import {
   mountOperations,
   readOperationRegistry,
   reconcileOperationPolicies,
+  type OperationDefinition,
 } from './operations.js';
 
 test(
@@ -58,8 +59,8 @@ test(
       owner = 'eth:' + randomUUID(),
       actor = 'did:web:test-connector.example';
     const secondActor = 'did:web:second-connector.example';
-    const slackMethod = 'urn:mentionable:auth:slack-member:v0.1';
-    const otherMethod = 'urn:example:employee';
+    const slackMethod = 'urn:mentionable:auth:slack-workspace-member:v0.1';
+    const otherMethod = 'https://auth.example/methods/employee';
     const otherGrant = formatFederatedDelegation({ id: randomUUID(), issuer: actor, method: otherMethod })!;
     const secondGrant = formatFederatedDelegation({ id: randomUUID(), issuer: secondActor, method: slackMethod })!;
     const operator = 'slack:T/O',
@@ -71,7 +72,7 @@ test(
         subject: requester,
       })!;
     const executorToken = randomUUID();
-    const policy = {
+    const policy: OperationDefinition = {
       agentId,
       ownerPrincipal: owner,
       ownerRevision: 0,
@@ -88,6 +89,9 @@ test(
         repo: { type: 'string', allowedValues: ['org/repo'] },
       },
     };
+    assert.throws(() => readOperationRegistry(JSON.stringify([{
+      ...policy, operators: [{ principalId: 'google:alice', method: slackMethod }],
+    }])), /Only federated operators/);
     const successorToken = randomUUID();
     const successor = {
       ...policy,
@@ -203,6 +207,29 @@ test(
     await store.updateTask(taskId, {
       status: { state: TaskState.INPUT_REQUIRED },
     });
+    // One connector can issue the same subject using two methods. A request
+    // under the second method must use an operator enrolled under that method.
+    const alternateCaller = await issue(requester, otherGrant);
+    const alternateTask = await store.createTask({
+      metadata: { ...metadata, _authorizationKey: otherGrant },
+    });
+    await store.updateTask(alternateTask.id, { artifacts, status: { state: TaskState.COMPLETED } });
+    const alternatePayload = { ...payload(0), taskId: alternateTask.id };
+    assert.equal((await post(path, alternateCaller, alternatePayload)).status, 404);
+    const alternateApprover = await issue('employee:ops', otherGrant);
+    const mixed = new Hono();
+    mountOperations(mixed, runtime, [{
+      ...policy, operators: [...policy.operators, { actorId: actor, principalId: 'employee:ops', method: otherMethod }],
+    }]);
+    const mixedPost = (uri: string, bearer: string, input: unknown) => mixed.request(uri, {
+      method: 'POST', headers: { Authorization: 'Bearer ' + bearer, 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+    const mixedRequest = requestView.parse(await (await mixedPost(path, alternateCaller, alternatePayload)).json());
+    const mixedDecision = path + '/' + mixedRequest.id + '/decision';
+    const decision = { decision: 'deny', digest: mixedRequest.digest };
+    assert.equal((await mixedPost(mixedDecision, alternateCaller, decision)).status, 404);
+    assert.equal((await mixedPost(mixedDecision, alternateApprover, decision)).status, 200);
     const directOnly = new Hono();
     mountOperations(directOnly, runtime, readOperationRegistry(JSON.stringify([{
       ...policy, operators: [{ principalId: 'google:314159' }],
@@ -241,22 +268,29 @@ test(
       404,
     );
     const pending = await create(8);
-    const oldSameMethod = await create(10);
-    const oldOtherMethod = await create(11);
-    for (const [item, token] of [[oldSameMethod, caller], [oldOtherMethod, approver]] as const) {
-      assert.equal((await post(path + '/' + item.id + '/decision', token, {
+    const selfApproved = await create(10);
+    const legacyApproved = await create(11);
+    for (const item of [selfApproved, legacyApproved]) {
+      assert.equal((await post(path + '/' + item.id + '/decision', caller, {
         decision: 'approve', digest: item.digest,
       })).status, 200);
     }
-    await sql`UPDATE infra.operation_requests SET decision_scheme_verified=false
-      WHERE id=ANY(${[oldSameMethod.id, oldOtherMethod.id]}::uuid[])`;
-    await sql`UPDATE infra.operation_requests SET decided_by=${otherGrant} WHERE id=${oldOtherMethod.id}`;
-    assert.equal(claim.parse(await (await post(worker + '/claim', executorToken)).json()).operation, null);
-    await reconcileOperationPolicies(runtime, readOperationRegistry(JSON.stringify([policy])));
-    assert.equal(claim.parse(await (await post(worker + '/claim', executorToken)).json()).operation?.id, oldSameMethod.id);
-    assert.equal((await post(worker + '/' + oldSameMethod.id + '/result', executorToken,
+    // Recreate the old, method-unbound registry digest. Such approvals may
+    // have been marked verified even though their operator did not specify a method.
+    const { executorTokenSha256: _credential, ...oldDefinition } = policy;
+    const oldDigest = createHash('sha256').update(JSON.stringify(oldDefinition, (_key, value) =>
+      value && typeof value === 'object' && !Array.isArray(value)
+        ? Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]])) : value,
+    )).digest('hex');
+    await sql`UPDATE infra.operation_requests SET policy_digest=${oldDigest} WHERE id=${legacyApproved.id}`;
+    // An explicitly spelled Slack default and an omitted method pin the same policy.
+    await reconcileOperationPolicies(runtime, [{
+      ...policy, operators: policy.operators.map(operator => ({ ...operator, method: slackMethod })),
+    }]);
+    assert.equal(requestView.parse(await (await get(path + '/' + legacyApproved.id, caller)).json()).state, 'cancelled');
+    assert.equal(claim.parse(await (await post(worker + '/claim', executorToken)).json()).operation?.id, selfApproved.id);
+    assert.equal((await post(worker + '/' + selfApproved.id + '/result', executorToken,
       { state: 'succeeded', result: 'Done' })).status, 200);
-    assert.equal(requestView.parse(await (await get(path + '/' + oldOtherMethod.id, caller)).json()).state, 'cancelled');
     const approved = await create(9);
     assert.equal(
       (

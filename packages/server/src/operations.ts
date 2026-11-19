@@ -1,6 +1,7 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { Context, Hono } from 'hono';
+import { isOAuthFederationMethodUri } from '@mentionable/connector-kit';
 import { MAX_OPERATION_FIELDS, MAX_OPERATION_REGISTRATION_BYTES, OPERATION_APPROVAL_EXTENSION_URI, OPERATION_PROPOSAL_TYPE } from '@vicoop-bridge/protocol';
 import { HTTPException } from 'hono/http-exception';
 import { bodyLimit } from 'hono/body-limit';
@@ -11,7 +12,7 @@ import { parseFederatedDelegation } from './auth/federated-delegation.js';
 import { matchPrincipal, parseFederatedPrincipal, type VerifiedCaller } from './auth/principal.js';
 import { verifySiweBearerToken } from './auth/siwe-bearer.js';
 import { TOKEN_EXCHANGE_ACCESS_TOKEN_PREFIX } from './oauth/token-exchange/types.js';
-import { operationCallerScheme } from './operation-callers.js';
+import { operationCallerScheme, operationOperatorMethod } from './operation-callers.js';
 import {
   verifyTokenExchangeAccessToken,
   type TokenExchangeAccessToken,
@@ -36,9 +37,12 @@ const definition = z
           .object({
             principalId: z.string().min(1),
             actorId: z.string().min(1).optional(),
+            method: z.string().max(256).refine(isOAuthFederationMethodUri).optional(),
           })
           .strict().refine(operator => operationCallerScheme(operator) !== undefined,
-            { message: 'Direct operators require a canonical Google or SIWE principal' }),
+            { message: 'Direct operators require a canonical Google or SIWE principal' })
+          .refine(operator => operator.method === undefined || operator.actorId !== undefined,
+            { message: 'Only federated operators have an authentication method' }),
       )
       .min(1),
     fields: z.record(
@@ -95,7 +99,12 @@ const outcome = z
 function policyDigest(policy: OperationDefinition) {
   // Credential rotation preserves the identity of this named executor.
   const { executorTokenSha256: _credential, ...definition } = policy;
-  return hash(canonical(definition));
+  // Materialize the method even for policies passed directly to mountOperations.
+  // A previously method-unbound federation policy must get a new digest.
+  const operators = policy.operators.map(operator => ({
+    ...operator, method: operationOperatorMethod(operator),
+  }));
+  return hash(canonical({ ...definition, operators }));
 }
 // Methods belong to the grant, not the OAuth profile. A connector can attest
 // several distinct types of identity under the same profile and actor DID.
@@ -113,29 +122,6 @@ export async function reconcileOperationPolicies(db: Sql, policies: OperationDef
     history=history||jsonb_build_object('event', 'policy_changed', 'at',clock_timestamp())
     WHERE state IN ('pending','approved') AND expires_at > clock_timestamp()
     AND NOT (policy_digest = ANY(${hashes}::text[]))`;
-  // Older deployments did not compare methods. Upgrade only live, unclaimed
-  // decisions and bound each transaction; workers skip them until verified.
-  for (;;) {
-    const checked = await db.begin(async tx => {
-      const rows = await tx<Pick<RequestRow, 'id' | 'requester' | 'actor' | 'grant_key' |
-        'decided_principal' | 'decided_actor' | 'decided_by'>[]>`
-        SELECT id, requester, actor, grant_key, decided_principal, decided_actor, decided_by
-        FROM infra.operation_requests WHERE state='approved' AND NOT decision_scheme_verified
-          AND expires_at > clock_timestamp() ORDER BY id LIMIT 128 FOR UPDATE`;
-      if (!rows.length) return 0;
-      const valid = rows.filter(row => {
-        if (!row.actor || !row.decided_actor || !row.decided_by || !row.decided_principal) return false;
-        const method = federatedMethod(row.grant_key, row.requester, row.actor);
-        return method !== undefined && method === federatedMethod(row.decided_by, row.decided_principal, row.decided_actor);
-      }).map(row => row.id);
-      await tx`UPDATE infra.operation_requests SET decision_scheme_verified=true WHERE id=ANY(${valid}::uuid[])`;
-      await tx`UPDATE infra.operation_requests SET state='cancelled', result='Incompatible approval identity',
-        history=history||jsonb_build_object('event','identity_scheme_changed','at',clock_timestamp())
-        WHERE id=ANY(${rows.map(row => row.id)}::uuid[]) AND NOT decision_scheme_verified`;
-      return rows.length;
-    });
-    if (!checked) break;
-  }
 }
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const canonical = (value: unknown): string =>
@@ -261,7 +247,8 @@ function eligibleOperator(row: RequestRow, policy: OperationDefinition, user: Op
   if (row.actor !== null && user.federatedMethod !== federatedMethod(row.grant_key, row.requester, row.actor))
     return false;
   return policy.operators.some(
-    (o) => o.principalId === user.principalId && (o.actorId ?? null) === user.actorId,
+    (o) => o.principalId === user.principalId && (o.actorId ?? null) === user.actorId &&
+      operationOperatorMethod(o) === user.federatedMethod,
   );
 }
 
@@ -406,7 +393,9 @@ export function mountOperations(
         if (prior && prior.digest === digest) return view(prior);
         if (prior) error(409, 'Proposal changed');
         const scheme = identity.actorId === null ? identity.profileId : 'federated';
-        if (!policy.operators.some(operator => operationCallerScheme(operator) === scheme)) missing();
+        if (!policy.operators.some(operator =>
+          operationCallerScheme(operator) === scheme && operationOperatorMethod(operator) === identity.federatedMethod,
+        )) missing();
         if (
           !origin || origin.owner_principal !== identity.principalId ||
           origin.owner_actor !== identity.actorId ||
@@ -534,7 +523,7 @@ export function mountOperations(
         if (row.state !== 'pending') error(409, 'Decision already taken');
         const updated =
           await tx`UPDATE infra.operation_requests SET state=${next}, decision=${input.decision}, decided_by=${identity.grants[0]},
-        decided_principal=${identity.principalId}, decided_actor=${identity.actorId}, decision_scheme_verified=true,
+        decided_principal=${identity.principalId}, decided_actor=${identity.actorId},
         history=history||jsonb_build_object('event',${next}::text,'by',${identity.principalId}::text,
           'actor',${identity.actorId}::text,'grant',${identity.grants[0]}::text,'at',clock_timestamp())
         WHERE id=${row.id} AND expires_at > clock_timestamp() RETURNING id`;
@@ -581,7 +570,6 @@ export function mountOperations(
         const [row] = await tx<RequestRow[]>`WITH candidate AS (
       SELECT r.id FROM infra.operation_requests r JOIN agents a ON a.id=r.agent_id
       WHERE r.agent_id=${p.agentId} AND r.operation=${p.operation} AND r.state='approved'
-      AND r.decision_scheme_verified
       AND infra.operation_grant_active(r.grant_key, a.allowed_callers)
       AND infra.operation_grant_active(r.decided_by, a.allowed_callers)
       AND r.policy_digest=${policyDigest(p)} AND r.expires_at > clock_timestamp()
