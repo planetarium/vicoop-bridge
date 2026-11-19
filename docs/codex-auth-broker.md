@@ -64,14 +64,13 @@ Other routes, query parameters, background requests and unsupported model
 names are rejected. Credentials, account headers and upstream error bodies
 are never accepted from or echoed back to the workload.
 
-## Self-hosted Responses API
+## External Responses API providers
 
 Set these three variables on the host bridge service, then restart the service.
-Use an HTTPS base URL that precedes `/responses`. For an Open WebUI installation
-serving `/openai/responses`, the base path is `/openai`.
+Use the provider’s HTTPS base URL. The broker appends `/responses` to that URL.
 
 ```sh
-export VICOOP_CODEX_RESPONSES_BASE_URL=https://models.example.org/openai
+export VICOOP_CODEX_RESPONSES_BASE_URL=https://models.example.org/v1
 export VICOOP_CODEX_RESPONSES_MODEL=example-model
 # Supply VICOOP_CODEX_RESPONSES_API_KEY from the host secret manager.
 ```
@@ -80,8 +79,8 @@ When an access gateway requires additional request headers, configure a JSON
 object mapping each header name to a host environment variable name. For example:
 
 ```sh
-export VICOOP_CODEX_RESPONSES_EXTRA_HEADERS='{"CF-Access-Client-Id":"DGX_CF_CLIENT_ID","CF-Access-Client-Secret":"DGX_CF_CLIENT_SECRET"}'
-# Supply DGX_CF_CLIENT_ID and DGX_CF_CLIENT_SECRET from the host secret manager.
+export VICOOP_CODEX_RESPONSES_EXTRA_HEADERS='{"X-Gateway-Token":"MODEL_GATEWAY_TOKEN"}'
+# Supply MODEL_GATEWAY_TOKEN from the host secret manager.
 ```
 
 The host attaches these values to requests to the pinned Responses endpoint,
@@ -93,7 +92,7 @@ value or changing its mapping.
 The broker accepts the configured model ID and supplies the key as a Bearer
 token to the configured origin. The container uses an execution grant. Provider
 selection is exclusive with direct OpenAI and Azure environment settings.
-The self-hosted profile disables Codex sub-agents and hosted web search.
+This provider profile disables Codex sub-agents and hosted web search.
 With caller file delivery enabled, A2A tasks expose `send_file` as a top-level
 function. The host validates the path and file limits and emits the attachment
 on the current task. An OpenAI-compatible caller request uses its own tools.

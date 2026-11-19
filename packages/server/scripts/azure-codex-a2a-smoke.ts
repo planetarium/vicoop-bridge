@@ -147,7 +147,7 @@ try {
   assert.ok(resumedText.includes(resumeNonce), 'resumed task did not recall the random nonce');
   assert.ok(!JSON.stringify(resumed).includes('conversationReset'), 'ordinary resume unexpectedly reset the conversation');
   assert.ok(!credentialInLogs, 'provider credential exposed in captured logs');
-  report = {success:true,transport:'HTTP A2A v0.3 + WebSocket',provider:process.env.VICOOP_CODEX_RESPONSES_BASE_URL ? 'self-hosted Responses' : 'Azure OpenAI',
+  report = {success:true,transport:'HTTP A2A v0.3 + WebSocket',provider:process.env.VICOOP_CODEX_RESPONSES_BASE_URL ? 'external Responses' : 'Azure OpenAI',
     attachmentBytes:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex'),initialFile:true,resumedFile:true,conversationResume:true};
 } finally {
   const failures: string[] = [];

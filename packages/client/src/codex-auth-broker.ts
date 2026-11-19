@@ -97,7 +97,6 @@ function readResponsesHeaders(env: NodeJS.ProcessEnv) {
   return { headers: Object.freeze(headers), sources };
 }
 
-// Self-hosted Responses servers commonly implement function tools only.
 export function codexProviderAppServerArgs(credential?: CodexCredential): string[] | undefined {
   const model = credential?.responsesProvider?.model ?? credential?.azureModel;
   if (!model) return undefined;

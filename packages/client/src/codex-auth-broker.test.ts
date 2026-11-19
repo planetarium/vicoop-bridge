@@ -304,7 +304,7 @@ test('Responses header mappings reject invalid or reserved fields and pin secret
   assert.throws(() => createCodexCredentialReader({ OPENAI_API_KEY: 'direct', VICOOP_CODEX_RESPONSES_EXTRA_HEADERS: '{}' }));
 });
 
-test('self-hosted Responses adds host header values only to the pinned routes', async t => {
+test('external Responses adds host header values only to the pinned routes', async t => {
   const seen: Array<{ url: string; headers: http.IncomingHttpHeaders }> = [];
   const fixture = createServer((req, res) => {
     seen.push({ url: req.url!, headers: req.headers });
