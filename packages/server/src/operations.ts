@@ -42,8 +42,18 @@ type Definition = z.infer<typeof definition>;
 export function readOperationRegistry(raw: string | undefined): Definition[] {
   if (!raw) return [];
   const entries = z.array(definition).max(256).parse(JSON.parse(raw));
-  if (new Set(entries.map((e) => JSON.stringify([e.agentId, e.operation]))).size !== entries.length)
-    throw new Error('Duplicate registered operation for agent');
+  const epochs = new Set<string>();
+  const credentials = new Set<string>();
+  for (const entry of entries) {
+    const key = [entry.agentId, entry.operation];
+    const epoch = JSON.stringify([...key, entry.ownerRevision]);
+    const credential = JSON.stringify([...key, entry.executorTokenSha256]);
+    if (epochs.has(epoch)) throw new Error('Duplicate registered operation for ownership revision');
+    if (credentials.has(credential))
+      throw new Error('Ownership revisions require distinct executor credentials');
+    epochs.add(epoch);
+    credentials.add(credential);
+  }
   return entries;
 }
 
@@ -116,6 +126,7 @@ type RequestRow = {
   result: string | null;
 };
 type Source = {
+  state: string;
   owner_principal: string;
   owner_actor: string;
   authorization_profile: string;
@@ -144,7 +155,9 @@ async function record(db: SqlExecutor, agent: string, id: string) {
   return row ?? missing();
 }
 async function source(db: SqlExecutor, agent: string, task: string) {
-  const [row] = await db<Source[]>`SELECT t.owner_principal, t.owner_actor, t.authorization_profile,
+  const [row] = await db<
+    Source[]
+  >`SELECT t.state, t.owner_principal, t.owner_actor, t.authorization_profile,
     t.authorization_key, t.authorization_revoked_at, t.task_json FROM infra.a2a_tasks t
     JOIN agents a ON a.id=t.owner_agent AND t.authorization_key=ANY(a.allowed_callers)
     WHERE t.owner_agent=${agent} AND t.task_id=${task} AND t.operation_owner_revision=a.owner_revision AND t.created_at>=a.created_at FOR SHARE OF t,a`;
@@ -206,12 +219,18 @@ export function mountOperations(
     return identity;
   }
   async function policyFor(tx: SqlExecutor, agent: string, operation: string) {
-    const policy = policies.find((p) => p.agentId === agent && p.operation === operation);
-    if (!policy) missing();
-    const [owner] =
-      await tx`SELECT 1 FROM agents WHERE id=${agent} AND owner_principal=${policy.ownerPrincipal} AND owner_revision=${policy.ownerRevision} FOR SHARE`;
+    const [owner] = await tx<{ owner_principal: string; owner_revision: string }[]>`
+      SELECT owner_principal, owner_revision::text FROM agents WHERE id=${agent} FOR SHARE`;
     if (!owner) missing();
-    return policy;
+    return (
+      policies.find(
+        (p) =>
+          p.agentId === agent &&
+          p.operation === operation &&
+          p.ownerPrincipal === owner.owner_principal &&
+          p.ownerRevision === Number(owner.owner_revision),
+      ) ?? missing()
+    );
   }
   function samePolicy(row: RequestRow, policy: Definition) {
     return (
@@ -264,6 +283,10 @@ export function mountOperations(
           origin.authorization_key !== identity.allowedCaller
         )
           missing();
+        if (['failed', 'canceled', 'rejected'].includes(origin.state))
+          error(400, 'Source task did not complete');
+        if (!['completed', 'input-required'].includes(origin.state))
+          error(409, 'Proposal task is not ready');
         const artifact =
           origin.task_json.artifacts?.filter((a) => a.artifactId === input.proposalKey) ?? [];
         if (!artifact.length) error(409, 'Proposal artifact unavailable');
@@ -386,23 +409,25 @@ export function mountOperations(
     ),
   );
 
-  async function worker(c: Context, tx: SqlExecutor) {
-    const policy = await policyFor(tx, c.req.param('agent')!, c.req.param('operation')!);
+  function worker(c: Context) {
     const raw = token(c);
-    if (
-      !raw ||
-      !timingSafeEqual(
-        Buffer.from(hash(raw), 'hex'),
-        Buffer.from(policy.executorTokenSha256, 'hex'),
-      )
-    )
-      error(401, 'Invalid executor credential');
-    return policy;
+    if (!raw) error(401, 'Invalid executor credential');
+    const digest = Buffer.from(hash(raw), 'hex');
+    const policy = policies.find(
+      (p) =>
+        p.agentId === c.req.param('agent') &&
+        p.operation === c.req.param('operation') &&
+        timingSafeEqual(digest, Buffer.from(p.executorTokenSha256, 'hex')),
+    );
+    return policy ?? error(401, 'Invalid executor credential');
   }
   app.post(workerPath + '/claim', async (c) =>
     c.json(
       await db.begin(async (tx) => {
-        const p = await worker(c, tx);
+        const p = worker(c);
+        // A credential from a previous ownership revision can reconcile its
+        // existing effects, but has no authority to acquire new work.
+        if (p !== (await policyFor(tx, p.agentId, p.operation))) missing();
         // One irrevocable claim; a lost HTTP response can require reconciliation,
         // but cannot cause a second dispatch. Removed grants invalidate queued jobs.
         const [row] = await tx<RequestRow[]>`WITH candidate AS (
@@ -421,7 +446,7 @@ export function mountOperations(
   app.get(workerPath + '/unresolved', async (c) =>
     c.json(
       await db.begin(async (tx) => {
-        const p = await worker(c, tx);
+        const p = worker(c);
         const after = c.req.query('after') ?? null;
         if (after && !z.string().uuid().safeParse(after).success) error(400, 'Invalid cursor');
         const rows = await tx<RequestRow[]>`SELECT *, false AS expired FROM infra.operation_requests
@@ -440,7 +465,7 @@ export function mountOperations(
     const input = await body(c, outcome);
     return c.json(
       await db.begin(async (tx) => {
-        const p = await worker(c, tx);
+        const p = worker(c);
         const row = await record(tx, p.agentId, c.req.param('id')!);
         if (
           row.operation !== p.operation ||

@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { TaskState } from '@a2x/sdk';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import postgres from 'postgres';
@@ -63,8 +64,25 @@ test(
       operators: [{ principalId: operator, actorId: actor }],
       fields: { pull: { type: 'integer' }, repo: { type: 'string', allowedValues: ['org/repo'] } },
     };
+    const successorToken = randomUUID();
+    const successor = {
+      ...policy,
+      ownerPrincipal: 'new-' + owner,
+      ownerRevision: 1,
+      executorTokenSha256: createHash('sha256').update(successorToken).digest('hex'),
+    };
+    assert.throws(
+      () =>
+        readOperationRegistry(
+          JSON.stringify([
+            policy,
+            { ...successor, executorTokenSha256: policy.executorTokenSha256 },
+          ]),
+        ),
+      /distinct executor credentials/,
+    );
     const app = new Hono();
-    mountOperations(app, sql, readOperationRegistry(JSON.stringify([policy])));
+    mountOperations(app, sql, readOperationRegistry(JSON.stringify([policy, successor])));
     const path = '/agents/' + agentId + '/operations';
     const worker = '/operation-executors/' + agentId + '/merge-pr';
     t.after(async () => {
@@ -113,22 +131,25 @@ test(
       ],
     }));
     const store = new PostgresTaskStore(sql, { ownerAgent: agentId });
-    const { id: taskId } = await store.createTask({
-      contextId: randomUUID(),
-      metadata: {
-        _principalId: requester,
-        _actorId: actor,
-        _authorizationKey: requesterGrant,
-        _authorizationProfile: MENTIONABLE_OAUTH_PROFILE_ID,
-      },
-    });
-    await store.updateTask(taskId, { artifacts });
+    const metadata = {
+      _principalId: requester,
+      _actorId: actor,
+      _authorizationKey: requesterGrant,
+      _authorizationProfile: MENTIONABLE_OAUTH_PROFILE_ID,
+    };
+    const { id: taskId } = await store.createTask({ contextId: randomUUID(), metadata });
+    await store.updateTask(taskId, { artifacts, status: { state: TaskState.WORKING } });
     const payload = (i: number) => ({
       taskId,
       proposalKey: artifacts[i].artifactId,
       operation: 'merge-pr',
       arguments: artifacts[i].parts[0].data.arguments,
     });
+    assert.equal((await post(path, caller, payload(0))).status, 409);
+    const abandoned = await store.createTask({ contextId: randomUUID(), metadata });
+    await store.updateTask(abandoned.id, { artifacts, status: { state: TaskState.FAILED } });
+    assert.equal((await post(path, caller, { ...payload(0), taskId: abandoned.id })).status, 400);
+    await store.updateTask(taskId, { status: { state: TaskState.INPUT_REQUIRED } });
     const create = async (i: number) => {
       const r = await post(path, caller, payload(i));
       assert.equal(r.status, 200, await r.clone().text());
@@ -150,6 +171,7 @@ test(
     );
     const [a, replay] = await Promise.all([create(0), create(0)]);
     assert.deepEqual(a, replay);
+    await store.updateTask(taskId, { status: { state: TaskState.COMPLETED } });
     assert.equal((await get(path + '/' + a.id, other)).status, 404);
     const decide = (item: typeof a, token = approver, decision = 'approve') =>
       post(path + '/' + item.id + '/decision', token, { decision, digest: item.digest });
@@ -316,7 +338,28 @@ test(
     ]} WHERE id=${agentId}`;
     assert.equal((await exchange()).status, 400);
     assert.equal((await get(path + '/' + a.id, recovered)).status, 404);
+    assert.equal((await post(worker + '/' + f.id + '/result', executorToken, outcome)).status, 200);
     await sql`UPDATE agents SET owner_principal=${'new-' + owner} WHERE id=${agentId}`;
+    const unresolved = async (credential: string) =>
+      z
+        .object({ operations: z.array(requestView) })
+        .parse(await (await get(worker + '/unresolved', credential)).json())
+        .operations.map((row) => row.id);
+    assert.deepEqual(await unresolved(executorToken), [f.id]);
+    assert.deepEqual(await unresolved(successorToken), []);
+    assert.equal((await post(worker + '/claim', executorToken)).status, 404);
+    assert.equal(
+      claim.parse(await (await post(worker + '/claim', successorToken)).json()).operation,
+      null,
+    );
+    assert.equal((await post(worker + '/' + f.id + '/result', successorToken, final)).status, 404);
+    assert.equal((await post(worker + '/' + f.id + '/result', executorToken, final)).status, 200);
+    assert.deepEqual(await unresolved(executorToken), []);
+    assert.equal((await get(path + '/' + f.id, caller)).status, 404);
+    const [settled] =
+      await sql`SELECT state,history->-1->>'event' AS last_event FROM infra.operation_requests WHERE id=${f.id}`;
+    assert.equal(settled.state, 'succeeded');
+    assert.equal(settled.last_event, 'succeeded');
     await sql`UPDATE agents SET owner_principal=${owner} WHERE id=${agentId}`;
     assert.equal((await get(path + '/' + a.id, caller)).status, 404);
     assert.equal((await post(worker + '/claim', executorToken)).status, 404);
