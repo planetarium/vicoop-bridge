@@ -1296,7 +1296,7 @@ test('delegation owner API generations revoke tokens/tasks and never reopen publ
     assert.deepEqual(stored.allowed_callers, ['federation-restricted:v1']);
     // Older rows may have a delegation and a NULL element but no sticky marker.
     await sql.begin(async tx => {
-      const legacy = 'legacy-' + randomUUID();
+      const legacy = 'legacy-' + setup.agentId;
       await tx`INSERT INTO agents(id, owner_principal, name, token_hash, allowed_callers)
         VALUES (${legacy}, ${owner}, 'legacy', ${legacy}, ARRAY[${first.principal}::text, NULL])`;
       const [updated] = await tx`UPDATE agents SET allowed_callers = '{}' WHERE id = ${legacy} RETURNING allowed_callers`;
