@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { OPERATION_APPROVAL_EXTENSION_URI } from '@vicoop-bridge/protocol';
+import { MAX_OPERATION_FIELDS, MAX_OPERATION_REGISTRATION_BYTES, OPERATION_APPROVAL_EXTENSION_URI, OPERATION_PROPOSAL_TYPE } from '@vicoop-bridge/protocol';
 import { z } from 'zod';
 import type { Emit } from './backend.js';
 
@@ -11,7 +11,7 @@ const proposal = z
     arguments: z.record(
       name,
       z.union([z.string().max(2048), z.number().int().safe(), z.boolean()]),
-    ),
+    ).refine(fields => Object.keys(fields).length <= MAX_OPERATION_FIELDS),
   })
   .strict();
 
@@ -26,8 +26,11 @@ export function proposalEmitter(
     signal.throwIfAborted();
     const parsed = proposal.parse(input);
     if (!operations.includes(parsed.operation)) throw new Error('Unregistered operation');
-    if (++count > 8) throw new Error('Proposal limit reached');
     const artifactId = randomUUID();
+    const registration = { taskId, proposalKey: artifactId, ...parsed };
+    if (Buffer.byteLength(JSON.stringify(registration)) > MAX_OPERATION_REGISTRATION_BYTES)
+      throw new Error('Proposal exceeds registration limit');
+    if (++count > 8) throw new Error('Proposal limit reached');
     emit({
       type: 'task.artifact',
       taskId,
@@ -36,7 +39,7 @@ export function proposalEmitter(
         artifactId,
         name: 'operation-proposal',
         extensions: [OPERATION_APPROVAL_EXTENSION_URI],
-        parts: [{ kind: 'data', data: { type: 'vicoop.operation-proposal.v1', ...parsed } }],
+        parts: [{ kind: 'data', data: { type: OPERATION_PROPOSAL_TYPE, ...parsed } }],
       },
     });
     return { proposed: true, artifactId };

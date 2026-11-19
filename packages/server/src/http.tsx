@@ -422,7 +422,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
 
     if (Array.isArray(message.extensions) && message.extensions.includes(OPERATION_APPROVAL_EXTENSION_URI)) {
       const card = getAgentForConn(conn).getAgentCard() as AgentCardV03;
-      if (!card.capabilities.extensions?.some(ext => ext.uri === OPERATION_APPROVAL_EXTENSION_URI)) {
+      // Message.extensions describes the content. Only the transport activation
+      // header opts this federated turn into offering the proposal tool.
+      if (caller?.tokenExchange && requestedExtensions.includes(OPERATION_APPROVAL_EXTENSION_URI) &&
+          card.capabilities.extensions?.some(ext => ext.uri === OPERATION_APPROVAL_EXTENSION_URI)) {
+        c.header(A2A_EXTENSIONS_HEADER, OPERATION_APPROVAL_EXTENSION_URI, { append: true });
+        c.header(A2A_EXTENSIONS_LEGACY_HEADER, OPERATION_APPROVAL_EXTENSION_URI, { append: true });
+      } else {
         message.extensions = message.extensions.filter(uri => uri !== OPERATION_APPROVAL_EXTENSION_URI);
       }
     }

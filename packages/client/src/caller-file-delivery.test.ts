@@ -253,3 +253,16 @@ for (const kind of ['claude','codex'] as const) test(kind+' caller MCP proposes 
     }});
   } finally {adapter.close();}
 });
+
+
+test('proposal output fits the registration field and UTF-8 body limits for native and MCP tools', async () => {
+  const { proposalEmitter } = await import('./operation-proposals.js');
+  const frames: UpFrame[] = [];
+  const propose = proposalEmitter(['review'], 'task', frame => frames.push(frame), new AbortController().signal);
+  const fields = (count: number, value: string) =>
+    Object.fromEntries(Array.from({length: count}, (_, index) => ['field' + index, value]));
+  assert.throws(() => propose({ operation: 'review', arguments: fields(33, '') }));
+  assert.throws(() => propose({ operation: 'review', arguments: fields(5, '한'.repeat(1800)) }), /registration limit/);
+  assert.equal(frames.length, 0);
+  assert.doesNotThrow(() => propose({ operation: 'review', arguments: fields(32, '') }));
+});

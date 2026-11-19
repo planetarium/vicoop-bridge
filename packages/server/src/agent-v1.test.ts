@@ -102,9 +102,11 @@ test('versioned discovery exposes a v1 dual-transport card without changing v0.3
 });
 
 test('operation approval discovery requires overlapping runtime and current ownership policy on both card versions', async () => {
-  for (const scenario of ['enabled', 'disabled', 'other-operation', 'old-revision', 'ordinary-agent']) {
+  for (const scenario of ['enabled', 'disabled', 'other-operation', 'old-revision', 'ordinary-agent', 'no-federation']) {
     const registry = new Registry();
-    registerAgent(registry);
+    const caller = formatFederatedPrincipal({ issuer: 'did:web:connector.example', subject: 'slack:T/U',
+      method: 'urn:mentionable:auth:slack-workspace-member:v0.1' })!;
+    registerAgent(registry, scenario === 'no-federation' ? [] : [caller]);
     const conn = registry.getAgent('v1-test-agent')!;
     conn.ownerRevision = 7;
     conn.protocolCapabilities = scenario === 'ordinary-agent' ? [] : callerRuntimeCapabilities;
@@ -372,20 +374,26 @@ test(`${federated ? 'federated' : apiKeyOnly ? 'API-key-only' : 'mixed-policy AP
     description: 'federated ingress integration',
     version: '0.0.1',
     protocolVersion: '0.3.0',
-    capabilities: { streaming: true },
+    capabilities: { streaming: true, extensions: [{ uri: OPERATION_APPROVAL_EXTENSION_URI,
+      params: { operations: ['merge-pr', 'unregistered'] } }] },
     skills: [],
   };
   assert.deepEqual(registry.registerAgent({
     agentId: 'v1-test-agent',
     clientId: 'client-1',
     ownerPrincipal: 'eth:0x0000000000000000000000000000000000000001',
+    ownerRevision: 0,
     agentCard,
     allowedCallers: apiKeyOnly ? [principalId] : [authorizationKey, ...(!federated ? [principalId] : [])],
     protocolCapabilities: callerRuntime ? callerRuntimeCapabilities : [CALLER_CONTEXT_V2_CAPABILITY],
     ws,
     connectedAt: Date.now(),
   }), { ok: true });
-  const app = createHttpApp({ registry, db: sql, publicUrl: 'https://bridge.example' });
+  const app = createHttpApp({ registry, db: sql, publicUrl: 'https://bridge.example', operationPolicies: [{
+    agentId: 'v1-test-agent', ownerPrincipal: 'eth:0x0000000000000000000000000000000000000001',
+    ownerRevision: 0, operation: 'merge-pr', version: '1', executorId: 'host', executorTokenSha256: '0'.repeat(64),
+    operators: [], ttlSeconds: 3600, fields: {},
+  }] });
   const authorization = `Bearer ${federated ? 'vbc_oauth_test' : 'vbc_caller_direct-554'}`;
   // Authentication succeeds without opting into unrelated extensions, even
   // when a mixed policy also advertises federation.
@@ -399,7 +407,7 @@ test(`${federated ? 'federated' : apiKeyOnly ? 'API-key-only' : 'mixed-policy AP
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: authorization,
+        Authorization: authorization, 'X-A2A-Extensions': OPERATION_APPROVAL_EXTENSION_URI,
       },
       body: JSON.stringify({
         jsonrpc: '2.0', id: 1, method: 'message/send', params: { message: message('m-v03') },
@@ -412,13 +420,13 @@ test(`${federated ? 'federated' : apiKeyOnly ? 'API-key-only' : 'mixed-policy AP
         Authorization: authorization,
       },
       body: JSON.stringify({
-        jsonrpc: '2.0', id: 2, method: 'SendMessage', params: { message: message('m-v1-rpc') },
+        jsonrpc: '2.0', id: 2, method: 'SendMessage', params: { message: { ...message('m-v1-rpc'), extensions: [OPERATION_APPROVAL_EXTENSION_URI] } },
       }),
     }],
     ['/agents/v1-test-agent/v1/message:send', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/a2a+json',
+        'Content-Type': 'application/a2a+json', 'A2A-Extensions': OPERATION_APPROVAL_EXTENSION_URI,
         Authorization: authorization,
       },
       body: JSON.stringify({ message: message('m-v1-http') }),
@@ -427,10 +435,16 @@ test(`${federated ? 'federated' : apiKeyOnly ? 'API-key-only' : 'mixed-policy AP
   for (const [path, init] of requests) {
     const response = await app.request(path, init);
     assert.ok(response.status >= 200 && response.status < 300, `${path}: ${await response.text()}`);
+    const activated = callerRuntime && federated && path !== '/agents/v1-test-agent/v1';
+    for (const header of ['X-A2A-Extensions', 'A2A-Extensions']) {
+      assert.equal(response.headers.get(header), activated ? OPERATION_APPROVAL_EXTENSION_URI : null);
+    }
   }
   assert.equal(submittedBindings.length, 3);
   assert.equal(assignments.length, 3);
   for (const assignment of assignments) {
+    assert.deepEqual(assignment.operationNames, callerRuntime && federated && assignment.message.messageId !== 'm-v1-rpc'
+      ? ['merge-pr'] : undefined);
     assert.deepEqual(assignment.caller, {
       principal: { id: principalId }, ...(federated ? { actor: { id: actorId } } : {}),
     });

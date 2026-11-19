@@ -86,8 +86,9 @@ export async function createCallerRuntime(args: {
       let taskFiles: ReturnType<typeof createCallerFileDelivery> | undefined;
       let filesHealthy = true;
       let propose: ReturnType<typeof proposalEmitter> | undefined;
+      let operationNames: string[] = [];
       const fileDelivery = config.fileDelivery || config.operations ? {
-        get operations() { return propose ? config.operations : undefined; },
+        get operations() { return propose ? operationNames : undefined; },
         filesEnabled: Boolean(config.fileDelivery),
         description: config.fileDelivery ? `Deliver a file as an A2A attachment. Allowed roots: ${config.fileDelivery.allowedRoots.join(', ')}. Limit ${config.fileDelivery.maxBytes} bytes per file, ${config.fileDelivery.maxTotalBytes} total bytes and ${config.fileDelivery.maxFiles} files per task.` : '',
         bind: () => {
@@ -193,8 +194,9 @@ export async function createCallerRuntime(args: {
             if (taskFiles || propose) throw new Error('Concurrent file delivery within one caller scope');
             const files = config.fileDelivery ? createCallerFileDelivery(containerId(), task.taskId, emit, signal,
               config.fileDelivery, runDockerCommand, () => broker.close()) : undefined;
-            propose = config.operations && task.requestedExtensions?.includes(OPERATION_APPROVAL_EXTENSION_URI)
-              ? proposalEmitter(config.operations,task.taskId,emit,signal) : undefined;
+            operationNames = task.requestedExtensions?.includes(OPERATION_APPROVAL_EXTENSION_URI)
+              ? (config.operations ?? []).filter(name => task.operationNames?.includes(name)) : [];
+            propose = operationNames.length ? proposalEmitter(operationNames, task.taskId, emit, signal) : undefined;
             taskFiles = files;
             try { await worker.handle(task, emit, signal); } finally {
               // Broker exit aborts active reads. Drain their rejection handlers

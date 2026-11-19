@@ -77,6 +77,7 @@ export interface TaskBinding {
   authorizationProfile?: string;
   authorizationKey?: string;
   requestedExtensions?: string[];
+  operationGrant?: { names: string[]; ownerRevision: number };
   // Diagnostic counter (issue #414): number of liveness-heartbeat `task.status`
   // frames the server has received from the client and pushed to the sink for
   // this task. Surfaced on the terminal log so a router stall can be checked

@@ -1,6 +1,7 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { Context, Hono } from 'hono';
+import { MAX_OPERATION_FIELDS, MAX_OPERATION_REGISTRATION_BYTES, OPERATION_APPROVAL_EXTENSION_URI, OPERATION_PROPOSAL_TYPE } from '@vicoop-bridge/protocol';
 import { HTTPException } from 'hono/http-exception';
 import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
@@ -12,7 +13,7 @@ import {
 
 const name = z.string().regex(/^[a-z][a-z0-9_-]{0,62}$/);
 const scalar = z.union([z.string().max(2048), z.number().int().safe(), z.boolean()]);
-const args = z.record(name, scalar).refine((a) => Object.keys(a).length <= 32);
+const args = z.record(name, scalar).refine((a) => Object.keys(a).length <= MAX_OPERATION_FIELDS);
 const definition = z
   .object({
     agentId: z.string().min(1),
@@ -41,7 +42,7 @@ const definition = z
           allowedValues: z.array(scalar).min(1).optional(),
         })
         .strict(),
-    ),
+    ).refine(fields => Object.keys(fields).length <= MAX_OPERATION_FIELDS),
   })
   .strict();
 export type OperationDefinition = z.infer<typeof definition>;
@@ -93,9 +94,10 @@ function policyDigest(policy: OperationDefinition) {
 export async function reconcileOperationPolicies(db: Sql, policies: OperationDefinition[]) {
   const hashes = policies.map(policyDigest);
   await db`UPDATE infra.operation_requests SET state='cancelled', result='Operation policy changed',
-    history=history||jsonb_build_object('event','policy_changed','at',clock_timestamp())
+    history=history||jsonb_build_object('event', CASE WHEN requester=decided_principal THEN 'self_approval_revoked'
+      ELSE 'policy_changed' END, 'at',clock_timestamp())
     WHERE state IN ('pending','approved') AND expires_at > clock_timestamp()
-    AND NOT (policy_digest = ANY(${hashes}::text[]))`;
+    AND (NOT (policy_digest = ANY(${hashes}::text[])) OR (state='approved' AND requester=decided_principal))`;
 }
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const canonical = (value: unknown): string =>
@@ -154,7 +156,7 @@ type Source = {
   authorization_key: string;
   authorization_revoked_at: Date | null;
   task_json: {
-    artifacts?: { artifactId: string; parts?: { data?: unknown }[] }[];
+    artifacts?: { artifactId: string; extensions?: string[]; parts?: { data?: unknown }[] }[];
   };
 };
 function view(row: RequestRow) {
@@ -198,7 +200,13 @@ function isRequester(row: RequestRow, user: TokenExchangeAccessToken) {
     user.allowedCaller === row.grant_key
   );
 }
-function operator(policy: OperationDefinition, user: TokenExchangeAccessToken) {
+function hasPlatformDecisionCredential(user: TokenExchangeAccessToken) {
+  return user.taskId === undefined && user.scopes.includes('a2a:message.send');
+}
+function eligibleOperator(row: RequestRow, policy: OperationDefinition, user: TokenExchangeAccessToken) {
+  // The platform subject includes the Slack workspace and user. A second
+  // connector or a different grant cannot turn that same person into a reviewer.
+  if (row.requester === user.principalId) return false;
   return policy.operators.some(
     (o) => o.principalId === user.principalId && o.actorId === user.actorId,
   );
@@ -211,7 +219,7 @@ export function mountOperations(
 ) {
   const path = '/agents/:agent/operations';
   const workerPath = '/operation-executors/:agent/:operation';
-  const limit = bodyLimit({ maxSize: 16 * 1024 });
+  const limit = bodyLimit({ maxSize: MAX_OPERATION_REGISTRATION_BYTES });
   for (const route of [path, path + '/*', workerPath + '/*']) {
     app.use(
       route,
@@ -277,7 +285,7 @@ export function mountOperations(
         if (identity.taskId && identity.taskId !== input.taskId) missing();
         const policy = policyFor(agent, input.operation, await ownerFor(tx, agent)) ?? missing();
         const data = {
-          type: 'vicoop.operation-proposal.v1',
+          type: OPERATION_PROPOSAL_TYPE,
           operation: input.operation,
           arguments: input.arguments,
         };
@@ -321,6 +329,7 @@ export function mountOperations(
         if (!artifact.length) error(400, 'Proposal artifact missing from ready task');
         if (
           artifact.length !== 1 ||
+          !artifact[0].extensions?.includes(OPERATION_APPROVAL_EXTENSION_URI) ||
           artifact[0].parts?.length !== 1 ||
           !isDeepStrictEqual(artifact[0].parts[0].data, data)
         )
@@ -381,7 +390,7 @@ export function mountOperations(
           !isRequester(row, identity))
       )
         missing();
-      if (!isRequester(row, identity) && !(policy && operator(policy, identity))) missing();
+      if (!isRequester(row, identity) && !(policy && eligibleOperator(row, policy, identity))) missing();
       if (owner.owner_principal !== row.agent_owner || owner.owner_revision !== row.owner_revision)
         missing();
       return action(tx, row, identity, policy);
@@ -394,12 +403,12 @@ export function mountOperations(
         async (_tx, row, identity, policy) => ({
           ...view(row),
           canDecide:
-            identity.operationReadRevision === undefined &&
+            hasPlatformDecisionCredential(identity) &&
             row.state === 'pending' &&
             !row.expired &&
             !!policy &&
             samePolicy(row, policy) &&
-            operator(policy, identity),
+            eligibleOperator(row, policy, identity),
         }),
         true,
       ),
@@ -417,7 +426,7 @@ export function mountOperations(
     const input = await body(c, decision);
     return c.json(
       await access(c, async (tx, row, identity, policy) => {
-        if (!policy || !operator(policy, identity)) missing();
+        if (!policy || !eligibleOperator(row, policy, identity) || !hasPlatformDecisionCredential(identity)) missing();
         if (!samePolicy(row, policy) || input.digest !== row.digest) error(409, 'Proposal changed');
         const next = input.decision === 'approve' ? 'approved' : 'denied';
         if (
@@ -442,7 +451,7 @@ export function mountOperations(
   app.post(path + '/:id/cancel', async (c) =>
     c.json(
       await access(c, async (tx, row, identity) => {
-        if (!isRequester(row, identity)) missing();
+        if (!isRequester(row, identity) || !identity.scopes.includes('a2a:task.cancel')) missing();
         if (row.state === 'cancelled') return view(row);
         if (row.expired || !['pending', 'approved'].includes(row.state))
           error(409, 'Already expired or consumed');
@@ -477,6 +486,7 @@ export function mountOperations(
         const [row] = await tx<RequestRow[]>`WITH candidate AS (
       SELECT r.id FROM infra.operation_requests r JOIN agents a ON a.id=r.agent_id
       WHERE r.agent_id=${p.agentId} AND r.operation=${p.operation} AND r.state='approved'
+      AND r.decided_principal <> r.requester
       AND r.grant_key=ANY(a.allowed_callers) AND r.decided_by=ANY(a.allowed_callers)
       AND r.policy_digest=${policyDigest(p)} AND r.expires_at > clock_timestamp()
       ORDER BY r.expires_at,r.id LIMIT 1 FOR UPDATE OF r SKIP LOCKED)

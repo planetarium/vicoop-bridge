@@ -9,6 +9,9 @@ export const PROTOCOL_VERSION = '0.1';
 // original taskId-only frames.
 export const TASK_REPLAY_CAPABILITY = 'task-replay-v1';
 export const REMOTE_APPROVAL_CAPABILITY = 'remote-tool-approval-v1';
+export const MAX_OPERATION_FIELDS = 32;
+export const MAX_OPERATION_REGISTRATION_BYTES = 16 * 1024;
+export const OPERATION_PROPOSAL_TYPE = 'vicoop.operation-proposal.v1';
 export const OPERATION_APPROVAL_EXTENSION_URI = 'https://github.com/planetarium/vicoop-bridge/blob/main/docs/operation-approvals.md#v1';
 export const APPROVAL_EXTENSION_URI = 'https://github.com/planetarium/vicoop-bridge/blob/main/docs/tool-approval-v1.md';
 export const TRACEABILITY_EXTENSION_URI =
@@ -611,6 +614,7 @@ export const TaskAssignFrame = z.object({
   contextId: z.string(),
   message: Message,
   requestedExtensions: z.array(z.string()).optional(),
+  operationNames: z.array(z.string()).optional(),
   caller: CallerContext.optional(),
   executionScope: ExecutionScopeV1.optional(),
 });

@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { OPERATION_APPROVAL_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import { TaskState } from '@a2x/sdk';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
@@ -55,6 +56,7 @@ test(
     const agentId = 'ops-' + randomUUID(),
       owner = 'eth:' + randomUUID(),
       actor = 'did:web:test-connector.example';
+    const secondActor = 'did:web:second-connector.example';
     const operator = 'slack:T/O',
       requester = 'slack:T/R',
       sharedGrant = 'grant-' + randomUUID(),
@@ -73,7 +75,10 @@ test(
       version: '1',
       ttlSeconds: 86400,
       executorTokenSha256: createHash('sha256').update(executorToken).digest('hex'),
-      operators: [{ principalId: operator, actorId: actor }],
+      operators: [
+        { principalId: operator, actorId: actor }, { principalId: requester, actorId: actor },
+        { principalId: requester, actorId: secondActor },
+      ],
       fields: {
         pull: { type: 'integer' },
         repo: { type: 'string', allowedValues: ['org/repo'] },
@@ -117,16 +122,17 @@ test(
     });
     await sql`INSERT INTO agents(id,owner_principal,name,token_hash,allowed_callers)
     VALUES(${agentId},${owner},'ops test',${agentId},${[requesterGrant, sharedGrant]})`;
-    const issue = async (principalId: string, allowedCaller: string, task?: string) =>
+    const issue = async (principalId: string, allowedCaller: string, task?: string,
+      scopes = task ? ['a2a:task.read'] : ['a2a:task.read', 'a2a:message.send', 'a2a:task.cancel'], actorId = actor) =>
       (
         await issueTokenExchangeAccessToken(sql, {
           agentId,
           resource: 'https://bridge.example/agents/' + agentId,
           profileId: MENTIONABLE_OAUTH_PROFILE_ID,
           principalId,
-          actorId: actor,
+          actorId,
           allowedCaller,
-          scopes: ['a2a:task.read'],
+          scopes,
           taskId: task,
           expiresAt: new Date(Date.now() + 60_000),
         })
@@ -147,6 +153,7 @@ test(
       app.request(uri, { headers: { Authorization: 'Bearer ' + token } });
     const artifacts = Array.from({ length: 10 }, (_, index) => ({
       artifactId: randomUUID(),
+      extensions: [OPERATION_APPROVAL_EXTENSION_URI],
       parts: [
         {
           kind: 'data',
@@ -192,6 +199,10 @@ test(
     await store.updateTask(taskId, {
       status: { state: TaskState.INPUT_REQUIRED },
     });
+    // A generic JSON artifact is not an operation proposal, even when its data looks identical.
+    const unmarked = { ...artifacts[0], artifactId: randomUUID(), extensions: [] };
+    await store.updateTask(taskId, { artifacts: [...artifacts, unmarked] });
+    assert.equal((await post(path, caller, { ...payload(0), proposalKey: unmarked.artifactId })).status, 409);
     const create = async (i: number) => {
       const r = await post(path, caller, payload(i));
       assert.equal(r.status, 200, await r.clone().text());
@@ -226,6 +237,11 @@ test(
       ).status,
       200,
     );
+    // Old revisions could record a decision when the requester was also an
+    // allowlisted operator. Do not dispatch that already-approved work.
+    await sql`UPDATE infra.operation_requests SET decided_principal=requester WHERE id=${approved.id}`;
+    assert.equal(claim.parse(await (await post(worker + '/claim', executorToken)).json()).operation, null);
+    await reconcileOperationPolicies(runtime, readOperationRegistry(JSON.stringify([policy])));
     const empty = new Hono();
     mountOperations(empty, runtime, []);
     const changed = readOperationRegistry(JSON.stringify([{ ...policy, ttlSeconds: 3600 }]));
@@ -240,7 +256,7 @@ test(
       const audit = history.parse(
         await (await get(path + '/' + item.id + '/audit', caller)).json(),
       );
-      assert.deepEqual(audit.history.filter((e) => e.event === 'policy_changed').length, 1);
+      assert.deepEqual(audit.history.filter((e) => e.event === (item === approved ? 'self_approval_revoked' : 'policy_changed')).length, 1);
     }
     const [a, replay] = await Promise.all([create(0), create(0)]);
     assert.deepEqual(a, replay);
@@ -249,6 +265,10 @@ test(
         .canDecide;
     assert.equal(await canDecide(a.id, caller), false);
     assert.equal(await canDecide(a.id, approver), true);
+    const readOnlyOperator = await issue(operator, sharedGrant, undefined, ['a2a:task.read']);
+    const taskScopedOperator = await issue(operator, sharedGrant, taskId, ['a2a:task.read', 'a2a:message.send']);
+    assert.equal(await canDecide(a.id, readOnlyOperator), false);
+    assert.equal(await canDecide(a.id, taskScopedOperator), false);
     await store.updateTask(taskId, { status: { state: TaskState.COMPLETED } });
     assert.equal((await get(path + '/' + a.id, other)).status, 404);
     const decide = (item: typeof a, token = approver, decision = 'approve') =>
@@ -256,7 +276,14 @@ test(
         decision,
         digest: item.digest,
       });
-    assert.equal((await decide(a, caller)).status, 404);
+    for (const asRequester of [caller, await issue(requester, sharedGrant), await issue(requester, sharedGrant, undefined, undefined, secondActor)]) {
+      for (const decision of ['approve', 'deny']) {
+        assert.equal((await decide(a, asRequester, decision)).status, 404);
+      }
+    }
+    assert.equal((await decide(a, readOnlyOperator)).status, 404);
+    assert.equal((await decide(a, taskScopedOperator)).status, 404);
+    assert.equal((await post(path + '/' + a.id + '/cancel', await issue(requester, requesterGrant, taskId))).status, 404);
     assert.equal((await decide({ ...a, digest: '0'.repeat(64) })).status, 409);
     // Read-only views do not wait on a concurrent operation-row writer.
     await sql.begin(async (tx) => {

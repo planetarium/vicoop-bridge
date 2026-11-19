@@ -77,12 +77,24 @@ export function buildAgentA2XServer(
     });
   }
 
+  // Policy belongs to the server. Re-evaluate at dispatch in case a slow turn
+  // waited on billing or storage across an ownership change or reconnect.
+  function operationNamesFor(current: ClientConnection): string[] {
+    const declaredNames = current.agentCard.capabilities?.extensions
+      ?.find(e => e.uri === OPERATION_APPROVAL_EXTENSION_URI)?.params?.operations;
+    if (!current.protocolCapabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) || !Array.isArray(declaredNames)) return [];
+    return (opts.operationPolicies ?? []).filter(p => p.agentId === current.agentId &&
+      p.ownerPrincipal === current.ownerPrincipal && p.ownerRevision === current.ownerRevision &&
+      declaredNames.includes(p.operation)).map(p => p.operation);
+  }
+
   const executor = new WSForwardingExecutor(
     conn.agentId,
     registry,
     taskStore,
     undefined,
     paymentsWired ? { sql: opts.db!, resource: url } : undefined,
+    operationNamesFor,
   );
 
   const a2xServer = new A2XServer({
@@ -131,16 +143,6 @@ export function buildAgentA2XServer(
     });
   }
   const declared = wire.capabilities?.extensions ?? [];
-  const runtimeOperations = declared.find(e => e.uri === OPERATION_APPROVAL_EXTENSION_URI)?.params?.operations;
-  if (conn.protocolCapabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) && Array.isArray(runtimeOperations) &&
-      opts.operationPolicies?.some(p => p.agentId === conn.agentId && p.ownerPrincipal === conn.ownerPrincipal &&
-        p.ownerRevision === conn.ownerRevision && runtimeOperations.includes(p.operation))) {
-    a2xServer.addExtension({
-      uri: OPERATION_APPROVAL_EXTENSION_URI, required: false,
-      description: 'Propose a registered host operation for independent operator review.',
-      params: { registrationUrl: `${opts.publicUrl ?? ''}/agents/${encodeURIComponent(conn.agentId)}/operations` },
-    });
-  }
   const wireExtensions = declared.filter(e => e.uri !== APPROVAL_EXTENSION_URI && e.uri !== OPERATION_APPROVAL_EXTENSION_URI);
   const callerRuntime = conn.protocolCapabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) === true;
   const restricted = conn.allowedCallers.length > 0 || callerRuntime;
@@ -169,6 +171,13 @@ export function buildAgentA2XServer(
       conn.protocolCapabilities.includes(FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY)
     )) &&
     (principals.some((p) => p?.kind === 'federated') || conn.allowedCallers.some((p) => parseFederatedDelegation(p) !== null));
+  if (bridgeWillEmitOAuthFederation && operationNamesFor(conn).length) {
+    a2xServer.addExtension({
+      uri: OPERATION_APPROVAL_EXTENSION_URI, required: false,
+      description: 'Propose a registered host operation for independent operator review.',
+      params: { registrationUrl: `${opts.publicUrl ?? ''}/agents/${encodeURIComponent(conn.agentId)}/operations` },
+    });
+  }
   for (const extension of wireExtensions) {
     if (callerRuntime && [OPENAI_COMPAT_EXTENSION_URI, TRACEABILITY_EXTENSION_URI].includes(extension.uri)) continue;
     if (extension.uri === SIWE_BEARER_AUTH_EXTENSION_URI) {

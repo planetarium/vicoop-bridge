@@ -15,7 +15,7 @@ import {
   type TaskStore,
 } from '@a2x/sdk';
 import { randomUUID } from 'node:crypto';
-import type { Registry, TaskBinding, TaskSink } from './registry.js';
+import type { ClientConnection, Registry, TaskBinding, TaskSink } from './registry.js';
 import { AsyncEventQueue } from './event-queue.js';
 import { logEvent } from './log.js';
 import { terminalErrorMessageFields } from './terminal-error.js';
@@ -23,6 +23,7 @@ import { X402Gate, createPostgresX402Context, type X402Settlement } from './x402
 import { readTaskUsage } from './x402/usage.js';
 import type { Sql } from './db.js';
 import {
+  OPERATION_APPROVAL_EXTENSION_URI,
   TASK_REPLAY_CAPABILITY,
   CALLER_RUNTIME_V1_CAPABILITY,
   type CallerAttestationV2,
@@ -237,6 +238,7 @@ export class WSForwardingExecutor extends AgentExecutor {
     // Absent in tests and on deployments without a DB-backed payment path;
     // the gate is then never installed and every agent is free.
     private readonly x402: X402ExecutorOptions | undefined = undefined,
+    private readonly operationNamesFor?: (conn: ClientConnection) => string[],
   ) {
     super({
       runner: NOOP_RUNNER,
@@ -569,6 +571,12 @@ export class WSForwardingExecutor extends AgentExecutor {
       if (executionId !== undefined) delete task.artifacts;
       this.abortControllers.set(taskId, ac);
       task.history = history;
+      const connection = this.registry.getAgent(this.agentId);
+      const operationNames = connection?.ownerRevision !== undefined && executionScope?.policy === 'federated-principal-v1' &&
+        requestedExtensions?.includes(OPERATION_APPROVAL_EXTENSION_URI)
+        ? this.operationNamesFor?.(connection) : undefined;
+      if (operationNames?.length && connection?.ownerRevision !== undefined)
+        binding.operationGrant = { names: operationNames, ownerRevision: connection.ownerRevision };
       sent = this.registry.sendToAgent(this.agentId, {
         type: 'task.assign', taskId,
         ...(executionId !== undefined ? { executionId } : {}), contextId,
@@ -578,6 +586,7 @@ export class WSForwardingExecutor extends AgentExecutor {
           ...(message.extensions !== undefined ? { extensions: message.extensions } : {}),
         },
         ...(message.extensions !== undefined ? { requestedExtensions: message.extensions } : {}),
+        ...(operationNames?.length ? { operationNames } : {}),
         ...(caller !== undefined ? { caller } : {}),
         ...(executionScope !== undefined ? { executionScope } : {}),
       });

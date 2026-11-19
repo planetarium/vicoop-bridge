@@ -7,6 +7,8 @@ import {
   parseUpFrame,
   PROTOCOL_VERSION,
   OPENAI_COMPAT_EXTENSION_URI,
+  OPERATION_APPROVAL_EXTENSION_URI,
+  OPERATION_PROPOSAL_TYPE,
   TASK_REPLAY_CAPABILITY,
   EXECUTION_SCOPE_V1_CAPABILITY,
   FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY,
@@ -450,6 +452,20 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         const accepted = acceptTaskFrame(frame);
         if (!accepted || accepted.kind === 'handled') return;
         const { binding: b } = accepted;
+        if (frame.artifact.extensions?.includes(OPERATION_APPROVAL_EXTENSION_URI)) {
+          const grant = b.operationGrant;
+          const conn = opts.registry.getAgent(b.agentId);
+          const [part] = frame.artifact.parts;
+          if (!grant || grant.ownerRevision !== conn?.ownerRevision ||
+              !b.authorizationKey || !conn.allowedCallers.includes(b.authorizationKey) ||
+              frame.append || !frame.lastChunk || frame.artifact.parts.length !== 1 ||
+              part?.kind !== 'data' || part.data.type !== OPERATION_PROPOSAL_TYPE ||
+              typeof part.data.operation !== 'string' || !grant.names.includes(part.data.operation)) {
+            opts.registry.sendToAgent(b.agentId, { type: 'task.cancel', taskId: b.taskId, executionId: b.executionId });
+            opts.registry.failTaskBinding(b, 'invalid_operation_proposal', 'Invalid operation proposal');
+            return;
+          }
+        }
         b.sink.pushArtifact({
           taskId: frame.taskId,
           contextId: b.contextId,
