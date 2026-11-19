@@ -1,6 +1,8 @@
 import semver from 'semver';
 import { BACKENDS_MANIFEST } from './backends-manifest.js';
 import { readFileSync, existsSync } from 'node:fs';
+import { validateHeaderName } from 'node:http';
+import { responsesHeaderReferences } from './provider-environment.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -16,10 +18,14 @@ export function isSupportedCodexBrokerVersion(version: string): boolean {
 
 class InvalidCodexLogin extends Error {}
 
+type ResponsesProvider = { endpoint: string; model: string };
+
 export type CodexCredential = {
   kind: 'api-key' | 'oauth';
   secret: string;
+  responsesHeaders?: Readonly<Record<string, string>>;
   accountId?: string;
+  responsesProvider?: ResponsesProvider;
   azureEndpoint?: string;
   azureModel?: string;
   azureDeployment?: string;
@@ -45,6 +51,52 @@ function validateAzureModels(model: string | undefined, deployment: string | und
     throw new Error('Azure Codex requires a supported logical model and a valid deployment name');
 }
 
+function responsesProvider(endpoint?: string, model?: string): ResponsesProvider {
+  if (!model || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(model))
+    throw new Error('Codex Responses provider requires an explicit model ID');
+  // Accept an HTTPS base URL with an optional path prefix. Append only the
+  // broker's own routes. Keep credentials and query parameters out of the URL.
+  if (!endpoint || !/^https:\/\/[^\s@?#\\]+$/i.test(endpoint))
+    throw new Error('Codex Responses provider requires an HTTPS base URL');
+  let url: URL;
+  try { url = new URL(endpoint); } catch { throw new Error('Invalid Codex Responses base URL'); }
+  return { endpoint: url.href.replace(/\/+$/, ''), model };
+}
+
+// The broker owns routing, framing, authentication and its caller metadata.
+const callerHeaders = ['user-agent', 'session_id', 'conversation_id', 'version'];
+const reservedHeaders = new Set([
+  ...callerHeaders, 'host', 'authorization', 'api-key', 'x-api-key', 'cookie', 'set-cookie',
+  'connection', 'proxy-connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+  'te', 'trailer', 'transfer-encoding', 'upgrade', 'expect', 'content-length', 'content-type',
+  'content-encoding', 'accept-encoding', 'chatgpt-account-id', 'openai-beta', 'originator',
+]);
+
+function readResponsesHeaders(env: NodeJS.ProcessEnv) {
+  const refs = responsesHeaderReferences(env.VICOOP_CODEX_RESPONSES_EXTRA_HEADERS);
+  const headers: Record<string, string> = Object.create(null);
+  for (const [name, source] of Object.entries(refs)) {
+    try { validateHeaderName(name); } catch { throw new Error('Invalid Codex Responses header name'); }
+    const lower = name.toLowerCase();
+    if (reservedHeaders.has(lower) || Object.hasOwn(headers, lower))
+      throw new Error(`Reserved or duplicate Codex Responses header: ${name}`);
+    const value = env[source];
+    if (typeof value !== 'string' || !value.trim() || /[^\x20-\x7e]/.test(value))
+      throw new Error(`Missing or invalid value for Codex Responses header: ${name}`);
+    headers[lower] = value;
+  }
+  return { headers: Object.freeze(headers), sources: Object.values(refs) };
+}
+
+export function codexProviderAppServerArgs(credential?: CodexCredential): string[] | undefined {
+  const model = credential?.responsesProvider?.model ?? credential?.azureModel;
+  if (!model) return undefined;
+  const args = ['app-server', '-c', `model=${JSON.stringify(model)}`];
+  if (credential?.responsesProvider)
+    args.push('-c', 'features.multi_agent=false', '-c', 'web_search="disabled"');
+  return args;
+}
+
 // Select once, reread only that source, and never copy/refresh a login in Docker.
 export function createCodexCredentialReader(
   env: NodeJS.ProcessEnv = process.env,
@@ -52,6 +104,24 @@ export function createCodexCredentialReader(
   const azureKeys = ['VICOOP_CODEX_AZURE_ENDPOINT', 'VICOOP_CODEX_AZURE_MODEL',
     'VICOOP_CODEX_AZURE_DEPLOYMENT', 'VICOOP_CODEX_AZURE_API_VERSION', 'AZURE_OPENAI_API_KEY',
     'AZURE_OPENAI_ENDPOINT', 'AZURE_OPENAI_AUTH_TOKEN', 'AZURE_OPENAI_AD_TOKEN', 'AZURE_OPENAI_API_VERSION'];
+  const responsesKeys = ['VICOOP_CODEX_RESPONSES_BASE_URL', 'VICOOP_CODEX_RESPONSES_MODEL', 'VICOOP_CODEX_RESPONSES_API_KEY',
+    'VICOOP_CODEX_RESPONSES_EXTRA_HEADERS'];
+  if (responsesKeys.some(key => env[key] !== undefined)) {
+    const conflicts = [...azureKeys, 'OPENAI_BASE_URL', 'OPENAI_API_KEY', 'OPENAI_API_VERSION'];
+    if (conflicts.some(key => env[key] !== undefined))
+      throw new Error('Conflicting Codex Responses provider settings');
+    const provider = responsesProvider(env.VICOOP_CODEX_RESPONSES_BASE_URL, env.VICOOP_CODEX_RESPONSES_MODEL);
+    const secret = env.VICOOP_CODEX_RESPONSES_API_KEY;
+    if (!secret || !/^[!-~]+$/.test(secret))
+      throw new Error('Host Codex Responses API key is unavailable');
+    const { headers, sources } = readResponsesHeaders(env);
+    const settings = [...responsesKeys, ...conflicts, ...sources].map(key => [key, env[key]] as const);
+    return () => {
+      if (settings.some(([key, value]) => env[key] !== value))
+        throw new Error('Host Codex Responses configuration changed; restart the bridge');
+      return { kind: 'api-key', secret, responsesProvider: { ...provider }, responsesHeaders: headers };
+    };
+  }
   if (azureKeys.some(key => env[key] !== undefined)) {
     if (!env.VICOOP_CODEX_AZURE_ENDPOINT || !env.AZURE_OPENAI_API_KEY ||
         !env.VICOOP_CODEX_AZURE_MODEL || !env.VICOOP_CODEX_AZURE_DEPLOYMENT ||
@@ -175,6 +245,7 @@ export function createCodexAuthBroker(opts: {
   credential: CodexCredentialReader;
   authentication: 'api-key' | 'oauth';
   upstream?: string;
+  responsesProvider?: ResponsesProvider;
   azureEndpoint?: string;
   azureModel?: string;
   azureDeployment?: string;
@@ -188,13 +259,16 @@ export function createCodexAuthBroker(opts: {
   if (azure && oauth) throw new Error('Azure Codex requires API-key authentication');
   if (azure) validateAzureModels(opts.azureModel, opts.azureDeployment);
   else if (opts.azureModel || opts.azureDeployment) throw new Error('Azure Codex requires an endpoint');
+  const custom = opts.responsesProvider;
+  if (custom && (azure || oauth || opts.upstream))
+    throw new Error('Codex Responses provider requires a dedicated API-key upstream');
+  const customUrl = custom ? new URL(responsesProvider(custom.endpoint, custom.model).endpoint) : undefined;
+  const origin = customUrl?.origin ?? azure?.origin ?? (oauth ? 'https://chatgpt.com' : 'https://api.openai.com');
   return createExecutionAuthBroker({
     ...opts,
-    upstream:
-      opts.upstream ??
-      (azure?.origin ?? (oauth ? 'https://chatgpt.com' : 'https://api.openai.com')),
-    origins: [azure?.origin ?? (oauth ? 'https://chatgpt.com' : 'https://api.openai.com')],
-    pathPrefix: azure ? azure.pathname : opts.upstream ? '' : oauth ? '/backend-api/codex' : '/v1',
+    upstream: opts.upstream ?? origin,
+    origins: [origin],
+    pathPrefix: customUrl ? customUrl.pathname.replace(/\/$/, '') : azure ? azure.pathname : opts.upstream ? '' : oauth ? '/backend-api/codex' : '/v1',
     transformBody: azure ? data => ({ ...data, model: opts.azureDeployment }) : undefined,
     allow(req) {
       // Built-in OpenAI tries WebSockets first. 426 selects its HTTP fallback
@@ -216,7 +290,7 @@ export function createCodexAuthBroker(opts: {
         !data ||
         typeof data !== 'object' ||
         typeof data.model !== 'string' ||
-        !/^(gpt-|o[134](?:-|$))[a-zA-Z0-9._-]*$/.test(data.model) ||
+        (custom ? data.model !== custom.model : !/^(gpt-|o[134](?:-|$))[a-zA-Z0-9._-]*$/.test(data.model)) ||
         (azure && data.model !== opts.azureModel) ||
         data.background === true
       )
@@ -231,6 +305,8 @@ export function createCodexAuthBroker(opts: {
       const credential = await opts.credential();
       if (
         credential.kind !== opts.authentication ||
+        credential.responsesProvider?.endpoint !== custom?.endpoint ||
+        credential.responsesProvider?.model !== custom?.model ||
         credential.azureEndpoint !== azure?.href.replace(/\/$/, '') ||
         credential.azureModel !== opts.azureModel ||
         credential.azureDeployment !== opts.azureDeployment ||
@@ -239,6 +315,7 @@ export function createCodexAuthBroker(opts: {
       )
         throw new BrokerRejection(503);
       const headers: Record<string, string> = {
+        ...(custom ? credential.responsesHeaders : undefined),
         'content-type': 'application/json',
         ...(azure ? {'api-key': credential.secret} : {authorization: `Bearer ${credential.secret}`}),
       };
@@ -249,12 +326,7 @@ export function createCodexAuthBroker(opts: {
         headers['openai-beta'] = 'responses=experimental';
         headers.originator = 'codex_cli_rs';
       }
-      for (const name of [
-        'user-agent',
-        'session_id',
-        'conversation_id',
-        'version',
-      ]) {
+      for (const name of callerHeaders) {
         if (typeof req.headers[name] === 'string')
           headers[name] = req.headers[name];
       }

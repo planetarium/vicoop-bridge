@@ -1,3 +1,4 @@
+import { MAX_PENDING_FILE_REQUESTS } from './caller-file-delivery.js';
 import {PROVIDER_ENV_PATTERN} from './provider-environment.js';
 // Runs INSIDE the workload. Contains no host credential or host destination.
 // JSON-lines multiplex raw HTTP sockets and the agent's stdio over docker exec.
@@ -154,7 +155,7 @@ function receive(m) {
       }
       if (m.fileDelivery) {
         fileServer = http.createServer({maxHeaderSize:4096}, async (req,res) => {
-          if(req.method!=='POST'||req.url!=='/send-file'||req.headers.authorization!=='Bearer '+m.fileDelivery.token||fileResponses.size>=4){res.writeHead(403);res.end();return;}
+          if(req.method!=='POST'||req.url!=='/send-file'||req.headers.authorization!=='Bearer '+m.fileDelivery.token||fileResponses.size>=${MAX_PENDING_FILE_REQUESTS}){res.writeHead(403);res.end();return;}
           req.setEncoding('utf8');
           req.setTimeout(15000,()=>req.destroy());
           let body='';

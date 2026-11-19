@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createServer} from 'node:http';
+import http, {createServer} from 'node:http';
+import https from 'node:https';
+import type { AddressInfo } from 'node:net';
+import { syncBuiltinESMExports } from 'node:module';
 import {createServer as tcpServer,connect} from 'node:net';
 import {once} from 'node:events';
 import {mkdtempSync,writeFileSync,rmSync} from 'node:fs';
@@ -231,4 +234,121 @@ test('Azure broker maps only the pinned model, constrains routes and sanitizes f
     assert.equal(received.length,7);
     broker.revoke(); await assert.rejects(request());
   } finally {broker.revoke();upstream.closeAllConnections();await Promise.all([new Promise<void>(r=>upstream.close(()=>r())),new Promise<void>(r=>tcp.close(()=>r()))]);}
+});
+
+test('host Responses provider pins its HTTPS endpoint, model and dedicated key', async () => {
+  const env: NodeJS.ProcessEnv = {
+    VICOOP_CODEX_RESPONSES_BASE_URL: 'https://model.example/openai/',
+    VICOOP_CODEX_RESPONSES_MODEL: 'example/Model-1:latest',
+    VICOOP_CODEX_RESPONSES_API_KEY: 'fixture',
+  };
+  const reader = createCodexCredentialReader(env);
+  const selected = await reader();
+  assert.deepEqual(selected.responsesProvider, { endpoint: 'https://model.example/openai', model: 'example/Model-1:latest' });
+  for (const endpoint of ['http://model.example', 'https://name@model.example', 'https://model.example/?key=foo', 'https://model.example/#fragment'])
+    assert.throws(() => createCodexCredentialReader({ ...env, VICOOP_CODEX_RESPONSES_BASE_URL: endpoint }));
+  for (const key of Object.keys(env))
+    assert.throws(() => createCodexCredentialReader({ ...env, [key]: undefined }));
+  for (const extra of [azureEnv(), { OPENAI_API_KEY: 'other' }, { OPENAI_BASE_URL: 'https://other.example' }])
+    assert.throws(() => createCodexCredentialReader({ ...env, ...extra }));
+  const options = { credential: reader, responsesProvider: selected.responsesProvider };
+  assert.throws(() => createCodexAuthBroker({ ...options, authentication: 'oauth' }));
+  assert.throws(() => createCodexAuthBroker({ ...options, authentication: 'api-key', upstream: 'http://127.0.0.1' }));
+  const broker = createCodexAuthBroker({ ...options, authentication: 'api-key' });
+  const tcp = tcpServer(socket => broker.attach(socket));
+  tcp.listen(0, '127.0.0.1');
+  await once(tcp, 'listening');
+  try {
+    const request = (model: string) => fetch(`http://127.0.0.1:${(tcp.address() as any).port}/responses`, {
+      method: 'POST', headers: { authorization: `Bearer ${broker.token}` }, body: JSON.stringify({ model }),
+    });
+    assert.equal((await request('gpt-5.4')).status, 403);
+    env.VICOOP_CODEX_RESPONSES_API_KEY = 'replaced';
+    assert.throws(reader, /changed/);
+    assert.equal((await request('example/Model-1:latest')).status, 503);
+    assert.equal(broker.stats.forwarded, 0);
+  } finally {
+    broker.revoke();
+    await new Promise<void>(resolve => tcp.close(() => resolve()));
+  }
+});
+
+const customHeaderEnv = {
+  VICOOP_CODEX_RESPONSES_BASE_URL: 'https://provider.example/llm',
+  VICOOP_CODEX_RESPONSES_MODEL: 'test-model',
+  VICOOP_CODEX_RESPONSES_API_KEY: 'model-fixture',
+  VICOOP_CODEX_RESPONSES_EXTRA_HEADERS: '{"X-Service-Key":"SERVICE_KEY"}',
+  SERVICE_KEY: 'service-fixture',
+};
+
+test('Responses header mappings reject invalid or reserved fields and pin secret sources', async () => {
+  const env = { ...customHeaderEnv };
+  const reader = createCodexCredentialReader(env);
+  const selected = await reader();
+  assert.equal(selected.responsesHeaders?.['x-service-key'], 'service-fixture');
+  assert.deepEqual(Object.keys(selected.responsesProvider!).sort(), ['endpoint', 'model']);
+  env.SERVICE_KEY = 'replacement';
+  assert.throws(reader, /changed; restart/);
+  const config = (mapping: string, value = 'service-fixture') =>
+    createCodexCredentialReader({ ...env, VICOOP_CODEX_RESPONSES_EXTRA_HEADERS: mapping, SERVICE_KEY: value });
+  for (const mapping of ['service-fixture', 'null', '[]', '{"Bad Name":"SERVICE_KEY"}',
+    '{"X-A":"MISSING"}', '{"X-A":123}', '{"X-A":"not-an-env-name"}', '{"X-A":"SERVICE_KEY","x-a":"SERVICE_KEY"}']) {
+    assert.throws(() => config(mapping), error => error instanceof Error && !error.message.includes('service-fixture'));
+  }
+  for (const name of ['Authorization', 'HOST', 'Cookie', 'Content-Length', 'Transfer-Encoding', 'User-Agent',
+    'Connection', 'Upgrade', 'proxy-authorization', 'api-key', 'TE', 'content-type', 'session_id']) {
+    assert.throws(() => config(JSON.stringify({ [name]: 'SERVICE_KEY' })), /Reserved/);
+  }
+  for (const value of ['  ', 'service-fixture\nsecond', 'service-fixture\r', 'service-fixture\0'])
+    assert.throws(() => config(env.VICOOP_CODEX_RESPONSES_EXTRA_HEADERS, value), /invalid value.*X-Service-Key/);
+  assert.throws(() => createCodexCredentialReader({ OPENAI_API_KEY: 'direct', VICOOP_CODEX_RESPONSES_EXTRA_HEADERS: '{}' }));
+});
+
+test('external Responses adds host header values only to the pinned routes', async t => {
+  const seen: Array<{ url: string; headers: http.IncomingHttpHeaders }> = [];
+  const fixture = createServer((req, res) => {
+    seen.push({ url: req.url!, headers: req.headers });
+    res.writeHead(seen.length === 2 ? 307 : 200, { location: 'https://elsewhere.example/', 'x-service-key': 'service-fixture' });
+    res.end(seen.length === 2 ? 'service-fixture' : '{}');
+  });
+  fixture.listen(0, '127.0.0.1');
+  await once(fixture, 'listening');
+  const local = 'http://127.0.0.1:' + (fixture.address() as AddressInfo).port;
+  // Redirect only the test's socket to the fixture; verify the real upstream URL.
+  const calls: string[] = [];
+  const transport = t.mock.method(https, 'request', (url: string, options: http.RequestOptions, cb: (res: http.IncomingMessage) => void) => {
+    calls.push(url);
+    return http.request(local + new URL(url).pathname, options, cb);
+  });
+  syncBuiltinESMExports();
+  const credential = createCodexCredentialReader(customHeaderEnv);
+  const broker = createCodexAuthBroker({ authentication: 'api-key', credential, responsesProvider: (await credential()).responsesProvider });
+  const tcp = tcpServer(socket => broker.attach(socket));
+  tcp.listen(0, '127.0.0.1');
+  await once(tcp, 'listening');
+  const send = (path: string) => fetch('http://127.0.0.1:' + (tcp.address() as AddressInfo).port + path, {
+    method: 'POST', headers: { authorization: 'Bearer ' + broker.token, 'x-service-key': 'caller-value', 'x-other': 'caller-only' },
+    body: JSON.stringify({ model: 'test-model', input: 'test' }),
+  });
+  try {
+    assert.equal((await send('/models')).status, 403);
+    const ok = await send('/responses');
+    assert.equal(ok.status, 200);
+    assert.equal(ok.headers.get('x-service-key'), null);
+    const redirect = await send('/responses/compact');
+    assert.equal(redirect.status, 502);
+    assert.ok(!(await redirect.text()).includes('service-fixture'));
+    assert.deepEqual(calls, ['https://provider.example/llm/responses', 'https://provider.example/llm/responses/compact']);
+    for (const { headers } of seen) {
+      assert.equal(headers.authorization, 'Bearer model-fixture');
+      assert.equal(headers['x-service-key'], 'service-fixture');
+      assert.equal(headers['x-other'], undefined);
+    }
+  } finally {
+    transport.mock.restore();
+    syncBuiltinESMExports();
+    broker.revoke();
+    fixture.closeAllConnections();
+    await Promise.all([new Promise<void>(r => fixture.close(() => r())), new Promise<void>(r => tcp.close(() => r()))]);
+  }
 });

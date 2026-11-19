@@ -5,6 +5,10 @@ import type { Emit } from './backend.js';
 import { inferMimeFromPath } from './backends/file-attach.js';
 import { runDockerCommand, type AsyncDockerRun } from './docker-command.js';
 
+export const MAX_FILE_REQUESTS_PER_EXECUTION = 64;
+export const MAX_PENDING_FILE_REQUESTS = 4;
+export const FILE_DELIVERY_REJECTION = 'File rejected: check allowed paths, regular-file requirement, and file/count/aggregate limits';
+
 export const CallerFileDeliveryConfig = z.object({
   allowedRoots: z.array(z.string().min(1).max(4096).refine(value =>
     value.startsWith('/workspace/') && !value.endsWith('/') && posix.normalize(value) === value && !value.includes('\0'),
@@ -128,6 +132,13 @@ export function createCallerFileDelivery(container: string, taskId: string, emit
   };
 }
 
+export const callerFileToolSchema = {
+  type: 'object',
+  properties: { path: { type: 'string' }, name: { type: 'string' } },
+  required: ['path'],
+  additionalProperties: false,
+};
+
 // Embedded stdio MCP helper: works with existing Node-equipped caller images.
 // The model supplies only path/name; transport credentials never enter schema.
 export const CALLER_FILE_MCP = String.raw`
@@ -140,7 +151,7 @@ readline.createInterface({input:process.stdin}).on('line',async line=>{
  const reply=result=>out({jsonrpc:'2.0',id:m.id,result});
  if(m.method==='initialize')return reply({protocolVersion:m.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'vicoop-caller-files',version:'1.0.0'}});
  if(m.method==='ping')return reply({});
- if(m.method==='tools/list')return reply({tools:[{name:'send_file',description,inputSchema:{type:'object',properties:{path:{type:'string'},name:{type:'string'}},required:['path'],additionalProperties:false}}]});
+ if(m.method==='tools/list')return reply({tools:[{name:'send_file',description,inputSchema:${JSON.stringify(callerFileToolSchema)}}]});
  if(m.method!=='tools/call'||m.params?.name!=='send_file')return out({jsonrpc:'2.0',id:m.id,error:{code:-32601,message:'Method not found'}});
  try{
   const response=await fetch(url,{method:'POST',headers:{authorization:'Bearer '+token,'content-type':'application/json'},body:JSON.stringify(m.params.arguments),signal:AbortSignal.timeout(20000)});

@@ -1,7 +1,7 @@
 import { spawn as nodeSpawn } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { CALLER_FILE_MCP } from './caller-file-delivery.js';
+import { CALLER_FILE_MCP, FILE_DELIVERY_REJECTION, MAX_FILE_REQUESTS_PER_EXECUTION } from './caller-file-delivery.js';
 import { EventEmitter } from 'node:events';
 import { Duplex, PassThrough, Writable } from 'node:stream';
 import type { createExecutionAuthBroker } from './execution-auth-broker.js';
@@ -182,10 +182,10 @@ export function createExecutionBrokerSpawn(container: string | (() => string), o
             stream.write(Buffer.from(m.data, 'base64'));
           } else if (m.t === 'send-file') {
             if (!deliverFile || fileController.signal.aborted || m.token !== fileToken ||
-                !Number.isSafeInteger(m.id) || m.id < 1 || ++fileRequests > 64) { fail(); return; }
+                !Number.isSafeInteger(m.id) || m.id < 1 || ++fileRequests > MAX_FILE_REQUESTS_PER_EXECUTION) { fail(); return; }
             void deliverFile(m.input, fileController.signal).then(
               result => { if (!fileController.signal.aborted) send({t:'file-result',id:m.id,result}); },
-              () => { if (!fileController.signal.aborted) send({t:'file-result',id:m.id,result:{error:'File rejected: check allowed paths, regular-file requirement, and file/count/aggregate limits'}}); },
+              () => { if (!fileController.signal.aborted) send({t:'file-result',id:m.id,result:{error:FILE_DELIVERY_REJECTION}}); },
             );
           } else if (m.t === 'open') {
             if (!Number.isSafeInteger(m.id) || m.id < 1 || sockets.has(m.id) || sockets.size >= 16) { fail(); return; }

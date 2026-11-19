@@ -8,6 +8,7 @@ import {
   TRACEABILITY_EXTENSION_URI,
   type Part,
 } from '@vicoop-bridge/protocol';
+import { callerFileToolSchema, MAX_FILE_REQUESTS_PER_EXECUTION, MAX_PENDING_FILE_REQUESTS, FILE_DELIVERY_REJECTION } from '../caller-file-delivery.js';
 import type { Backend } from '../backend.js';
 import {
   appendCallerContextInstruction,
@@ -61,6 +62,10 @@ export type CodexSandboxMode = SandboxMode;
 export type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline' | 'remote';
 
 export interface CodexBackendOptions {
+  functionFileDelivery?: {
+    description: string;
+    bind(): (input: unknown, signal: AbortSignal) => Promise<object>;
+  };
   supportedModelIds?: readonly string[];
   command?: string;
   appServerArgs?: readonly string[];
@@ -969,6 +974,34 @@ function extractAgentMessageDelta(params: unknown): string {
   return '';
 }
 
+/** Bind the app-server function to one execution and bound outstanding host-side reads. */
+export function createCodexFileToolHandler(
+  send: (input: unknown, signal: AbortSignal) => Promise<object>,
+  signal: AbortSignal,
+  currentTurn: () => string | null,
+): (call: DynamicToolCallParams) => Promise<DynamicToolCallResponse> {
+  let requests = 0;
+  let pending = 0;
+  return async call => {
+    const turnId = currentTurn();
+    if (call.tool !== 'send_file' || call.namespace != null || signal.aborted ||
+        (turnId !== null && call.turnId !== turnId))
+      return { success: false, contentItems: [] };
+    if (pending >= MAX_PENDING_FILE_REQUESTS || requests >= MAX_FILE_REQUESTS_PER_EXECUTION)
+      return { success: false, contentItems: [{ type: 'inputText', text: 'Attachment request limit reached' }] };
+    pending++;
+    requests++;
+    try {
+      const receipt = await send(call.arguments, signal);
+      return { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(receipt) }] };
+    } catch {
+      return { success: false, contentItems: [{ type: 'inputText', text: FILE_DELIVERY_REJECTION }] };
+    } finally {
+      pending--;
+    }
+  };
+}
+
 export function createCodexBackend(
   opts: CodexBackendOptions = {},
 ): Backend & {close():Promise<void>} {
@@ -1362,7 +1395,7 @@ export function createCodexBackend(
       let registeredThreadId: string | null = null;
       let approvalThreadId: string | undefined;
       const requestApproval = currentApprovalRequester();
-      const approvalLifetime = new AbortController();
+      const turnLifetime = new AbortController();
       try {
         if (signal.aborted) {
           emit({
@@ -1440,6 +1473,7 @@ export function createCodexBackend(
           );
           envelopeModel = undefined;
         }
+        const fileDelivery = envelope === null ? opts.functionFileDelivery : undefined;
         const dynamicTools =
           envelopeTools && callerToolDispatchActive(envelopeTools, envelopeToolChoice)
             ? openaiToolsToDynamicToolSpecs(envelopeTools)
@@ -1773,7 +1807,9 @@ export function createCodexBackend(
                   // codex persists `dynamicTools` with `SessionMeta` and
                   // re-hydrates them on `thread/resume`, so we only send
                   // them on the initial start.
-                  ...(dynamicTools ? { dynamicTools } : {}),
+                  ...(fileDelivery ? { dynamicTools: [{
+                    name: 'send_file', description: fileDelivery.description, inputSchema: callerFileToolSchema,
+                  }] } : dynamicTools ? { dynamicTools } : {}),
                 },
               );
               threadId = startResult.thread.id;
@@ -1791,7 +1827,7 @@ export function createCodexBackend(
             }
             if (approvalDecision === 'remote') {
               approvalThreadId = threadId;
-              approvalHandlers.set(threadId, { request: requestApproval, signal: approvalLifetime.signal });
+              approvalHandlers.set(threadId, { request: requestApproval, signal: turnLifetime.signal });
             }
             // Append prior conversation (if any) as native Responses API
             // items so codex's session builder includes them in the model
@@ -1923,7 +1959,12 @@ export function createCodexBackend(
           // dynamicTools with SessionMeta and the resumed thread can still
           // invoke them. The handler is unregistered in the `finally` of
           // the outer try that wraps the turn loop below.
-          if (envelope) {
+          if (fileDelivery) {
+            const send = fileDelivery.bind();
+            const executionSignal = AbortSignal.any([signal, turnLifetime.signal]);
+            registeredThreadId = threadId;
+            toolCallHandlers.set(threadId, createCodexFileToolHandler(send, executionSignal, () => activeTurnId));
+          } else if (envelope) {
             registeredThreadId = threadId;
             toolCallHandlers.set(threadId, async (p) => {
               capturedToolCall = true;
@@ -2582,7 +2623,7 @@ export function createCodexBackend(
           // one. Map.delete on a missing key is a no-op, so paths that
           // failed before registration (failed start/resume, aborted-before-
           // turn) cost nothing here.
-          approvalLifetime.abort();
+          turnLifetime.abort();
           if (approvalThreadId) approvalHandlers.delete(approvalThreadId);
           if (registeredThreadId) toolCallHandlers.delete(registeredThreadId);
           if (mapped.tempDir) {
