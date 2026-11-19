@@ -1,10 +1,10 @@
-import { OPENAI_COMPAT_EXTENSION_URI, TRACEABILITY_EXTENSION_URI, type AgentCard } from '@vicoop-bridge/protocol';
+import { OPERATION_APPROVAL_EXTENSION_URI, OPENAI_COMPAT_EXTENSION_URI, TRACEABILITY_EXTENSION_URI, type AgentCard } from '@vicoop-bridge/protocol';
 
 /** Match advertised input modes to the caller admission gate, without mutating host cards. */
-export function callerRuntimeCard(card: AgentCard, kind: string, custom = false, fileDelivery = false): AgentCard {
+export function callerRuntimeCard(card: AgentCard, kind: string, custom = false, fileDelivery = false, operations: readonly string[] = []): AgentCard {
   if (fileDelivery && kind !== 'claude' && kind !== 'codex') throw new Error('caller fileDelivery currently supports Claude and Codex only');
-  const outputModes = fileDelivery ? ['text/plain', '*/*'] : ['text/plain'];
-  const outputDescription = fileDelivery ? 'Files can be delivered as inline A2A FileParts through send_file, subject to operator path and size limits.' : 'Output is text only; outgoing files are unsupported.';
+  const outputModes = ['text/plain', ...(operations.length ? ['application/json'] : []), ...(fileDelivery ? ['*/*'] : [])];
+  const outputDescription = [fileDelivery ? 'Files can be delivered as inline A2A FileParts through send_file, subject to operator path and size limits.' : '', operations.length ? 'The agent can emit structured operation proposals for human review.' : ''].filter(Boolean).join(' ') || 'Output is text only; outgoing files are unsupported.';
   const allowed = ['text/plain', 'image/png', 'image/jpeg', 'image/gif', 'image/webp',
     ...(kind === 'claude' ? ['application/pdf'] : [])];
   const inputModes = (card.defaultInputModes ?? allowed).filter(mode => allowed.includes(mode));
@@ -15,17 +15,21 @@ export function callerRuntimeCard(card: AgentCard, kind: string, custom = false,
     ...card,
     description: custom
       ? `${card.description ?? card.name}\n\n${customContract}`
-      : `Caller-isolated ${kind} coding agent with a persistent workspace per authenticated caller. ${inputDescription}${fileDelivery ? ` ${outputDescription}` : ''}`,
+      : `Caller-isolated ${kind} coding agent with a persistent workspace per authenticated caller. ${inputDescription}${fileDelivery || operations.length ? ` ${outputDescription}` : ''}`,
     defaultInputModes: inputModes,
     defaultOutputModes: outputModes,
     capabilities: {
       ...card.capabilities,
-      extensions: card.capabilities?.extensions?.filter(extension => extension.uri !== OPENAI_COMPAT_EXTENSION_URI && extension.uri !== TRACEABILITY_EXTENSION_URI),
+      extensions: [
+        ...(card.capabilities?.extensions ?? []).filter(extension =>
+          ![OPENAI_COMPAT_EXTENSION_URI, TRACEABILITY_EXTENSION_URI, OPERATION_APPROVAL_EXTENSION_URI].includes(extension.uri)),
+        ...(operations.length ? [{ uri: OPERATION_APPROVAL_EXTENSION_URI, required: false, params: { operations } }] : []),
+      ],
     },
     skills: card.skills?.map(skill => ({
       ...skill,
       description: custom ? `${skill.description ?? skill.name}\n\n${customContract}`
-        : `Give an instruction or ask a question in natural language. ${inputDescription}${fileDelivery ? ` ${outputDescription}` : ''}`,
+        : `Give an instruction or ask a question in natural language. ${inputDescription}${fileDelivery || operations.length ? ` ${outputDescription}` : ''}`,
     })),
   };
 }

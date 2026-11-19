@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AgentCard, OPENAI_COMPAT_EXTENSION_URI, TRACEABILITY_EXTENSION_URI } from '@vicoop-bridge/protocol';
+import { AgentCard, OPERATION_APPROVAL_EXTENSION_URI, OPENAI_COMPAT_EXTENSION_URI, TRACEABILITY_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import { resolveBundledCard } from './bundled-cards.js';
 import { callerRuntimeCard } from './caller-runtime-card.js';
 
@@ -49,4 +49,21 @@ test('file delivery is advertised only for explicitly enabled Claude and Codex c
     assert.deepEqual(callerRuntimeCard(card, kind).defaultOutputModes, ['text/plain']);
   }
   assert.throws(() => callerRuntimeCard(AgentCard.parse(resolveBundledCard('claude')), 'openclaw', false, true), /Claude and Codex only/);
+});
+
+test('operations-only caller agents advertise structured proposal output', () => {
+  const host = AgentCard.parse(resolveBundledCard('codex'));
+  const card = callerRuntimeCard(host, 'codex', false, false, ['merge-pr']);
+  assert.deepEqual(card.defaultOutputModes, ['text/plain','application/json']);
+  assert.match(card.description ?? '', /operation proposals/);
+});
+
+test('file delivery and operation approval remain discoverable together', () => {
+  const host = AgentCard.parse(resolveBundledCard('claude'));
+  const card = callerRuntimeCard(host, 'claude', false, true, ['merge-pr']);
+  assert.ok(card.defaultOutputModes?.includes('application/json'));
+  assert.match(card.description!, /FileParts/);
+  assert.match(card.description!, /operation proposals/);
+  assert.deepEqual(card.capabilities?.extensions?.find(e => e.uri === OPERATION_APPROVAL_EXTENSION_URI)?.params,
+    { operations: ['merge-pr'] });
 });

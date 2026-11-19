@@ -207,6 +207,7 @@ test('stripSensitiveMetadata scrubs authorization handoff from rejection history
           _actorId: 'did:web:connector.example',
           _authorizationProfile: 'https://mentionable.dev/ns/oauth-federation/v0.1',
           _authorizationKey: 'federated:v1:private-policy-binding',
+          _operationGrantKey: 'google:domain:example.com',
           _identityVcPresented: [{ profile: { displayName: 'private' } }],
           keep: 1,
         },

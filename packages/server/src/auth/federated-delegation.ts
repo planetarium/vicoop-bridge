@@ -13,7 +13,7 @@ export function formatFederatedDelegation(input: FederatedDelegation): string | 
   return tuple ? FEDERATED_DELEGATION_PREFIX + tuple : null;
 }
 export function parseFederatedDelegation(value: string): FederatedDelegation | null {
-  if (!value.startsWith(FEDERATED_DELEGATION_PREFIX)) return null;
+  if (typeof value !== 'string' || !value.startsWith(FEDERATED_DELEGATION_PREFIX)) return null;
   const tuple = parseFederatedPrincipal(value.slice(FEDERATED_DELEGATION_PREFIX.length));
   if (!tuple || !UUID.test(tuple.subject)) return null;
   const result = { id: tuple.subject, issuer: tuple.issuer, method: tuple.method };

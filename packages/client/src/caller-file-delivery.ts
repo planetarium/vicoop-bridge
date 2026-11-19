@@ -143,7 +143,11 @@ export const callerFileToolSchema = {
 // The model supplies only path/name; transport credentials never enter schema.
 export const CALLER_FILE_MCP = String.raw`
 const readline=require('node:readline');
-const [url,token,description]=process.argv.slice(1);
+const [url,token,description,options]=process.argv.slice(1);
+const {filesEnabled,operations}=JSON.parse(options||'{"filesEnabled":true}');
+const tools=[];
+if(filesEnabled)tools.push({name:'send_file',description,inputSchema:${JSON.stringify(callerFileToolSchema)}});
+if(operations)tools.push({name:'propose_operation',description:'Propose an operation for human review and later execution by a separate host. Proposal never executes it.',inputSchema:{type:'object',properties:{operation:{type:'string',enum:operations},arguments:{type:'object'}},required:['operation','arguments'],additionalProperties:false}});
 const out=value=>process.stdout.write(JSON.stringify(value)+'\n');
 readline.createInterface({input:process.stdin}).on('line',async line=>{
  let m;try{m=JSON.parse(line);}catch{return;}
@@ -151,10 +155,11 @@ readline.createInterface({input:process.stdin}).on('line',async line=>{
  const reply=result=>out({jsonrpc:'2.0',id:m.id,result});
  if(m.method==='initialize')return reply({protocolVersion:m.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'vicoop-caller-files',version:'1.0.0'}});
  if(m.method==='ping')return reply({});
- if(m.method==='tools/list')return reply({tools:[{name:'send_file',description,inputSchema:${JSON.stringify(callerFileToolSchema)}}]});
- if(m.method!=='tools/call'||m.params?.name!=='send_file')return out({jsonrpc:'2.0',id:m.id,error:{code:-32601,message:'Method not found'}});
+ if(m.method==='tools/list')return reply({tools});
+ if(m.method!=='tools/call'||!tools.some(tool=>tool.name===m.params?.name))return out({jsonrpc:'2.0',id:m.id,error:{code:-32601,message:'Method not found'}});
  try{
-  const response=await fetch(url,{method:'POST',headers:{authorization:'Bearer '+token,'content-type':'application/json'},body:JSON.stringify(m.params.arguments),signal:AbortSignal.timeout(20000)});
+  const endpoint=m.params.name==='propose_operation'?new URL('/propose-operation',url):url;
+  const response=await fetch(endpoint,{method:'POST',headers:{authorization:'Bearer '+token,'content-type':'application/json'},body:JSON.stringify(m.params.arguments),signal:AbortSignal.timeout(20000)});
   if(!response.ok)throw Error('Attachment transport rejected request');
   const result=await response.json();
   reply({...(result.error?{isError:true}:{}),content:[{type:'text',text:JSON.stringify(result)}]});

@@ -1,3 +1,5 @@
+import { OPERATION_APPROVAL_EXTENSION_URI } from '@vicoop-bridge/protocol';
+import { proposalEmitter } from './operation-proposals.js';
 import { createCallerFileDelivery } from './caller-file-delivery.js';
 import { createCodexModelCatalogCache } from './codex-model-catalog-cache.js';
 import { assertCallerRuntimeVersion } from './caller-runtime-version.js';
@@ -83,12 +85,21 @@ export async function createCallerRuntime(args: {
       signal.throwIfAborted();
       let taskFiles: ReturnType<typeof createCallerFileDelivery> | undefined;
       let filesHealthy = true;
-      const fileDelivery = config.fileDelivery ? {
-        description: `Deliver a file as an A2A attachment. Allowed roots: ${config.fileDelivery.allowedRoots.join(', ')}. Limit ${config.fileDelivery.maxBytes} bytes per file, ${config.fileDelivery.maxTotalBytes} total bytes and ${config.fileDelivery.maxFiles} files per task.`,
+      let propose: ReturnType<typeof proposalEmitter> | undefined;
+      let operationNames: string[] = [];
+      const fileDelivery = config.fileDelivery || config.operations ? {
+        get operations() { return propose ? operationNames : undefined; },
+        filesEnabled: Boolean(config.fileDelivery),
+        description: config.fileDelivery ? `Deliver a file as an A2A attachment. Allowed roots: ${config.fileDelivery.allowedRoots.join(', ')}. Limit ${config.fileDelivery.maxBytes} bytes per file, ${config.fileDelivery.maxTotalBytes} total bytes and ${config.fileDelivery.maxFiles} files per task.` : '',
         bind: () => {
           const bound = taskFiles;
-          if (!bound) throw new Error('Missing file delivery execution');
-          return (input: unknown, signal: AbortSignal) => bound.send(input, signal);
+          const boundProposal = propose;
+          return async (input: unknown, signal: AbortSignal, tool?: string) => {
+            signal.throwIfAborted();
+            if (tool === 'propose_operation' && boundProposal) return boundProposal(input);
+            if (!bound || (tool && tool !== 'send_file')) throw new Error('Tool unavailable');
+            return bound.send(input, signal);
+          };
         },
       } : undefined;
       const broker =
@@ -154,7 +165,7 @@ export async function createCallerRuntime(args: {
             })
           : createCodexExecutionBackend({
               ...args.codex,
-              functionFileDelivery: codexSelected?.responsesProvider ? fileDelivery : undefined,
+              functionFileDelivery: codexSelected?.responsesProvider && fileDelivery ? fileDelivery : undefined,
               ...(providerModel ? {
                 appServerArgs: codexProviderAppServerArgs(codexSelected),
                 readCodexConfigToml: async () => `model=${JSON.stringify(providerModel)}`,
@@ -171,24 +182,28 @@ export async function createCallerRuntime(args: {
             });
       return {
         bindContainer(next: CallerContainer) {
-          if (next.id !== container.id || next.context !== container.context || processes.size || taskFiles)
+          if (next.id !== container.id || next.context !== container.context || processes.size || taskFiles || propose)
             throw new Error('Cannot rebind an active or unrelated caller worker');
           if (!next.dockerId || !/^[a-f0-9]{64}$/.test(next.dockerId))
             throw new Error('Missing immutable caller container identity');
           boundContainer = next;
         },
-        backend: config.fileDelivery ? {
+        backend: fileDelivery ? {
           ...worker,
           async handle(task, emit, signal) {
-            if (taskFiles) throw new Error('Concurrent file delivery within one caller scope');
-            const files = createCallerFileDelivery(containerId(), task.taskId, emit, signal,
-              config.fileDelivery!, runDockerCommand, () => broker.close());
+            if (taskFiles || propose) throw new Error('Concurrent file delivery within one caller scope');
+            const files = config.fileDelivery ? createCallerFileDelivery(containerId(), task.taskId, emit, signal,
+              config.fileDelivery, runDockerCommand, () => broker.close()) : undefined;
+            operationNames = task.requestedExtensions?.includes(OPERATION_APPROVAL_EXTENSION_URI)
+              ? (config.operations ?? []).filter(name => task.operationNames?.includes(name)) : [];
+            propose = operationNames.length ? proposalEmitter(operationNames, task.taskId, emit, signal) : undefined;
             taskFiles = files;
             try { await worker.handle(task, emit, signal); } finally {
               // Broker exit aborts active reads. Drain their rejection handlers
               // before scope cleanup decides whether this worker is reusable.
-              await files.settle();
-              filesHealthy &&= files.healthy();
+              await files?.settle();
+              filesHealthy &&= files?.healthy() ?? true;
+              propose = undefined;
               taskFiles = undefined;
             }
           },

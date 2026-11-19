@@ -1,3 +1,4 @@
+import { operationGrantIsActive } from './operation-callers.js';
 import { approvalStatus } from './tool-approvals.js';
 import { APPROVAL_EXTENSION_URI, REMOTE_APPROVAL_CAPABILITY } from '@vicoop-bridge/protocol';
 import { WebSocketServer, type WebSocket } from 'ws';
@@ -7,6 +8,8 @@ import {
   parseUpFrame,
   PROTOCOL_VERSION,
   OPENAI_COMPAT_EXTENSION_URI,
+  OPERATION_APPROVAL_EXTENSION_URI,
+  OPERATION_PROPOSAL_TYPE,
   TASK_REPLAY_CAPABILITY,
   EXECUTION_SCOPE_V1_CAPABILITY,
   FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY,
@@ -50,6 +53,7 @@ interface ClientRow {
   client_id: string;
   owner_principal: string;
   owner_email: string | null;
+  owner_revision: string;
   allowed_callers: string[];
   x402_pricing: unknown;
 }
@@ -60,7 +64,7 @@ async function lookupByTokenHash(sql: Sql, hash: string): Promise<ClientRow | nu
   // deleted simply matches nothing and the daemon sees the 4005 "bad token"
   // path.
   const rows = await sql<ClientRow[]>`
-    SELECT id, client_id, owner_principal, owner_email, allowed_callers, x402_pricing
+    SELECT id, client_id, owner_principal, owner_email, allowed_callers, x402_pricing, owner_revision::text
     FROM agents
     WHERE token_hash = ${hash}
   `;
@@ -180,6 +184,7 @@ async function authenticateAndRegister(
     clientId,
     ownerPrincipal,
     ownerEmail: client.owner_email,
+    ownerRevision: Number(client.owner_revision),
     backendKind: frame.backendKind,
     protocolCapabilities: frame.protocolCapabilities,
     identityTrust: frame.identityTrust,
@@ -448,6 +453,22 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         const accepted = acceptTaskFrame(frame);
         if (!accepted || accepted.kind === 'handled') return;
         const { binding: b } = accepted;
+        const taggedProposal = frame.artifact.extensions?.includes(OPERATION_APPROVAL_EXTENSION_URI);
+        const proposalPart = frame.artifact.parts.some(part => part.kind === 'data' && part.data.type === OPERATION_PROPOSAL_TYPE);
+        if (taggedProposal || proposalPart) {
+          const grant = b.operationGrant;
+          const conn = opts.registry.getAgent(b.agentId);
+          const [part] = frame.artifact.parts;
+          if (!taggedProposal || !grant || grant.ownerRevision !== conn?.ownerRevision ||
+              !operationGrantIsActive(grant.grantKey, conn.allowedCallers) ||
+              frame.append || !frame.lastChunk || frame.artifact.parts.length !== 1 ||
+              part?.kind !== 'data' || part.data.type !== OPERATION_PROPOSAL_TYPE ||
+              typeof part.data.operation !== 'string' || !grant.names.includes(part.data.operation)) {
+            opts.registry.sendToAgent(b.agentId, { type: 'task.cancel', taskId: b.taskId, executionId: b.executionId });
+            opts.registry.failTaskBinding(b, 'invalid_operation_proposal', 'Invalid operation proposal');
+            return;
+          }
+        }
         b.sink.pushArtifact({
           taskId: frame.taskId,
           contextId: b.contextId,

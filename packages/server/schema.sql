@@ -1210,9 +1210,9 @@ COMMENT ON COLUMN agents.owner_revision IS E'@omit create,update';
 CREATE OR REPLACE FUNCTION preserve_federation_restriction() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
-  IF ('federation-restricted:v1' = ANY(OLD.allowed_callers)
-      OR EXISTS (SELECT 1 FROM unnest(NEW.allowed_callers) c WHERE c LIKE 'federated-delegation:v1:%'))
-     AND NOT ('federation-restricted:v1' = ANY(NEW.allowed_callers)) THEN
+  IF (array_position(OLD.allowed_callers, 'federation-restricted:v1') IS NOT NULL
+      OR EXISTS (SELECT 1 FROM unnest(OLD.allowed_callers || NEW.allowed_callers) c WHERE c LIKE 'federated-delegation:v1:%'))
+     AND array_position(NEW.allowed_callers, 'federation-restricted:v1') IS NULL THEN
     NEW.allowed_callers := array_append(NEW.allowed_callers, 'federation-restricted:v1');
   END IF;
   RETURN NEW;
@@ -1221,3 +1221,88 @@ $$;
 DROP TRIGGER IF EXISTS preserve_federation_restriction_trigger ON agents;
 CREATE TRIGGER preserve_federation_restriction_trigger BEFORE UPDATE OF allowed_callers ON agents
 FOR EACH ROW EXECUTE FUNCTION preserve_federation_restriction();
+
+-- Only newly created tasks can establish the agent ownership epoch for a proposal.
+ALTER TABLE infra.a2a_tasks ADD COLUMN IF NOT EXISTS operation_owner_revision bigint;
+-- The grant used for a direct caller's negotiated proposal rights. Keep
+-- this separate from the OAuth authorization that governs ordinary task access.
+ALTER TABLE infra.a2a_tasks ADD COLUMN IF NOT EXISTS operation_grant_key text;
+
+-- Operator-reviewed work runs independently of the originating agent execution.
+CREATE TABLE IF NOT EXISTS infra.operation_requests (
+  id uuid PRIMARY KEY,
+  agent_id text NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  agent_owner text NOT NULL,
+  owner_revision bigint NOT NULL,
+  task_id text NOT NULL,
+  artifact_id text NOT NULL,
+  requester text NOT NULL,
+  actor text,
+  profile text NOT NULL,
+  grant_key text NOT NULL,
+  operation text NOT NULL,
+  version text NOT NULL,
+  executor_id text NOT NULL,
+  policy_digest text NOT NULL,
+  arguments jsonb NOT NULL,
+  digest text NOT NULL,
+  expires_at timestamptz NOT NULL,
+  state text NOT NULL DEFAULT 'pending' CHECK (state IN
+    ('pending','approved','denied','cancelled','executing','succeeded','failed','unknown')),
+  decision text CHECK (decision IN ('approve','deny')),
+  decided_by text,
+  decided_principal text,
+  decided_actor text,
+  result text,
+  history jsonb NOT NULL,
+  UNIQUE (agent_id, task_id, artifact_id)
+);
+-- A direct caller acts for itself and has no delegated connector.
+ALTER TABLE infra.operation_requests ALTER COLUMN actor DROP NOT NULL;
+-- Preserve the original requester's revocation after its A2A task is pruned.
+ALTER TABLE infra.operation_requests ADD COLUMN IF NOT EXISTS requester_revoked boolean NOT NULL DEFAULT false;
+ALTER TABLE infra.oauth_token_exchange_access_tokens ADD COLUMN IF NOT EXISTS operation_read_revision bigint;
+CREATE INDEX IF NOT EXISTS operation_requests_queue ON infra.operation_requests
+  (agent_id,operation,expires_at) WHERE state = 'approved';
+
+-- Open caller-runtime agents still verify identity. An open grant stops
+-- being effective when an allowlist is installed, even for a listed user.
+CREATE OR REPLACE FUNCTION infra.operation_grant_active(grant_key text, allowed_callers text[])
+RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS $$
+  SELECT CASE WHEN grant_key = 'public' THEN cardinality(allowed_callers) = 0
+    ELSE COALESCE(grant_key = ANY(allowed_callers), false) END
+$$;
+REVOKE ALL ON FUNCTION infra.operation_grant_active(text,text[]) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION infra.operation_grant_active(text,text[]) TO app_postgraphile;
+
+-- Revocation must survive a later grant re-add or ownership transfer back.
+-- The private ledger can outlive the retention window of the A2A task.
+CREATE OR REPLACE FUNCTION infra.invalidate_operation_approvals() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, infra AS $$
+BEGIN
+  UPDATE infra.a2a_tasks SET operation_grant_key=NULL
+  WHERE owner_agent=OLD.id AND operation_grant_key IS NOT NULL AND
+    (OLD.owner_principal IS DISTINCT FROM NEW.owner_principal OR
+     NOT infra.operation_grant_active(operation_grant_key, NEW.allowed_callers));
+  UPDATE infra.operation_requests SET requester_revoked=true
+  WHERE agent_id=OLD.id AND NOT requester_revoked AND
+    (OLD.owner_principal IS DISTINCT FROM NEW.owner_principal OR NOT infra.operation_grant_active(grant_key, NEW.allowed_callers));
+  UPDATE infra.operation_requests SET state='cancelled',
+    history=history||jsonb_build_object('event','policy_revoked','at',clock_timestamp())
+  WHERE agent_id=OLD.id AND state IN ('pending','approved') AND
+    (OLD.owner_principal IS DISTINCT FROM NEW.owner_principal OR
+     NOT infra.operation_grant_active(grant_key, NEW.allowed_callers) OR
+     (decided_by IS NOT NULL AND NOT infra.operation_grant_active(decided_by, NEW.allowed_callers)));
+  RETURN NULL;
+END;
+$$;
+REVOKE ALL ON FUNCTION infra.invalidate_operation_approvals() FROM PUBLIC;
+DROP TRIGGER IF EXISTS invalidate_operation_approvals ON agents;
+CREATE TRIGGER invalidate_operation_approvals AFTER UPDATE OF allowed_callers,owner_principal ON agents
+FOR EACH ROW WHEN (OLD.allowed_callers IS DISTINCT FROM NEW.allowed_callers OR
+  OLD.owner_principal IS DISTINCT FROM NEW.owner_principal)
+EXECUTE FUNCTION infra.invalidate_operation_approvals();
+-- The earlier legacy blanket infra grant can run again on an existing DB.
+REVOKE ALL ON infra.operation_requests FROM app_anonymous, app_authenticated, PUBLIC;
+GRANT SELECT, INSERT, UPDATE ON infra.operation_requests TO app_postgraphile;
+REVOKE DELETE ON infra.operation_requests FROM app_postgraphile;

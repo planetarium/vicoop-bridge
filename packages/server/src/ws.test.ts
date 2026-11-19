@@ -10,6 +10,8 @@ import {
   EXECUTION_SCOPE_V1_CAPABILITY,
   encodeFrame,
   OPENAI_COMPAT_EXTENSION_URI,
+  OPERATION_APPROVAL_EXTENSION_URI,
+  OPERATION_PROPOSAL_TYPE,
   parseDownFrame,
   PROTOCOL_VERSION,
   TASK_REPLAY_CAPABILITY,
@@ -1186,6 +1188,44 @@ test('sequenced task frames are acknowledged, deduplicated, and completed once',
         frame.type === 'task.ack' ? frame.acceptedSeq : -1),
       [0, 0, 1],
     );
+  } finally {
+    ws.close();
+    await closeServer(server);
+  }
+});
+
+test('operation artifacts require the active execution grant before forwarding', async () => {
+  const server = createServer();
+  const registry = new Registry();
+  attachWsServer(server, { db: mockSql(), registry });
+  const port = await listen(server);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/connect`);
+  try {
+    await once(ws, 'open');
+    ws.send(encodeFrame({ type: 'hello', version: PROTOCOL_VERSION, agentId: 'agent-1', token: 'token',
+      protocolCapabilities: [TASK_REPLAY_CAPABILITY], agentCard: { name: 'agent', version: '1', protocolVersion: '0.3.0' } }));
+    await waitForAgent(registry, 'agent-1');
+    const conn = registry.getAgent('agent-1')!;
+    conn.ownerRevision = 4;
+    for (const scenario of ['allowed', 'untagged', 'unnegotiated', 'other-operation', 'old-owner', 'removed-grant', 'chunk',
+      'direct-grant', 'public', 'public-removed', 'direct-removed']) {
+      const grantKey = scenario.startsWith('public') ? 'public' : scenario.startsWith('direct') ? 'google:domain:example.com' : 'requester';
+      conn.allowedCallers = scenario === 'public' ? [] : ['removed-grant', 'direct-removed', 'public-removed'].includes(scenario) ? ['other'] : [grantKey];
+      const accepts = ['allowed', 'direct-grant', 'public'].includes(scenario);
+      const sink = makeSink();
+      registry.bindTask({ agentId: conn.agentId, taskId: scenario, contextId: 'ctx', sink,
+        executionId: scenario, nextClientSeq: 0,
+        operationGrant: scenario === 'unnegotiated' ? undefined :
+          { names: ['merge-pr'], ownerRevision: scenario === 'old-owner' ? 3 : 4, grantKey } });
+      ws.send(encodeFrame({ type: 'task.artifact', taskId: scenario, executionId: scenario, seq: 0,
+        lastChunk: scenario !== 'chunk', artifact: { artifactId: 'proposal', extensions: scenario === 'untagged' ? [] : [OPERATION_APPROVAL_EXTENSION_URI],
+          parts: [{ kind: 'data', data: { type: OPERATION_PROPOSAL_TYPE,
+            operation: scenario === 'other-operation' ? 'sync' : 'merge-pr', arguments: {} } }] } }));
+      if (accepts) ws.send(encodeFrame({ type: 'task.complete', taskId: scenario, executionId: scenario,
+        seq: 1, status: { state: 'completed' } }));
+      await withTimeout(sink.finished, 5000, scenario);
+      assert.equal(sink.artifacts.length, accepts ? 1 : 0);
+    }
   } finally {
     ws.close();
     await closeServer(server);

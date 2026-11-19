@@ -155,7 +155,9 @@ function receive(m) {
       }
       if (m.fileDelivery) {
         fileServer = http.createServer({maxHeaderSize:4096}, async (req,res) => {
-          if(req.method!=='POST'||req.url!=='/send-file'||req.headers.authorization!=='Bearer '+m.fileDelivery.token||fileResponses.size>=${MAX_PENDING_FILE_REQUESTS}){res.writeHead(403);res.end();return;}
+          const tool=req.url==='/propose-operation'&&m.fileDelivery.operations?'propose_operation':
+            req.url==='/send-file'&&m.fileDelivery.filesEnabled!==false?'send_file':undefined;
+          if(req.method!=='POST'||!tool||req.headers.authorization!=='Bearer '+m.fileDelivery.token||fileResponses.size>=${MAX_PENDING_FILE_REQUESTS}){res.writeHead(403);res.end();return;}
           req.setEncoding('utf8');
           req.setTimeout(15000,()=>req.destroy());
           let body='';
@@ -165,14 +167,16 @@ function receive(m) {
             fileResponses.set(id,res);
             const timer=setTimeout(()=>res.destroy(),20000);
             res.on('close',()=>{clearTimeout(timer);fileResponses.delete(id);});
-            send({t:'send-file',id,token:m.fileDelivery.token,input});
+            send({t:'send-file',id,token:m.fileDelivery.token,input,tool});
           }catch{res.writeHead(400);res.end();}
         });
         fileServer.on('error',()=>shutdown(1));
         await new Promise(resolve=>fileServer.listen(0,'127.0.0.1',resolve));
         if(closing)return;
         const url='http://127.0.0.1:'+fileServer.address().port+'/send-file';
-        const helperArgs=['-e',m.fileDelivery.helper,url,m.fileDelivery.token,m.fileDelivery.description];
+        const helperArgs=['-e',m.fileDelivery.helper,url,m.fileDelivery.token,m.fileDelivery.description,JSON.stringify({
+          filesEnabled:m.fileDelivery.filesEnabled!==false,operations:m.fileDelivery.operations})];
+        const names=[...(m.fileDelivery.filesEnabled!==false?['send_file']:[]),...(m.fileDelivery.operations?['propose_operation']:[])];
         if(m.backend==='codex') {
           // Codex merges CLI tables with persisted config, including transport
           // fields that cannot be unset through TOML overrides. A fresh reserved
@@ -184,13 +188,13 @@ function receive(m) {
           m.args.push('-c',serverKey+'={command="/usr/local/bin/node",args=['+helperArgs.map(v=>JSON.stringify(v).replace(/\u007f/g,'\\u007f')).join(',')+'],enabled=true}');
           // Operator opt-in authorizes this bounded export tool even when
           // remote approvals put the rest of Codex in untrusted mode.
-          m.args.push('-c',serverKey+'.tools.send_file.approval_mode="approve"');
+          for(const name of names)m.args.push('-c',serverKey+'.tools.'+name+'.approval_mode="approve"');
         } else {
           // Replace only the bridge-owned empty strict MCP configuration.
           const index=m.args.indexOf('--mcp-config');
           if(index<0||m.args[index+1]!==JSON.stringify({mcpServers:{}}))return shutdown(1);
           m.args[index+1]=JSON.stringify({mcpServers:{'_vb-send-file':{command:'/usr/local/bin/node',args:helperArgs}}});
-          m.args.push('--allowedTools','mcp___vb-send-file__send_file');
+          m.args.push('--allowedTools',names.map(name=>'mcp___vb-send-file__'+name).join(','));
         }
       }
       child = spawn(m.command, m.args, {cwd:m.cwd, env, detached:true, stdio:['pipe','pipe','pipe']});

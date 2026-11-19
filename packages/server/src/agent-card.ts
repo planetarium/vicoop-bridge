@@ -1,5 +1,7 @@
 import { parseFederatedDelegation } from './auth/federated-delegation.js';
-import { APPROVAL_EXTENSION_URI, REMOTE_APPROVAL_CAPABILITY } from '@vicoop-bridge/protocol';
+import type { OperationDefinition } from './operations.js';
+import { matchingOperationNames, type OperationCallerScheme } from './operation-callers.js';
+import { OPERATION_APPROVAL_EXTENSION_URI, APPROVAL_EXTENSION_URI, REMOTE_APPROVAL_CAPABILITY } from '@vicoop-bridge/protocol';
 import {
   A2A_TRANSPORTS,
   A2XServer,
@@ -32,6 +34,7 @@ export interface AgentA2XOptions {
   publicUrl: string | undefined;
   deviceFlowEnabled: boolean;
   protocolVersion?: ProtocolVersion;
+  operationPolicies?: readonly OperationDefinition[];
   // DB handle for the x402 offering store. Absent on deployments assembled
   // without a payment path; the executor then never installs the gate.
   db?: Sql;
@@ -75,12 +78,19 @@ export function buildAgentA2XServer(
     });
   }
 
+  // Policy belongs to the server. Re-evaluate at dispatch in case a slow turn
+  // waited on billing or storage across an ownership change or reconnect.
+  function operationNamesFor(current: ClientConnection, scheme: OperationCallerScheme): string[] {
+    return matchingOperationNames(current, opts.operationPolicies ?? [], scheme);
+  }
+
   const executor = new WSForwardingExecutor(
     conn.agentId,
     registry,
     taskStore,
     undefined,
     paymentsWired ? { sql: opts.db!, resource: url } : undefined,
+    operationNamesFor,
   );
 
   const a2xServer = new A2XServer({
@@ -128,7 +138,8 @@ export function buildAgentA2XServer(
         requesterApprovalUrlTemplate: `${opts.publicUrl ?? ''}/agents/${encodeURIComponent(conn.agentId)}/approvals/{requestId}` },
     });
   }
-  const wireExtensions = (wire.capabilities?.extensions ?? []).filter(e => e.uri !== APPROVAL_EXTENSION_URI);
+  const declared = wire.capabilities?.extensions ?? [];
+  const wireExtensions = declared.filter(e => e.uri !== APPROVAL_EXTENSION_URI && e.uri !== OPERATION_APPROVAL_EXTENSION_URI);
   const callerRuntime = conn.protocolCapabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) === true;
   const restricted = conn.allowedCallers.length > 0 || callerRuntime;
   const principals = conn.allowedCallers.map(parsePrincipal);
@@ -156,6 +167,15 @@ export function buildAgentA2XServer(
       conn.protocolCapabilities.includes(FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY)
     )) &&
     (principals.some((p) => p?.kind === 'federated') || conn.allowedCallers.some((p) => parseFederatedDelegation(p) !== null));
+  if ((bridgeWillEmitOAuthFederation && operationNamesFor(conn, 'federated').length) ||
+      (allowsGoogle && operationNamesFor(conn, 'google').length) ||
+      (allowsEthereum && operationNamesFor(conn, 'siwe').length)) {
+    a2xServer.addExtension({
+      uri: OPERATION_APPROVAL_EXTENSION_URI, required: false,
+      description: 'Propose a registered host operation for operator review.',
+      params: { registrationUrl: `${opts.publicUrl ?? ''}/agents/${encodeURIComponent(conn.agentId)}/operations` },
+    });
+  }
   for (const extension of wireExtensions) {
     if (callerRuntime && [OPENAI_COMPAT_EXTENSION_URI, TRACEABILITY_EXTENSION_URI].includes(extension.uri)) continue;
     if (extension.uri === SIWE_BEARER_AUTH_EXTENSION_URI) {

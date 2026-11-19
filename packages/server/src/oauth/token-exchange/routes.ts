@@ -365,6 +365,7 @@ export function mountTokenExchangeRoutes(app: Hono, options: TokenExchangeRouteO
         allowedCaller: result.authorizationKey,
         ...(result.attestation !== undefined ? { attestation: result.attestation } : {}),
         scopes: result.scopes,
+        operationReadRevision: result.operationReadRevision,
         ...(result.taskId !== undefined ? { taskId: result.taskId } : {}),
         expiresAt,
       });

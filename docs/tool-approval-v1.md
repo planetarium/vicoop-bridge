@@ -2,7 +2,7 @@
 
 Issue [#71](https://github.com/planetarium/vicoop-bridge/issues/71) covers
 resuming an already-running Claude/Codex permission request. Operation-level
-approval followed by a separate executor is tracked in #544.
+approval followed by a separate executor is described in [operator-approved external operations](./operation-approvals.md).
 
 ## Enable
 

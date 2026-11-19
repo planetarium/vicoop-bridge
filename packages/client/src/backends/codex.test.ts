@@ -4525,3 +4525,28 @@ test('file function bounds concurrent and unsuccessful reads within its executio
   assert.equal((await handle(call)).success, false);
   assert.equal(reads, 64);
 });
+
+
+test('native host functions follow operation negotiation on reused caller contexts', async () => {
+  const fake = makeFakeSpawn(() => happyPath());
+  let enabled = false;
+  const backend = createCodexBackend({
+    spawn: fake.spawn,
+    functionFileDelivery: {
+      filesEnabled: false, description: '',
+      get operations() { return enabled ? ['merge-pr'] : undefined; },
+      bind: () => async () => ({ proposed: true }),
+    },
+  });
+  try {
+    for (const active of [false, true, false]) {
+      enabled = active;
+      await backend.handle(assign('review', 'same-context'), collect().emit, NEVER);
+    }
+    const starts = fake.lastChild().stdinFrames().filter(
+      (frame): frame is { method: string; params: { dynamicTools: {name: string}[] } } =>
+        (frame as {method?: string}).method === 'thread/start',
+    );
+    assert.deepEqual(starts.map(f => f.params.dynamicTools.map(tool => tool.name)), [[], ['propose_operation'], []]);
+  } finally { await backend.close(); }
+});
