@@ -16,6 +16,7 @@ import { createClaudeBrokerSpawn } from './claude-broker-spawn.js';
 import {
   createCodexCredentialReader,
   createCodexAuthBroker,
+  codexProviderAppServerArgs,
 } from './codex-auth-broker.js';
 import { createExecutionBrokerSpawn } from './execution-broker-spawn.js';
 import {
@@ -44,6 +45,7 @@ export async function createCallerRuntime(args: {
     args.kind === 'codex' ? createCodexCredentialReader() : undefined;
   const selected = await (claudeCredential ?? codexCredential)!();
   const codexSelected = codexCredential ? await codexCredential() : undefined;
+  const providerModel = codexSelected?.responsesProvider?.model ?? codexSelected?.azureModel;
   const claudeSettings = args.kind === 'claude' ? selectClaudeCallerSettings(args.claude?.settings) : undefined;
   const catalog = codexCredential ? createCodexModelCatalogCache(codexCredential) : undefined;
   const pool = new DockerCallerRuntimePool(args.kind, config, args.agentId);
@@ -108,6 +110,7 @@ export async function createCallerRuntime(args: {
                 const providerBroker = createCodexAuthBroker({
                   credential: codexCredential!,
                   authentication: selected.kind,
+                  responsesProvider: codexSelected?.responsesProvider,
                   azureEndpoint: codexSelected?.azureEndpoint,
                   azureModel: codexSelected?.azureModel,
                   azureDeployment: codexSelected?.azureDeployment,
@@ -151,9 +154,9 @@ export async function createCallerRuntime(args: {
             })
           : createCodexExecutionBackend({
               ...args.codex,
-              ...(codexSelected?.azureModel ? {
-                appServerArgs: ['app-server', '-c', `model=${JSON.stringify(codexSelected.azureModel)}`],
-                readCodexConfigToml: async () => `model=${JSON.stringify(codexSelected.azureModel)}`,
+              ...(providerModel ? {
+                appServerArgs: codexProviderAppServerArgs(codexSelected),
+                readCodexConfigToml: async () => `model=${JSON.stringify(providerModel)}`,
               } : {}),
               operatorInstructions: callerOperatorInstructions(config),
               runtimeInstructions: [workspaceInstructions, proxyInstructions].filter(Boolean).join('\n\n') || undefined,

@@ -25,7 +25,7 @@ version is 0.153.4. `vicoop-client info` advertises this floor as
 `backends.codex.externalRuntimeSupportedRange`; `supportedRange` retains the
 existing host/bundled-direct range. Supported host sources, selected in order:
 
-1. Explicit Azure provider settings described below, if any are present (incomplete
+1. Explicit host Responses provider or Azure provider settings described below, if any are present (incomplete
    or conflicting Azure settings fail closed).
 2. Explicit `OPENAI_API_KEY` in the bridge environment.
 3. An API key or ChatGPT OAuth login in `$CODEX_HOME/auth.json` (default
@@ -37,9 +37,9 @@ Credentials are reread for each request; an expired token, removed file, or
 changed account fails closed. OAuth must remain valid for at least 30 seconds.
 The bridge never refreshes OAuth or falls back to another account or API key.
 Renew the login on the host and retry; restart after changing accounts or
-environment credentials. Keyring-only logins, arbitrary custom providers, host config profiles and
-`OPENAI_BASE_URL` overrides are unsupported in this profile. The explicit Azure
-provider below is supported independently of host Codex custom-provider config.
+environment credentials. Keyring-only logins, providers selected by the workload, host config profiles and
+`OPENAI_BASE_URL` overrides are unsupported in this profile. The explicit host Responses and Azure
+providers below are supported independently of host Codex custom-provider config.
 
 For direct OpenAI/ChatGPT, only the host config's root `model` setting is inherited. Other host settings,
 MCP servers and credential files are not copied. For OAuth, the host loads the
@@ -63,6 +63,28 @@ The broker permits only POST `/responses` and
 Other routes, query parameters, background requests and unsupported model
 names are rejected. Credentials, account headers and upstream error bodies
 are never accepted from or echoed back to the workload.
+
+## Self-hosted Responses API
+
+Set these three variables on the host bridge service, then restart the service.
+Use an HTTPS base URL that precedes `/responses`. For an Open WebUI installation
+serving `/openai/responses`, the base path is `/openai`.
+
+```sh
+export VICOOP_CODEX_RESPONSES_BASE_URL=https://models.example.org/openai
+export VICOOP_CODEX_RESPONSES_MODEL=example-model
+# Supply VICOOP_CODEX_RESPONSES_API_KEY from the host secret manager.
+```
+
+The broker accepts the configured model ID and supplies the key as a Bearer
+token to the configured origin. The container uses an execution grant. Provider
+selection is exclusive with direct OpenAI and Azure environment settings.
+The self-hosted profile disables Codex sub-agents and hosted web search.
+Codex advertises MCP tools (including native file delivery) as Responses
+namespace tools. File delivery requires an upstream that supports that tool type.
+The upstream must support the Responses features your tasks use, including
+streaming and tool calls. The host must be able to reach it without an interactive
+login. Changing the endpoint, key or model requires restarting the bridge.
 
 ## Azure OpenAI caller containers
 

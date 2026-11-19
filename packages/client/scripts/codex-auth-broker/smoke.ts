@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
 import {randomBytes,randomUUID} from 'node:crypto';
 import {RuntimeContainer} from '../../src/runtime-container.js';
-import {createCodexCredentialReader,createCodexAuthBroker,loadCodexModelCatalog} from '../../src/codex-auth-broker.js';
+import {codexProviderAppServerArgs,createCodexCredentialReader,createCodexAuthBroker,loadCodexModelCatalog} from '../../src/codex-auth-broker.js';
 import {createExecutionBrokerSpawn} from '../../src/execution-broker-spawn.js';
 import {createCodexExecutionBackend} from '../../src/backends/codex-execution.js';
 import type {UpFrame,TaskAssignFrame} from '@vicoop-bridge/protocol';
@@ -22,12 +22,18 @@ const brokers:ReturnType<typeof createCodexAuthBroker>[]=[];
 const codexCatalog=await loadCodexModelCatalog(credential,'0.153.4');
 const adapter=createExecutionBrokerSpawn(container,{backend:'codex',codexCatalog,ttlMs:90000,createBroker:()=>{
  executions++;
- const b=createCodexAuthBroker({credential,authentication:selected.kind,ttlMs:90000});brokers.push(b);return b;
+ const broker = createCodexAuthBroker({
+   credential, authentication: selected.kind, ttlMs: 90000,
+   responsesProvider: selected.responsesProvider, azureEndpoint: selected.azureEndpoint,
+   azureModel: selected.azureModel, azureDeployment: selected.azureDeployment,
+ });
+ brokers.push(broker);
+ return broker;
 }});
 const logger={info(){},warn(){},error(){},debug(){}};
-const model=process.env.VICOOP_SMOKE_CODEX_MODEL;
+const model=selected.responsesProvider?.model ?? selected.azureModel ?? process.env.VICOOP_SMOKE_CODEX_MODEL;
 assert.ok(model,'Set VICOOP_SMOKE_CODEX_MODEL to a model supported by the host account');
-const backend=createCodexExecutionBackend({spawn:adapter.spawn,appServerArgs:['app-server','-c',`model=${JSON.stringify(model)}`],
+const backend=createCodexExecutionBackend({spawn:adapter.spawn,appServerArgs:codexProviderAppServerArgs(selected) ?? ['app-server','-c',`model=${JSON.stringify(model)}`],
  sandboxMode:'danger-full-access',approvalDecision:'accept',initializeTimeoutMs:15000,turnTimeoutMs:60000,logger,
  readCodexConfigToml:async()=>`model=${JSON.stringify(model)}`});
 const task=(text:string,contextId='memory'):TaskAssignFrame=>({type:'task.assign',taskId:randomUUID(),contextId,message:{role:'user',messageId:randomUUID(),parts:[{kind:'text',text}]}});

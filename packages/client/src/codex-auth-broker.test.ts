@@ -232,3 +232,40 @@ test('Azure broker maps only the pinned model, constrains routes and sanitizes f
     broker.revoke(); await assert.rejects(request());
   } finally {broker.revoke();upstream.closeAllConnections();await Promise.all([new Promise<void>(r=>upstream.close(()=>r())),new Promise<void>(r=>tcp.close(()=>r()))]);}
 });
+
+test('host Responses provider pins its HTTPS endpoint, model and dedicated key', async () => {
+  const env: NodeJS.ProcessEnv = {
+    VICOOP_CODEX_RESPONSES_BASE_URL: 'https://model.example/openai/',
+    VICOOP_CODEX_RESPONSES_MODEL: 'example/Model-1',
+    VICOOP_CODEX_RESPONSES_API_KEY: 'fixture',
+  };
+  const reader = createCodexCredentialReader(env);
+  const selected = await reader();
+  assert.deepEqual(selected.responsesProvider, { endpoint: 'https://model.example/openai', model: 'example/Model-1' });
+  for (const endpoint of ['http://model.example', 'https://name@model.example', 'https://model.example/?key=foo', 'https://model.example/#fragment'])
+    assert.throws(() => createCodexCredentialReader({ ...env, VICOOP_CODEX_RESPONSES_BASE_URL: endpoint }));
+  for (const key of Object.keys(env))
+    assert.throws(() => createCodexCredentialReader({ ...env, [key]: undefined }));
+  for (const extra of [azureEnv(), { OPENAI_API_KEY: 'other' }, { OPENAI_BASE_URL: 'https://other.example' }])
+    assert.throws(() => createCodexCredentialReader({ ...env, ...extra }));
+  const options = { credential: reader, responsesProvider: selected.responsesProvider };
+  assert.throws(() => createCodexAuthBroker({ ...options, authentication: 'oauth' }));
+  assert.throws(() => createCodexAuthBroker({ ...options, authentication: 'api-key', upstream: 'http://127.0.0.1' }));
+  const broker = createCodexAuthBroker({ ...options, authentication: 'api-key' });
+  const tcp = tcpServer(socket => broker.attach(socket));
+  tcp.listen(0, '127.0.0.1');
+  await once(tcp, 'listening');
+  try {
+    const request = (model: string) => fetch(`http://127.0.0.1:${(tcp.address() as any).port}/responses`, {
+      method: 'POST', headers: { authorization: `Bearer ${broker.token}` }, body: JSON.stringify({ model }),
+    });
+    assert.equal((await request('gpt-5.4')).status, 403);
+    env.VICOOP_CODEX_RESPONSES_API_KEY = 'replaced';
+    assert.throws(reader, /changed/);
+    assert.equal((await request('example/Model-1')).status, 503);
+    assert.equal(broker.stats.forwarded, 0);
+  } finally {
+    broker.revoke();
+    await new Promise<void>(resolve => tcp.close(() => resolve()));
+  }
+});
