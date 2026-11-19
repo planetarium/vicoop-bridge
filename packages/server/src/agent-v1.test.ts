@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { WebSocket } from 'ws';
 import {
+  OPERATION_APPROVAL_EXTENSION_URI,
   CALLER_CONTEXT_V2_CAPABILITY,
   CALLER_RUNTIME_V1_CAPABILITY,
   EXECUTION_SCOPE_V1_CAPABILITY,
@@ -98,6 +99,36 @@ test('versioned discovery exposes a v1 dual-transport card without changing v0.3
   const v03Card = await v03Response.json() as { protocolVersion: string; url: string };
   assert.equal(v03Card.protocolVersion, '0.3.0');
   assert.equal(v03Card.url, 'https://bridge.example/agents/v1-test-agent');
+});
+
+test('operation approval discovery requires overlapping runtime and current ownership policy on both card versions', async () => {
+  for (const scenario of ['enabled', 'disabled', 'other-operation', 'old-revision', 'ordinary-agent']) {
+    const registry = new Registry();
+    registerAgent(registry);
+    const conn = registry.getAgent('v1-test-agent')!;
+    conn.ownerRevision = 7;
+    conn.protocolCapabilities = scenario === 'ordinary-agent' ? [] : callerRuntimeCapabilities;
+    conn.agentCard.capabilities = { extensions: [{ uri: OPERATION_APPROVAL_EXTENSION_URI,
+      required: true, params: { operations: ['merge-pr'], registrationUrl: 'https://untrusted.example' } }] };
+    const policy = {
+      agentId: conn.agentId, ownerPrincipal: conn.ownerPrincipal, ownerRevision: scenario === 'old-revision' ? 6 : 7,
+      operation: scenario === 'other-operation' ? 'sync' : 'merge-pr', version: '1', executorId: 'host',
+      executorTokenSha256: '0'.repeat(64), operators: [], ttlSeconds: 3600, fields: {},
+    };
+    const app = createHttpApp({ registry, db: fakeSql(), publicUrl: 'https://bridge.example',
+      operationPolicies: scenario === 'disabled' ? [] : [policy] });
+    for (const suffix of ['', '/v1']) {
+      const response = await app.request(`/agents/${conn.agentId}${suffix}/.well-known/agent-card.json`);
+      assert.equal(response.status, 200);
+      const card = await response.json() as AgentCard;
+      const matches = card.capabilities?.extensions?.filter(e => e.uri === OPERATION_APPROVAL_EXTENSION_URI) ?? [];
+      assert.equal(matches.length, scenario === 'enabled' ? 1 : 0, scenario);
+      if (matches.length) {
+        assert.equal(matches[0]!.required, false);
+        assert.deepEqual(matches[0]!.params, { registrationUrl: 'https://bridge.example/agents/v1-test-agent/operations' });
+      }
+    }
+  }
 });
 
 test('all public card surfaces advertise OAuth federation only for capable caller runtimes', async () => {

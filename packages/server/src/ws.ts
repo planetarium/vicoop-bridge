@@ -50,6 +50,7 @@ interface ClientRow {
   client_id: string;
   owner_principal: string;
   owner_email: string | null;
+  owner_revision: string;
   allowed_callers: string[];
   x402_pricing: unknown;
 }
@@ -60,7 +61,7 @@ async function lookupByTokenHash(sql: Sql, hash: string): Promise<ClientRow | nu
   // deleted simply matches nothing and the daemon sees the 4005 "bad token"
   // path.
   const rows = await sql<ClientRow[]>`
-    SELECT id, client_id, owner_principal, owner_email, allowed_callers, x402_pricing
+    SELECT id, client_id, owner_principal, owner_email, allowed_callers, x402_pricing, owner_revision::text
     FROM agents
     WHERE token_hash = ${hash}
   `;
@@ -180,6 +181,7 @@ async function authenticateAndRegister(
     clientId,
     ownerPrincipal,
     ownerEmail: client.owner_email,
+    ownerRevision: Number(client.owner_revision),
     backendKind: frame.backendKind,
     protocolCapabilities: frame.protocolCapabilities,
     identityTrust: frame.identityTrust,

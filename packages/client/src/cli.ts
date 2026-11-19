@@ -570,7 +570,7 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
   const cardRuntime = args.backends?.[args.backend as 'claude' | 'codex']?.caller_runtime;
   const agentCard = parsedCard && args.runtime === 'container'
     ? callerRuntimeCard(parsedCard, args.backend, Boolean(args.card), Boolean(cardRuntime?.fileDelivery),
-      Boolean(cardRuntime?.operations?.length)) : parsedCard;
+      cardRuntime?.operations) : parsedCard;
 
   // Emit the resolved backend at startup so operators can verify which
   // backend the precedence chain picked (flag vs. config vs. default

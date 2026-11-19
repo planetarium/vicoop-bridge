@@ -1,5 +1,6 @@
 import { parseFederatedDelegation } from './auth/federated-delegation.js';
-import { APPROVAL_EXTENSION_URI, REMOTE_APPROVAL_CAPABILITY } from '@vicoop-bridge/protocol';
+import type { OperationDefinition } from './operations.js';
+import { OPERATION_APPROVAL_EXTENSION_URI, APPROVAL_EXTENSION_URI, REMOTE_APPROVAL_CAPABILITY } from '@vicoop-bridge/protocol';
 import {
   A2A_TRANSPORTS,
   A2XServer,
@@ -32,6 +33,7 @@ export interface AgentA2XOptions {
   publicUrl: string | undefined;
   deviceFlowEnabled: boolean;
   protocolVersion?: ProtocolVersion;
+  operationPolicies?: readonly OperationDefinition[];
   // DB handle for the x402 offering store. Absent on deployments assembled
   // without a payment path; the executor then never installs the gate.
   db?: Sql;
@@ -128,7 +130,18 @@ export function buildAgentA2XServer(
         requesterApprovalUrlTemplate: `${opts.publicUrl ?? ''}/agents/${encodeURIComponent(conn.agentId)}/approvals/{requestId}` },
     });
   }
-  const wireExtensions = (wire.capabilities?.extensions ?? []).filter(e => e.uri !== APPROVAL_EXTENSION_URI);
+  const declared = wire.capabilities?.extensions ?? [];
+  const runtimeOperations = declared.find(e => e.uri === OPERATION_APPROVAL_EXTENSION_URI)?.params?.operations;
+  if (conn.protocolCapabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) && Array.isArray(runtimeOperations) &&
+      opts.operationPolicies?.some(p => p.agentId === conn.agentId && p.ownerPrincipal === conn.ownerPrincipal &&
+        p.ownerRevision === conn.ownerRevision && runtimeOperations.includes(p.operation))) {
+    a2xServer.addExtension({
+      uri: OPERATION_APPROVAL_EXTENSION_URI, required: false,
+      description: 'Propose a registered host operation for independent operator review.',
+      params: { registrationUrl: `${opts.publicUrl ?? ''}/agents/${encodeURIComponent(conn.agentId)}/operations` },
+    });
+  }
+  const wireExtensions = declared.filter(e => e.uri !== APPROVAL_EXTENSION_URI && e.uri !== OPERATION_APPROVAL_EXTENSION_URI);
   const callerRuntime = conn.protocolCapabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) === true;
   const restricted = conn.allowedCallers.length > 0 || callerRuntime;
   const principals = conn.allowedCallers.map(parsePrincipal);

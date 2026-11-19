@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { OPERATION_APPROVAL_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import { z } from 'zod';
 import type { Emit } from './backend.js';
 
@@ -34,6 +35,7 @@ export function proposalEmitter(
       artifact: {
         artifactId,
         name: 'operation-proposal',
+        extensions: [OPERATION_APPROVAL_EXTENSION_URI],
         parts: [{ kind: 'data', data: { type: 'vicoop.operation-proposal.v1', ...parsed } }],
       },
     });

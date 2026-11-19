@@ -57,7 +57,9 @@ export function createExecutionBrokerSpawn(container: string | (() => string), o
       if (!stat.isFile() || stagedBytes > 16 * 1024 * 1024) throw new Error('Claude prompt files exceed the staging limit');
       promptFiles.push({argIndex:i,content:readFileSync(path)});
     }
-    const deliverFile = opts.fileDelivery?.bind();
+    const delivery = opts.fileDelivery;
+    const operations = delivery?.operations;
+    const deliverFile = delivery && (delivery.filesEnabled !== false || operations?.length) ? delivery.bind() : undefined;
     const fileToken = deliverFile ? randomBytes(32).toString('hex') : undefined;
     const fileController = new AbortController();
     let fileRequests = 0;
@@ -265,7 +267,7 @@ export function createExecutionBrokerSpawn(container: string | (() => string), o
         services: serviceProxies.map(({name, token, origins}) => ({name, token, origins})),
         ...(serviceProxies.length ? { serviceFetchModule: CREDENTIAL_PROXY_FETCH } : {}),
         authentication: opts.authentication ?? 'oauth',
-        ...(deliverFile ? {fileDelivery:{token:fileToken,helper:CALLER_FILE_MCP,operations:opts.fileDelivery!.operations,filesEnabled:opts.fileDelivery!.filesEnabled,description:opts.fileDelivery!.description}} : {}), files:promptFiles.map((file,id)=>({id,argIndex:file.argIndex})) });
+        ...(deliverFile ? {fileDelivery:{token:fileToken,helper:CALLER_FILE_MCP,operations,filesEnabled:opts.fileDelivery!.filesEnabled,description:opts.fileDelivery!.description}} : {}), files:promptFiles.map((file,id)=>({id,argIndex:file.argIndex})) });
     })().catch(fail);
     return Object.assign(events, {
       ...(opts.backend === 'codex' ? {executionToken: broker.token} : {}),

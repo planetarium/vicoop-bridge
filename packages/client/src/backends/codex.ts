@@ -64,7 +64,9 @@ export type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline' | 'remo
 export interface CodexBackendOptions {
   functionFileDelivery?: {
     description: string;
-    bind(): (input: unknown, signal: AbortSignal) => Promise<object>;
+    filesEnabled?: boolean;
+    operations?: string[];
+    bind(): (input: unknown, signal: AbortSignal, tool?: string) => Promise<object>;
   };
   supportedModelIds?: readonly string[];
   command?: string;
@@ -976,15 +978,16 @@ function extractAgentMessageDelta(params: unknown): string {
 
 /** Bind the app-server function to one execution and bound outstanding host-side reads. */
 export function createCodexFileToolHandler(
-  send: (input: unknown, signal: AbortSignal) => Promise<object>,
+  send: (input: unknown, signal: AbortSignal, tool?: string) => Promise<object>,
   signal: AbortSignal,
   currentTurn: () => string | null,
+  allowedTools: readonly string[] = ['send_file'],
 ): (call: DynamicToolCallParams) => Promise<DynamicToolCallResponse> {
   let requests = 0;
   let pending = 0;
   return async call => {
     const turnId = currentTurn();
-    if (call.tool !== 'send_file' || call.namespace != null || signal.aborted ||
+    if (!allowedTools.includes(call.tool) || call.namespace != null || signal.aborted ||
         (turnId !== null && call.turnId !== turnId))
       return { success: false, contentItems: [] };
     if (pending >= MAX_PENDING_FILE_REQUESTS || requests >= MAX_FILE_REQUESTS_PER_EXECUTION)
@@ -992,10 +995,10 @@ export function createCodexFileToolHandler(
     pending++;
     requests++;
     try {
-      const receipt = await send(call.arguments, signal);
+      const receipt = await send(call.arguments, signal, call.tool);
       return { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(receipt) }] };
     } catch {
-      return { success: false, contentItems: [{ type: 'inputText', text: FILE_DELIVERY_REJECTION }] };
+      return { success: false, contentItems: [{ type: 'inputText', text: call.tool === 'propose_operation' ? 'Proposal rejected' : FILE_DELIVERY_REJECTION }] };
     } finally {
       pending--;
     }
@@ -1474,6 +1477,14 @@ export function createCodexBackend(
           envelopeModel = undefined;
         }
         const fileDelivery = envelope === null ? opts.functionFileDelivery : undefined;
+        const hostTools = fileDelivery ? [
+          ...(fileDelivery.filesEnabled !== false ? [{ name: 'send_file', description: fileDelivery.description, inputSchema: callerFileToolSchema }] : []),
+          ...(fileDelivery.operations?.length ? [{ name: 'propose_operation',
+            description: 'Propose an operation for independent human review and host execution.',
+            inputSchema: { type: 'object', properties: { operation: { type: 'string', enum: fileDelivery.operations }, arguments: { type: 'object' } },
+              required: ['operation', 'arguments'], additionalProperties: false },
+          }] : []),
+        ] : undefined;
         const dynamicTools =
           envelopeTools && callerToolDispatchActive(envelopeTools, envelopeToolChoice)
             ? openaiToolsToDynamicToolSpecs(envelopeTools)
@@ -1617,7 +1628,11 @@ export function createCodexBackend(
           const tNow = now();
           if (sessionReuseEligible) evictExpired(tNow - sessionTtlMs);
           const callerKey = callerContextSessionKey(task.caller);
-          const instructionsKey = createHash('sha256').update(systemPrompt ?? '').digest('hex');
+          // Codex persists dynamic tools at thread/start. A change in negotiated
+          // host tools needs a fresh thread so its tool list matches this turn.
+          const instructionsKey = createHash('sha256')
+            .update(JSON.stringify([systemPrompt ?? '', hostTools]))
+            .digest('hex');
           const stored = sessionReuseEligible ? sessions.get(task.contextId) : undefined;
           const existing = stored?.callerKey === callerKey && stored.instructionsKey === instructionsKey ? stored : undefined;
           let writeId = 0;
@@ -1807,9 +1822,7 @@ export function createCodexBackend(
                   // codex persists `dynamicTools` with `SessionMeta` and
                   // re-hydrates them on `thread/resume`, so we only send
                   // them on the initial start.
-                  ...(fileDelivery ? { dynamicTools: [{
-                    name: 'send_file', description: fileDelivery.description, inputSchema: callerFileToolSchema,
-                  }] } : dynamicTools ? { dynamicTools } : {}),
+                  ...(hostTools ? { dynamicTools: hostTools } : dynamicTools ? { dynamicTools } : {}),
                 },
               );
               threadId = startResult.thread.id;
@@ -1963,7 +1976,7 @@ export function createCodexBackend(
             const send = fileDelivery.bind();
             const executionSignal = AbortSignal.any([signal, turnLifetime.signal]);
             registeredThreadId = threadId;
-            toolCallHandlers.set(threadId, createCodexFileToolHandler(send, executionSignal, () => activeTurnId));
+            toolCallHandlers.set(threadId, createCodexFileToolHandler(send, executionSignal, () => activeTurnId, hostTools?.map(tool => tool.name)));
           } else if (envelope) {
             registeredThreadId = threadId;
             toolCallHandlers.set(threadId, async (p) => {

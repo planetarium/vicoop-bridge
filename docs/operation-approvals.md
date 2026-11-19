@@ -33,6 +33,12 @@ Example server definition (replace the placeholders with deployment values):
 
 Fields are required; extra fields are rejected. Supported values are strings, safe integers and booleans. Use the optional `allowedValues` to pin target identifiers. The host adapter also enforces service-specific constraints and uses upstream preconditions. The model supplies only arguments and a registered operation name. It has no channel to specify a command, executable path, approver, destination URL, executor, credentials, or TTL.
 
+## v1
+
+The optional A2A extension URI is `https://github.com/planetarium/vicoop-bridge/blob/main/docs/operation-approvals.md#v1`. Discover it in `capabilities.extensions` on either Agent Card version. The bridge advertises it when a caller runtime and its current ownership-bound server policy share a configured operation. Its `params.registrationUrl` identifies the registration endpoint. Resolve a relative URL against the card origin and verify the trusted bridge origin before sending credentials.
+
+Request the URI on each proposal-capable turn using `X-A2A-Extensions` (0.3) or `A2A-Extensions` (1.0). The proposal artifact carries the same URI in `extensions`. Ordinary chat works without activation. Activation permits proposal output only. Registration, operator review and host execution use the separate credentials below.
+
 ## Connector contract
 
 The tool emits a single A2A artifact with a new `artifactId` and one DataPart:

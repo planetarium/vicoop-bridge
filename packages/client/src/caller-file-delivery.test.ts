@@ -1,3 +1,4 @@
+import { OPERATION_APPROVAL_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, symlink, link, rm } from 'node:fs/promises';
@@ -246,6 +247,7 @@ for (const kind of ['claude','codex'] as const) test(kind+' caller MCP proposes 
     assert.equal(await new Promise(resolve=>child.on('close',resolve)),0);
     assert.equal(frames.length,1);
     assert.deepEqual(frames[0],{type:'task.artifact',taskId:'task-id',lastChunk:true,artifact:{
+      extensions:[OPERATION_APPROVAL_EXTENSION_URI],
       name:'operation-proposal',artifactId:(frames[0] as {artifact:{artifactId:string}}).artifact.artifactId,
       parts:[{kind:'data',data:{type:'vicoop.operation-proposal.v1',operation:'merge-pr',arguments:{pull:42}}}],
     }});

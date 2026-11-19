@@ -1,4 +1,4 @@
-import { ApprovalDecision } from '@vicoop-bridge/protocol';
+import { ApprovalDecision, OPERATION_APPROVAL_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import { transferAgent } from './agent-transfer.js';
 import { authorizeRequesterApproval, RequesterDecisionBody, requesterApprovalResponse } from './requester-approvals.js';
 import path from 'node:path';
@@ -62,7 +62,7 @@ import {
   rejectAgentRequest,
 } from './agent-auth.js';
 import { CALLER_TOKEN_PREFIX, OWNER_SESSION_PREFIX, verifySessionToken } from './auth/caller-token.js';
-import { mountOperations, type OperationDefinition } from './operations.js';
+import { mountOperations, readOperationRegistry, type OperationDefinition } from './operations.js';
 import { mountDeviceFlow } from './auth/device-flow.js';
 import { mountDeviceUi } from './auth/device-ui.js';
 import { mountTokenRevocation } from './auth/revoke.js';
@@ -191,7 +191,8 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }),
   );
 
-  mountOperations(app, opts.db, opts.operationPolicies);
+  const operationPolicies = opts.operationPolicies ?? readOperationRegistry(process.env.VICOOP_OPERATIONS);
+  mountOperations(app, opts.db, operationPolicies);
 
   // The built-in admin agent and every connected client agent get distinct
   // owner-scoped views of the same Postgres table. A handler can therefore
@@ -223,6 +224,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   const tokenExchangeResourceProfiles = [createMentionableResourceProfile()];
   const agentCardOpts: AgentA2XOptions = {
     publicUrl: opts.publicUrl,
+    operationPolicies,
     deviceFlowEnabled,
     db: opts.db,
   };
@@ -416,6 +418,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         ? message.extensions.filter((value: unknown): value is string => typeof value === 'string')
         : [];
       message.extensions = [...new Set([...existing, ...requestedExtensions])];
+    }
+
+    if (Array.isArray(message.extensions) && message.extensions.includes(OPERATION_APPROVAL_EXTENSION_URI)) {
+      const card = getAgentForConn(conn).getAgentCard() as AgentCardV03;
+      if (!card.capabilities.extensions?.some(ext => ext.uri === OPERATION_APPROVAL_EXTENSION_URI)) {
+        message.extensions = message.extensions.filter(uri => uri !== OPERATION_APPROVAL_EXTENSION_URI);
+      }
     }
 
     stripCallerSuppliedInternalKeys(message);

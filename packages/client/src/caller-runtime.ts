@@ -1,3 +1,4 @@
+import { OPERATION_APPROVAL_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import { proposalEmitter } from './operation-proposals.js';
 import { createCallerFileDelivery } from './caller-file-delivery.js';
 import { createCodexModelCatalogCache } from './codex-model-catalog-cache.js';
@@ -86,7 +87,7 @@ export async function createCallerRuntime(args: {
       let filesHealthy = true;
       let propose: ReturnType<typeof proposalEmitter> | undefined;
       const fileDelivery = config.fileDelivery || config.operations ? {
-        operations: config.operations,
+        get operations() { return propose ? config.operations : undefined; },
         filesEnabled: Boolean(config.fileDelivery),
         description: config.fileDelivery ? `Deliver a file as an A2A attachment. Allowed roots: ${config.fileDelivery.allowedRoots.join(', ')}. Limit ${config.fileDelivery.maxBytes} bytes per file, ${config.fileDelivery.maxTotalBytes} total bytes and ${config.fileDelivery.maxFiles} files per task.` : '',
         bind: () => {
@@ -163,7 +164,7 @@ export async function createCallerRuntime(args: {
             })
           : createCodexExecutionBackend({
               ...args.codex,
-              functionFileDelivery: codexSelected?.responsesProvider ? fileDelivery : undefined,
+              functionFileDelivery: codexSelected?.responsesProvider && fileDelivery ? fileDelivery : undefined,
               ...(providerModel ? {
                 appServerArgs: codexProviderAppServerArgs(codexSelected),
                 readCodexConfigToml: async () => `model=${JSON.stringify(providerModel)}`,
@@ -192,7 +193,8 @@ export async function createCallerRuntime(args: {
             if (taskFiles || propose) throw new Error('Concurrent file delivery within one caller scope');
             const files = config.fileDelivery ? createCallerFileDelivery(containerId(), task.taskId, emit, signal,
               config.fileDelivery, runDockerCommand, () => broker.close()) : undefined;
-            propose = config.operations ? proposalEmitter(config.operations,task.taskId,emit,signal) : undefined;
+            propose = config.operations && task.requestedExtensions?.includes(OPERATION_APPROVAL_EXTENSION_URI)
+              ? proposalEmitter(config.operations,task.taskId,emit,signal) : undefined;
             taskFiles = files;
             try { await worker.handle(task, emit, signal); } finally {
               // Broker exit aborts active reads. Drain their rejection handlers

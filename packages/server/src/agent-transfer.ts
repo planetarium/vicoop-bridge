@@ -93,15 +93,14 @@ export async function transferAgent(
 }
 
 // Management authorization reads Postgres directly; this cache is only for
-// display/telemetry. Periodic reconciliation also repairs missed NOTIFY events
+// discovery and telemetry. Periodic reconciliation also repairs missed NOTIFY events
 // and a hello that raced with the transfer. In-flight tasks are untouched.
 export async function refreshAgentOwners(db: Sql, registry: Registry): Promise<void> {
   const ids = registry.listAgents().map((a) => a.agentId);
   if (!ids.length) return;
-  const rows = await db`SELECT id, owner_principal, owner_email FROM agents WHERE id = ANY(${ids})`;
+  const rows = await db`SELECT id, owner_principal, owner_email, owner_revision::text FROM agents WHERE id = ANY(${ids})`;
   for (const row of rows) {
-    const conn = registry.getAgent(row.id);
-    if (conn) { conn.ownerPrincipal = row.owner_principal; conn.ownerEmail = row.owner_email; }
+    registry.updateOwner(row.id, row.owner_principal, Number(row.owner_revision), row.owner_email);
   }
 }
 

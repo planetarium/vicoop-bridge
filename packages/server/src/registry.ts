@@ -16,6 +16,7 @@ export interface ClientConnection {
   agentId: string;
   clientId: string;
   ownerPrincipal: string;
+  ownerRevision?: number;
   // Owner's email (device-flow registrations); null for SIWE-onboarded clients
   // that only have a wallet principal. Carried for observability/logging.
   ownerEmail?: string | null;
@@ -756,6 +757,16 @@ export class Registry {
 
   onAgentChange(listener: AgentChangeListener): void {
     this.agentChangeListeners.push(listener);
+  }
+
+  updateOwner(agentId: string, principal: string, revision: number, email: string | null): void {
+    const conn = this.agents.get(agentId);
+    if (!conn || (conn.ownerRevision !== undefined && revision < conn.ownerRevision)) return;
+    const changed = conn.ownerPrincipal !== principal || conn.ownerRevision !== revision;
+    conn.ownerPrincipal = principal;
+    conn.ownerRevision = revision;
+    conn.ownerEmail = email;
+    if (changed) this.notifyAgentChange(agentId);
   }
 
   updateAllowedCallers(agentId: string, callers: string[]): void {

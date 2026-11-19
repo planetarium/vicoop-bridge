@@ -77,6 +77,7 @@ test('ownership transfer: identity, authorization, atomicity, concurrency and re
     for (let i = 0; i < 100 && conn.ownerPrincipal !== google; i++) await new Promise((r) => setTimeout(r, 20));
     assert.equal(conn.ownerPrincipal, google);
     assert.equal(conn.ownerEmail, email);
+    assert.equal(conn.ownerRevision, 1);
     const [after] = await db`SELECT * FROM agents WHERE id = ${agentId}`;
     assert.equal(after!.token_hash, agent!.token_hash);
     assert.deepEqual(after!.allowed_callers, agent!.allowed_callers);
