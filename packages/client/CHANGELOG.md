@@ -1,5 +1,11 @@
 # @vicoop-bridge/client
 
+## 0.50.0
+
+### Minor Changes
+
+- 995323d: Support a host-configured HTTPS Responses provider and model for Codex caller containers. Native A2A file delivery uses a function tool on this provider. Operators can map additional upstream headers to host secret environment variables for access gateways.
+
 ## 0.49.2
 
 ### Patch Changes
