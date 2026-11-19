@@ -15,8 +15,13 @@ export async function submitSync(job, env, request = fetch) {
       !/^[a-f0-9]{40}$/.test(revision) || !env.ARGOCD_TOKEN || !env.ARGOCD_REPOSITORY ||
       !Number.isFinite(Date.parse(job.expiresAt)) || Date.parse(job.expiresAt) <= Date.now()) return refused;
 
-  const origin = URL.parse(env.ARGOCD_URL);
-  if (!origin || origin.protocol !== 'https:' || origin.username || origin.password ||
+  let origin;
+  try {
+    origin = new URL(env.ARGOCD_URL);
+  } catch {
+    return refused;
+  }
+  if (origin.protocol !== 'https:' || origin.username || origin.password ||
       origin.pathname !== '/' || origin.search || origin.hash) return refused;
   const endpoint = new URL('/api/v1/applications/' + application, origin);
   const getUrl = new URL(endpoint);
