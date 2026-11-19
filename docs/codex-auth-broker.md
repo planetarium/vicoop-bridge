@@ -76,6 +76,20 @@ export VICOOP_CODEX_RESPONSES_MODEL=example-model
 # Supply VICOOP_CODEX_RESPONSES_API_KEY from the host secret manager.
 ```
 
+When an access gateway requires additional request headers, configure a JSON
+object mapping each header name to a host environment variable name. For example:
+
+```sh
+export VICOOP_CODEX_RESPONSES_EXTRA_HEADERS='{"CF-Access-Client-Id":"DGX_CF_CLIENT_ID","CF-Access-Client-Secret":"DGX_CF_CLIENT_SECRET"}'
+# Supply DGX_CF_CLIENT_ID and DGX_CF_CLIENT_SECRET from the host secret manager.
+```
+
+The host attaches these values to requests to the pinned Responses endpoint,
+including compaction. Header names are case-insensitive. Routing, authentication,
+framing and broker-owned metadata headers are reserved. Missing variables and
+invalid header values fail startup. Restart the host bridge after rotating a
+value or changing its mapping.
+
 The broker accepts the configured model ID and supplies the key as a Bearer
 token to the configured origin. The container uses an execution grant. Provider
 selection is exclusive with direct OpenAI and Azure environment settings.

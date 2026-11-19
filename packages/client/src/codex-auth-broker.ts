@@ -1,6 +1,7 @@
 import semver from 'semver';
 import { BACKENDS_MANIFEST } from './backends-manifest.js';
 import { readFileSync, existsSync } from 'node:fs';
+import { validateHeaderName } from 'node:http';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -21,6 +22,7 @@ type ResponsesProvider = { endpoint: string; model: string };
 export type CodexCredential = {
   kind: 'api-key' | 'oauth';
   secret: string;
+  responsesHeaders?: Readonly<Record<string, string>>;
   accountId?: string;
   responsesProvider?: ResponsesProvider;
   azureEndpoint?: string;
@@ -60,6 +62,41 @@ function responsesProvider(endpoint?: string, model?: string): ResponsesProvider
   return { endpoint: url.href.replace(/\/+$/, ''), model };
 }
 
+// The broker owns routing, framing, authentication and its caller metadata.
+const callerHeaders = ['user-agent', 'session_id', 'conversation_id', 'version'];
+const reservedHeaders = new Set([
+  ...callerHeaders, 'host', 'authorization', 'api-key', 'x-api-key', 'cookie', 'set-cookie',
+  'connection', 'proxy-connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+  'te', 'trailer', 'transfer-encoding', 'upgrade', 'expect', 'content-length', 'content-type',
+  'content-encoding', 'accept-encoding', 'chatgpt-account-id', 'openai-beta', 'originator',
+]);
+
+function readResponsesHeaders(env: NodeJS.ProcessEnv) {
+  const raw = env.VICOOP_CODEX_RESPONSES_EXTRA_HEADERS;
+  const headers: Record<string, string> = Object.create(null);
+  const sources: string[] = [];
+  if (raw !== undefined) {
+    let entries: unknown;
+    try { entries = JSON.parse(raw); } catch { throw new Error('Invalid Codex Responses extra header mapping'); }
+    if (!entries || typeof entries !== 'object' || Array.isArray(entries))
+      throw new Error('Codex Responses extra headers must map header names to environment variable names');
+    for (const [name, source] of Object.entries(entries)) {
+      try { validateHeaderName(name); } catch { throw new Error('Invalid Codex Responses header name'); }
+      const lower = name.toLowerCase();
+      if (reservedHeaders.has(lower) || Object.hasOwn(headers, lower))
+        throw new Error(`Reserved or duplicate Codex Responses header: ${name}`);
+      if (typeof source !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(source))
+        throw new Error(`Invalid environment reference for Codex Responses header: ${name}`);
+      const value = env[source];
+      if (typeof value !== 'string' || !value.trim() || /[^\x20-\x7e]/.test(value))
+        throw new Error(`Missing or invalid value for Codex Responses header: ${name}`);
+      headers[lower] = value;
+      sources.push(source);
+    }
+  }
+  return { headers: Object.freeze(headers), sources };
+}
+
 // Self-hosted Responses servers commonly implement function tools only.
 export function codexProviderAppServerArgs(credential?: CodexCredential): string[] | undefined {
   const model = credential?.responsesProvider?.model ?? credential?.azureModel;
@@ -77,7 +114,8 @@ export function createCodexCredentialReader(
   const azureKeys = ['VICOOP_CODEX_AZURE_ENDPOINT', 'VICOOP_CODEX_AZURE_MODEL',
     'VICOOP_CODEX_AZURE_DEPLOYMENT', 'VICOOP_CODEX_AZURE_API_VERSION', 'AZURE_OPENAI_API_KEY',
     'AZURE_OPENAI_ENDPOINT', 'AZURE_OPENAI_AUTH_TOKEN', 'AZURE_OPENAI_AD_TOKEN', 'AZURE_OPENAI_API_VERSION'];
-  const responsesKeys = ['VICOOP_CODEX_RESPONSES_BASE_URL', 'VICOOP_CODEX_RESPONSES_MODEL', 'VICOOP_CODEX_RESPONSES_API_KEY'];
+  const responsesKeys = ['VICOOP_CODEX_RESPONSES_BASE_URL', 'VICOOP_CODEX_RESPONSES_MODEL', 'VICOOP_CODEX_RESPONSES_API_KEY',
+    'VICOOP_CODEX_RESPONSES_EXTRA_HEADERS'];
   if (responsesKeys.some(key => env[key] !== undefined)) {
     const conflicts = [...azureKeys, 'OPENAI_BASE_URL', 'OPENAI_API_KEY', 'OPENAI_API_VERSION'];
     if (conflicts.some(key => env[key] !== undefined))
@@ -86,11 +124,12 @@ export function createCodexCredentialReader(
     const secret = env.VICOOP_CODEX_RESPONSES_API_KEY;
     if (!secret || !/^[!-~]+$/.test(secret))
       throw new Error('Host Codex Responses API key is unavailable');
-    const settings = [...responsesKeys, ...conflicts].map(key => [key, env[key]] as const);
+    const { headers, sources } = readResponsesHeaders(env);
+    const settings = [...responsesKeys, ...conflicts, ...sources].map(key => [key, env[key]] as const);
     return () => {
       if (settings.some(([key, value]) => env[key] !== value))
         throw new Error('Host Codex Responses configuration changed; restart the bridge');
-      return { kind: 'api-key', secret, responsesProvider: { ...provider } };
+      return { kind: 'api-key', secret, responsesProvider: { ...provider }, responsesHeaders: headers };
     };
   }
   if (azureKeys.some(key => env[key] !== undefined)) {
@@ -286,6 +325,7 @@ export function createCodexAuthBroker(opts: {
       )
         throw new BrokerRejection(503);
       const headers: Record<string, string> = {
+        ...(custom ? credential.responsesHeaders : undefined),
         'content-type': 'application/json',
         ...(azure ? {'api-key': credential.secret} : {authorization: `Bearer ${credential.secret}`}),
       };
@@ -296,12 +336,7 @@ export function createCodexAuthBroker(opts: {
         headers['openai-beta'] = 'responses=experimental';
         headers.originator = 'codex_cli_rs';
       }
-      for (const name of [
-        'user-agent',
-        'session_id',
-        'conversation_id',
-        'version',
-      ]) {
+      for (const name of callerHeaders) {
         if (typeof req.headers[name] === 'string')
           headers[name] = req.headers[name];
       }

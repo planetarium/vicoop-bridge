@@ -19,6 +19,7 @@ import { Registry } from '../src/registry.js';
 import { ensureSchema } from '../src/db.js';
 import { issueSessionToken } from '../src/auth/caller-token.js';
 import { Client } from '../../client/src/client.js';
+import { createCodexCredentialReader } from '../../client/src/codex-auth-broker.js';
 import { createCallerRuntime } from '../../client/src/caller-runtime.js';
 import { CallerRuntimeConfig } from '../../client/src/caller-runtime-config.js';
 import { runDockerCommand } from '../../client/src/docker-command.js';
@@ -26,8 +27,11 @@ import { DockerCallerRuntimePool } from '../../client/src/caller-runtime-docker.
 
 const image = process.env.VICOOP_SMOKE_CODEX_IMAGE ?? process.env.VICOOP_AZURE_SMOKE_IMAGE;
 assert.ok(image, 'Set VICOOP_SMOKE_CODEX_IMAGE to a pinned real Codex caller image');
-const secret = process.env.VICOOP_CODEX_RESPONSES_API_KEY ?? process.env.AZURE_OPENAI_API_KEY;
-assert.ok(secret, 'Set host-only Responses or Azure provider authentication');
+assert.ok(process.env.VICOOP_CODEX_RESPONSES_API_KEY || process.env.AZURE_OPENAI_API_KEY,
+  'Set host-only Responses or Azure provider authentication');
+const credential = await createCodexCredentialReader()();
+const secrets = [credential.secret, ...Object.values(credential.responsesHeaders ?? {})];
+const containsCredential = (text: string) => secrets.some(secret => text.includes(secret));
 const id = `azure-a2a-${randomUUID()}`;
 const databaseContainer = `${id}-postgres`;
 const databaseName = `vicoop_azure_smoke_${randomUUID().replaceAll('-', '')}`;
@@ -51,7 +55,7 @@ let credentialInLogs = false;
 const originalLog = console.log, originalWarn = console.warn, originalError = console.error;
 const captureLog = (...args: unknown[]) => {
   const line = args.map(arg => typeof arg === 'string' ? arg : JSON.stringify(arg)).join(' ');
-  credentialInLogs ||= line.includes(secret!);
+  credentialInLogs ||= containsCredential(line);
 };
 // Suppress repetitive HTTP polling logs; scan every line before discarding it.
 console.log = captureLog; console.warn = captureLog; console.error = captureLog;
@@ -114,7 +118,7 @@ try {
       headers:{'Content-Type':'application/json', Authorization:`Bearer ${caller.rawToken}`},
       body:JSON.stringify({jsonrpc:'2.0',id:randomUUID(),method,params})});
     const body = await response.json() as any;
-    assert.ok(!JSON.stringify(body).includes(secret!), 'provider credential exposed in A2A response');
+    assert.ok(!containsCredential(JSON.stringify(body)), 'provider credential exposed in A2A response');
     assert.ok(response.ok && !body.error, `A2A ${method} failed (details withheld)`);
     return body.result;
   }
