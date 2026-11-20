@@ -1,3 +1,4 @@
+import { loadOutboundSigner } from './outbound-signature.js';
 import { watchAgentOwners } from './agent-transfer.js';
 import { serve } from '@hono/node-server';
 import { Registry } from './registry.js';
@@ -85,6 +86,8 @@ export interface ServerOptions {
 }
 
 export async function startServer(opts: ServerOptions) {
+  const signingKey = process.env.VICOOP_OUTBOUND_KEY_FILE;
+  const outboundSigner = signingKey ? loadOutboundSigner(signingKey) : undefined;
   const policies = readOperationRegistry(process.env.VICOOP_OPERATIONS);
   await reconcileOperationPolicies(opts.db, policies);
   const registry = new Registry();
@@ -105,6 +108,7 @@ export async function startServer(opts: ServerOptions) {
 
   attachWsServer(server as unknown as import('node:http').Server, {
     db: opts.db,
+    outboundSigner,
     registry,
   });
 
