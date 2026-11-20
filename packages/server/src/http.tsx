@@ -108,6 +108,7 @@ import {
 } from './oauth/token-exchange/authorization.js';
 
 export interface ServerHttpOptions {
+  publicationAuthority?: ReturnType<typeof import('./outbound-signature.js').loadOutboundSigner>;
   operationPolicies?: OperationDefinition[];
   registry: Registry;
   publicUrl?: string;
@@ -648,7 +649,16 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // the bridge's own admin agent at `@admin@<bridge-host>`. The agentId
   // "admin" is reserved (see reserved-agent-ids.ts) so a connected client
   // cannot shadow the admin entry.
+  const authority = opts.publicationAuthority;
   const wellKnownDeps: WellKnownDeps = {
+    publicationIdentity: authority ? async local => {
+      const rows = await opts.db<{ id: string; client_id: string; owner_revision: string }[]>`
+        SELECT id, client_id, owner_revision::text FROM agents WHERE lower(id) = lower(${local}) LIMIT 2
+      `;
+      if (rows.length !== 1) return;
+      const identity = authority.identity(rows[0]);
+      if (identity) return { ...identity, keys: authority.keys };
+    } : undefined,
     listAgents: () => opts.registry.listAgents(),
     getAgentCard: (conn) => getAgentForConn(conn).getAgentCard() as AgentCardV03,
     adminCard,

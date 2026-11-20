@@ -2041,7 +2041,7 @@ test('private signing socket negotiates the daemon connection and correlates res
   const path = dir + '/s';
   const socket = await listenOutbound(path, input => client.signOutbound(input));
   t.after(() => new Promise<void>(resolve => socket.close(() => resolve())));
-  const input = { target: 'https://receiver.example/a2a', recipient: 'ops', digest: Buffer.alloc(32).toString('base64') };
+  const input = { target: 'https://receiver.example/a2a', digest: Buffer.alloc(32).toString('base64') };
   function post(payload: object) {
     return new Promise<{ status?: number; body: string }>((resolve, reject) => {
       const req = request({ method: 'POST', socketPath: path, path: '/sign' }, res => {
@@ -2060,16 +2060,16 @@ test('private signing socket negotiates the daemon connection and correlates res
   wss.on('connection', ws => ws.on('message', data => {
     const frame = parseUpFrame(data.toString());
     if (frame.type === 'hello') {
-      assert.ok(frame.protocolCapabilities?.includes('outbound-http-signature-v1'));
-      ws.send(encodeFrame({ type: 'hello.ack', protocolCapabilities: ['outbound-http-signature-v1'],
+      assert.ok(frame.protocolCapabilities?.includes('publication-web-bot-auth-draft-01'));
+      ws.send(encodeFrame({ type: 'hello.ack', protocolCapabilities: ['publication-web-bot-auth-draft-01'],
         disconnectGraceMs: 0, maxFrameBytes: 8192 }));
     }
     if (frame.type === 'outbound.sign') {
       assert.deepEqual(frame.request, input);
       ws.send(encodeFrame({ type: 'outbound.result', requestId: crypto.randomUUID(), headers: null }));
       ws.send(encodeFrame({ type: 'outbound.result', requestId: frame.requestId, headers: {
-        'content-type': 'application/json', 'content-digest': 'digest', 'vicoop-recipient': 'ops',
-        'vicoop-sender': 'subject', signature: 'proof', 'signature-input': 'params',
+        'content-type': 'application/json', 'content-digest': 'digest',
+        'signature-agent': 'sig1="https://agents.example/id"', signature: 'proof', 'signature-input': 'params',
       } }));
       completed = true;
     }

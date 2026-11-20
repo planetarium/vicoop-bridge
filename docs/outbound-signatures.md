@@ -1,10 +1,10 @@
 # Signing an outbound publication
 
-A trusted host can send a new JSON POST without an A2A Task. The bridge issues an Ed25519 HTTP Message Signature over the daemon's authenticated WebSocket. The host sends the publication directly to its receiver. Both sides must opt in to the v1 profile.
+A trusted host can send a new JSON POST without an A2A Task. The bridge issues an Ed25519 HTTP Message Signature over the daemon's authenticated WebSocket. The host sends the publication directly to its receiver. Both direct agents and delegated bridge signers use [Web Bot Auth draft-01](https://www.ietf.org/archive/id/draft-ietf-webbotauth-httpsig-protocol-01.html) with the request-binding rules below.
 
 ## Configure keys and the daemon
 
-Generate a dedicated Ed25519 key pair on the bridge, for example with `openssl genpkey -algorithm Ed25519 -out signing.pem` under umask 077. Export the public key with `openssl pkey -in signing.pem -pubout -out signing.pub`. Set `VICOOP_OUTBOUND_KEY_FILE` to the private PEM path on each server before starting it. Distribute the public PEM through trusted receiver configuration and assign it to this bridge issuer. Each issuer needs its own keys. The key ID is unpadded base64url of SHA-256 over the DER SubjectPublicKeyInfo.
+Generate a dedicated Ed25519 key pair on the bridge, for example with `openssl genpkey -algorithm Ed25519 -out signing.pem` under umask 077. Export the public key with `openssl pkey -in signing.pem -pubout -out signing.pub`. Set `VICOOP_OUTBOUND_KEY_FILE` to the private PEM path on each server before starting it. Set PUBLIC_URL to the canonical HTTPS address-domain origin (default port). The bridge serves WebFinger and the public verification keys there. Each issuer needs its own keys. The key ID is unpadded base64url of the SHA-256 JWK thumbprint (RFC 8037 Appendix A.3), computed over the UTF-8 JSON object containing only `crv`, `kty`, and `x` in that order, without whitespace.
 
 On the POSIX daemon host, choose an absolute canonical path of at most 103 bytes in an owner-only directory. For example, create it with `install -d -m 700 "$HOME/.vicoop-outbound"` and start the daemon with `VICOOP_OUTBOUND_SOCKET="$HOME/.vicoop-outbound/sign.sock" vicoop-client start`. All processes with access to that socket can act as the daemon's registered agent. If a crash leaves a socket file, first confirm the owning daemon has exited before removing it.
 
@@ -14,26 +14,32 @@ Save the exact UTF-8 JSON request in `message.json`, including its stable messag
 
 ```sh
 set -eu
-target=https://receiver.example/a2a
-recipient=ops-notices
+target=https://connector.example/api/publications
 digest=$(openssl dgst -sha256 -binary message.json | openssl base64 -A)
-request=$(jq -nc --arg target "$target" --arg recipient "$recipient" --arg digest "$digest" '{target:$target,recipient:$recipient,digest:$digest}')
+request=$(jq -nc --arg target "$target" --arg digest "$digest" '{target:$target,digest:$digest}')
 headers=$(curl -fsS --unix-socket "$HOME/.vicoop-outbound/sign.sock" \
   --json "$request" http://localhost/sign)
 printf '%s' "$headers" | jq -er 'to_entries[] | "\(.key): \(.value)"' | \
-  curl -fsS --header @- --data-binary @message.json "$target"
+  curl -fsS --header @- -H 'A2A-Version: 1.0' \
+    -H 'A2A-Extensions: https://mentionable.dev/ns/publication/v0.1' --data-binary @message.json "$target"
 ```
 
-Use a canonical absolute HTTPS URL without credentials or a fragment. The recipient is an opaque, case-sensitive identifier. The daemon returns HTTP 400 for invalid input and 503 when disconnected, busy, or connected to a bridge without signing enabled. Retry with backoff. Keep signing responses and signature headers out of logs and shell traces.
+Use a canonical absolute HTTPS URL without credentials or a fragment. The exact target URI identifies the recipient. The daemon returns HTTP 400 for invalid input and 503 when disconnected, busy, or connected to a bridge without signing enabled. Retry with backoff. Keep signing responses and signature headers out of logs and shell traces.
 
 ## Verify before dispatch
 
 The [runnable Node receiver example](../examples/outbound/verify.mjs) implements the fixed [RFC 9421](https://www.rfc-editor.org/rfc/rfc9421.html) profile and checks [RFC 9530](https://www.rfc-editor.org/rfc/rfc9530.html) content integrity. Pass it the actual external target URI (including query), actual method, HTTP headers and raw entity bytes before JSON parsing. Use trusted proxy configuration to establish the external URI. Require unencoded application/json. Use only the signed body for destination, reply target and message ID.
 
-The signature covers, in order, `@method`, `@target-uri`, `content-type`, `content-digest`, `vicoop-recipient` and `vicoop-sender`. The last field is unpadded base64url of a UTF-8 JSON array containing agent ID, registration client ID and decimal ownership revision as strings. The signature parameters require a 60-second lifetime, a random nonce, the bridge key ID, ed25519 and the purpose tag `vicoop-publish-v1`. Allow five seconds of clock skew. Check the recipient against local configuration.
+The sender uses the RFC 9421 label `sig1` and sends `Signature-Agent: sig1="https://agents.example/agents/7"`. This URL serves the public JWK Set for one permanent principal. The application requires a canonical, query-free HTTPS principal URL. Use distinct paths for distinct principals, including when several principals delegate to the same bridge key.
 
-Select the issuer and its pinned key set from receiver configuration. Scope posting grants to that issuer and the returned identity tuple. Transfer changes the revision, and a new registration has its own client ID. A previously issued signature remains valid for its bounded lifetime. For normal rotation, install the new public key alongside the old one on every receiver, switch all issuers, then retain the old public key for at least 65 seconds after its last issuance (plus any clock difference between issuer and receiver). Remove a compromised key immediately.
+Cover `"@method" "@target-uri" "content-type" "content-digest" "signature-agent";key="sig1"` in that order. The last component's value in the signature base is the quoted URL alone. Use the signature parameters shown in the fixture, a 60-second lifetime, a fresh lowercase UUIDv4 nonce, the Ed25519 JWK thumbprint, `alg="ed25519"` and `tag="web-bot-auth"`. Allow five seconds of clock skew. Match the actual target to the publication endpoint configured by the receiver.
 
-Supply an atomic `consumeNonce(nonce, retainUntilEpochSeconds)` shared across all receiver instances, scoped by issuer. Return true only on first insertion and retain the entry through its acceptance window. On a lost HTTP response, obtain a fresh signature for the same bytes. The receiver owns destination and reply permissions and durable publication deduplication by sender and message ID. Record the body digest alongside the result and reject reuse of an ID with different content.
+At channel approval, resolve the administrator's `acct:local@domain` at that domain's HTTPS WebFinger endpoint. Require the exact JRD subject and one `https://mentionable.dev/ns/rel/publication-identity` link. Store that account and linked URL with the channel grant. During submission, use the requested destination or parent publication to look up the expected active grant in receiver storage. Use the matching signed agent URL to distinguish principals where multiple grants exist. The reference verifier takes that trusted `grant: { address, id }` as input. Require its ID, the current WebFinger href, and the labeled Signature-Agent member to agree. Resolve the linked URL and verify using a public key in its JWK Set whose computed thumbprint matches `keyid`. The account address travels in discovery. The bridge derives the signing URL from its authenticated registration.
 
-The [conformance fixture](../examples/outbound/fixture.json) contains a complete signed request, the exact UTF-8 body string, a public verification key, verification time and expected sender. Use the fixture time when testing expiration.
+The [standalone direct signer](../examples/outbound/sign-direct.mjs) can use its own authorized key. The [example verifier](../examples/outbound/verify.mjs) accepts configured HTTPS origins and a JSON loader. Fetch directly with HTTP 200, no redirects, bounded responses and timeouts. Revalidate current discovery before accepting publication and check the active grant on queued dispatch. Key rotation preserves the URL. Transfer or re-registration requires reapproval for a new URL.
+
+For rolling key changes, set `VICOOP_OUTBOUND_PUBLIC_KEYS_FILE` to a JSON array of public PEM strings for overlap. First deploy the next public key on every instance, switch the signing key on all instances while advertising both public keys, then remove the retired key after the last signature acceptance window. The active key is always included. For compromise, remove the affected key from all instances immediately.
+
+Supply an atomic `consumeNonce(id, nonce, retainUntilEpochSeconds)` shared by receiver instances. On a lost response, sign the same message and bytes again. The receiver owns durable deduplication by ID and message ID, destination authorization and reply permissions.
+
+The [public test vectors](../examples/outbound/fixture.json) provide WebFinger, the JWK Set, a channel grant, exact signature bases, and valid direct/delegated signatures produced independently with OpenSSL. They include invalid body, target, identity and signature-label cases. Use the fixture time for offline verification. Upgrade the server and daemon together for signing and use a receiver implementing this profile.

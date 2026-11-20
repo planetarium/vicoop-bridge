@@ -1,21 +1,288 @@
 {
-  "publicKey": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAMxmeDId490sYm+QxGtJBzhE9TeDdtoQodV4m6qIcU7Q=\n-----END PUBLIC KEY-----\n",
-  "now": 1795169410,
-  "method": "POST",
-  "url": "https://receiver.example/a2a?profile=publication",
-  "recipient": "reports",
-  "body": "{\"messageId\":\"notice-42\",\"destination\":\"operations\",\"replyTo\":\"parent-7\",\"text\":\"점검 완료\"}",
-  "headers": {
-    "content-type": "application/json",
-    "content-digest": "sha-256=:jLlkc1STNplDNRLhFCdV1DvWuPanpXRPajyNr7VQfr0=:",
-    "vicoop-sender": "WyJvcGVyYXRpb25zIiwicmVnaXN0cmF0aW9uLTEiLCIwIl0",
-    "vicoop-recipient": "reports",
-    "signature-input": "sig1=(\"@method\" \"@target-uri\" \"content-type\" \"content-digest\" \"vicoop-recipient\" \"vicoop-sender\");created=1795169410;expires=1795169470;nonce=\"13b87f08-8de8-490e-b9dd-5eb76ec2b9f5\";keyid=\"P0S18pe8Fa4DSa75SgWnCYVrx_jqYZPOK9Gu-I40WOY\";alg=\"ed25519\";tag=\"vicoop-publish-v1\"",
-    "signature": "sig1=:362D3Tt4Ozgy6tymmPcrl771l8hGaEvGbDKAXJ++htZQfkgMQzuQdh7yuYoHB64R4QShnaGehWjIAi4Qy0EvBg==:"
+  "audience": "https://connector.example/api/publications",
+  "subject": "https://agents.example/agents/7",
+  "now": 1767225610,
+  "maxWindowSeconds": 60,
+  "clockSkewSeconds": 5,
+  "discovery": {
+    "webfinger": {
+      "url": "https://agents.example/.well-known/webfinger?resource=acct%3Aops%40agents.example",
+      "document": {
+        "subject": "acct:ops@agents.example",
+        "links": [
+          {
+            "rel": "https://mentionable.dev/ns/rel/publication-identity",
+            "type": "application/jwk-set+json",
+            "href": "https://agents.example/agents/7"
+          }
+        ]
+      }
+    },
+    "identity": {
+      "url": "https://agents.example/agents/7",
+      "document": {
+        "keys": [
+          {
+            "crv": "Ed25519",
+            "kty": "OKP",
+            "x": "2s0Gt2RC0UDjg-ZZiSTMnpZnBx0OSfnb2LD0abDuyUg",
+            "kid": "CO-xthfSXnUCPAuyd1IsA2mPhhB6LsP9lTtKRUUQXV8"
+          },
+          {
+            "crv": "Ed25519",
+            "kty": "OKP",
+            "x": "mgpnOoZJFIcnhPn6z4ChK9wOW2WVEOwS2YJN5GGhwZY",
+            "kid": "u67W9HUm4W4vo4VsGdeIJ45NYSAsBMQw6C_71fyvN-Q"
+          }
+        ]
+      }
+    }
   },
-  "expected": {
-    "agentId": "operations",
-    "clientId": "registration-1",
-    "ownerRevision": "0"
-  }
+  "profile": "draft-ietf-webbotauth-httpsig-protocol-01 / request-bound publication",
+  "grant": {
+    "address": "acct:ops@agents.example",
+    "id": "https://agents.example/agents/7"
+  },
+  "valid": [
+    {
+      "name": "direct",
+      "request": {
+        "method": "POST",
+        "url": "https://connector.example/api/publications",
+        "headers": [
+          [
+            "a2a-version",
+            "1.0"
+          ],
+          [
+            "a2a-extensions",
+            "https://mentionable.dev/ns/publication/v0.1"
+          ],
+          [
+            "content-type",
+            "application/json"
+          ],
+          [
+            "content-digest",
+            "sha-256=:v9sylBTBSFkki1ML2WJQnExwhc3OZf089j6vJ69oyT8=:"
+          ],
+          [
+            "signature-agent",
+            "sig1=\"https://agents.example/agents/7\""
+          ],
+          [
+            "signature-input",
+            "sig1=(\"@method\" \"@target-uri\" \"content-type\" \"content-digest\" \"signature-agent\";key=\"sig1\");created=1767225600;expires=1767225660;nonce=\"54b4890f-8582-4a32-a492-c623214ce280\";keyid=\"CO-xthfSXnUCPAuyd1IsA2mPhhB6LsP9lTtKRUUQXV8\";alg=\"ed25519\";tag=\"web-bot-auth\""
+          ],
+          [
+            "signature",
+            "sig1=:a7yRpLzuAJus/rzVkEt+tPcikdOpmVxgY8Mi6+fsJ2RivmEE508MZEfdWbxHTrcJTvaWyBe6S6lBf4+25escCw==:"
+          ]
+        ],
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"SendMessage\",\"params\":{\"message\":{\"messageId\":\"fixture-notice-1\",\"role\":\"ROLE_USER\",\"parts\":[{\"text\":\"Deploy finished\"}],\"extensions\":[\"https://mentionable.dev/ns/publication/v0.1\"],\"metadata\":{\"https://mentionable.dev/ns/publication/v0.1\":{\"destinationId\":\"dst_fixture\"}}}}}"
+      },
+      "signatureBase": "\"@method\": POST\n\"@target-uri\": https://connector.example/api/publications\n\"content-type\": application/json\n\"content-digest\": sha-256=:v9sylBTBSFkki1ML2WJQnExwhc3OZf089j6vJ69oyT8=:\n\"signature-agent\";key=\"sig1\": \"https://agents.example/agents/7\"\n\"@signature-params\": (\"@method\" \"@target-uri\" \"content-type\" \"content-digest\" \"signature-agent\";key=\"sig1\");created=1767225600;expires=1767225660;nonce=\"54b4890f-8582-4a32-a492-c623214ce280\";keyid=\"CO-xthfSXnUCPAuyd1IsA2mPhhB6LsP9lTtKRUUQXV8\";alg=\"ed25519\";tag=\"web-bot-auth\"",
+      "expected": {
+        "address": "acct:ops@agents.example",
+        "id": "https://agents.example/agents/7"
+      }
+    },
+    {
+      "name": "delegated",
+      "request": {
+        "method": "POST",
+        "url": "https://connector.example/api/publications",
+        "headers": [
+          [
+            "a2a-version",
+            "1.0"
+          ],
+          [
+            "a2a-extensions",
+            "https://mentionable.dev/ns/publication/v0.1"
+          ],
+          [
+            "content-type",
+            "application/json"
+          ],
+          [
+            "content-digest",
+            "sha-256=:v9sylBTBSFkki1ML2WJQnExwhc3OZf089j6vJ69oyT8=:"
+          ],
+          [
+            "signature-agent",
+            "sig1=\"https://agents.example/agents/7\""
+          ],
+          [
+            "signature-input",
+            "sig1=(\"@method\" \"@target-uri\" \"content-type\" \"content-digest\" \"signature-agent\";key=\"sig1\");created=1767225600;expires=1767225660;nonce=\"54b4890f-8582-4a32-a492-c623214ce281\";keyid=\"u67W9HUm4W4vo4VsGdeIJ45NYSAsBMQw6C_71fyvN-Q\";alg=\"ed25519\";tag=\"web-bot-auth\""
+          ],
+          [
+            "signature",
+            "sig1=:f0gaEtZrkqkCJMrI0K5iW11bEvo1Wyz1VCUR5Eie/CnfTY4tIUvPkTjmPYy7CsBeiu2YA3uwm9VyHdXiGeFJCw==:"
+          ]
+        ],
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"SendMessage\",\"params\":{\"message\":{\"messageId\":\"fixture-notice-1\",\"role\":\"ROLE_USER\",\"parts\":[{\"text\":\"Deploy finished\"}],\"extensions\":[\"https://mentionable.dev/ns/publication/v0.1\"],\"metadata\":{\"https://mentionable.dev/ns/publication/v0.1\":{\"destinationId\":\"dst_fixture\"}}}}}"
+      },
+      "signatureBase": "\"@method\": POST\n\"@target-uri\": https://connector.example/api/publications\n\"content-type\": application/json\n\"content-digest\": sha-256=:v9sylBTBSFkki1ML2WJQnExwhc3OZf089j6vJ69oyT8=:\n\"signature-agent\";key=\"sig1\": \"https://agents.example/agents/7\"\n\"@signature-params\": (\"@method\" \"@target-uri\" \"content-type\" \"content-digest\" \"signature-agent\";key=\"sig1\");created=1767225600;expires=1767225660;nonce=\"54b4890f-8582-4a32-a492-c623214ce281\";keyid=\"u67W9HUm4W4vo4VsGdeIJ45NYSAsBMQw6C_71fyvN-Q\";alg=\"ed25519\";tag=\"web-bot-auth\"",
+      "expected": {
+        "address": "acct:ops@agents.example",
+        "id": "https://agents.example/agents/7"
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "changed-body",
+      "request": {
+        "method": "POST",
+        "url": "https://connector.example/api/publications",
+        "headers": [
+          [
+            "a2a-version",
+            "1.0"
+          ],
+          [
+            "a2a-extensions",
+            "https://mentionable.dev/ns/publication/v0.1"
+          ],
+          [
+            "content-type",
+            "application/json"
+          ],
+          [
+            "content-digest",
+            "sha-256=:v9sylBTBSFkki1ML2WJQnExwhc3OZf089j6vJ69oyT8=:"
+          ],
+          [
+            "signature-agent",
+            "sig1=\"https://agents.example/agents/7\""
+          ],
+          [
+            "signature-input",
+            "sig1=(\"@method\" \"@target-uri\" \"content-type\" \"content-digest\" \"signature-agent\";key=\"sig1\");created=1767225600;expires=1767225660;nonce=\"54b4890f-8582-4a32-a492-c623214ce280\";keyid=\"CO-xthfSXnUCPAuyd1IsA2mPhhB6LsP9lTtKRUUQXV8\";alg=\"ed25519\";tag=\"web-bot-auth\""
+          ],
+          [
+            "signature",
+            "sig1=:a7yRpLzuAJus/rzVkEt+tPcikdOpmVxgY8Mi6+fsJ2RivmEE508MZEfdWbxHTrcJTvaWyBe6S6lBf4+25escCw==:"
+          ]
+        ],
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"SendMessage\",\"params\":{\"message\":{\"messageId\":\"fixture-notice-1\",\"role\":\"ROLE_USER\",\"parts\":[{\"text\":\"Changed\"}],\"extensions\":[\"https://mentionable.dev/ns/publication/v0.1\"],\"metadata\":{\"https://mentionable.dev/ns/publication/v0.1\":{\"destinationId\":\"dst_fixture\"}}}}}"
+      }
+    },
+    {
+      "name": "changed-target",
+      "request": {
+        "method": "POST",
+        "url": "https://connector.example/api/publications/other",
+        "headers": [
+          [
+            "a2a-version",
+            "1.0"
+          ],
+          [
+            "a2a-extensions",
+            "https://mentionable.dev/ns/publication/v0.1"
+          ],
+          [
+            "content-type",
+            "application/json"
+          ],
+          [
+            "content-digest",
+            "sha-256=:v9sylBTBSFkki1ML2WJQnExwhc3OZf089j6vJ69oyT8=:"
+          ],
+          [
+            "signature-agent",
+            "sig1=\"https://agents.example/agents/7\""
+          ],
+          [
+            "signature-input",
+            "sig1=(\"@method\" \"@target-uri\" \"content-type\" \"content-digest\" \"signature-agent\";key=\"sig1\");created=1767225600;expires=1767225660;nonce=\"54b4890f-8582-4a32-a492-c623214ce280\";keyid=\"CO-xthfSXnUCPAuyd1IsA2mPhhB6LsP9lTtKRUUQXV8\";alg=\"ed25519\";tag=\"web-bot-auth\""
+          ],
+          [
+            "signature",
+            "sig1=:a7yRpLzuAJus/rzVkEt+tPcikdOpmVxgY8Mi6+fsJ2RivmEE508MZEfdWbxHTrcJTvaWyBe6S6lBf4+25escCw==:"
+          ]
+        ],
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"SendMessage\",\"params\":{\"message\":{\"messageId\":\"fixture-notice-1\",\"role\":\"ROLE_USER\",\"parts\":[{\"text\":\"Deploy finished\"}],\"extensions\":[\"https://mentionable.dev/ns/publication/v0.1\"],\"metadata\":{\"https://mentionable.dev/ns/publication/v0.1\":{\"destinationId\":\"dst_fixture\"}}}}}"
+      }
+    },
+    {
+      "name": "wrong-agent",
+      "request": {
+        "method": "POST",
+        "url": "https://connector.example/api/publications",
+        "headers": [
+          [
+            "a2a-version",
+            "1.0"
+          ],
+          [
+            "a2a-extensions",
+            "https://mentionable.dev/ns/publication/v0.1"
+          ],
+          [
+            "content-type",
+            "application/json"
+          ],
+          [
+            "content-digest",
+            "sha-256=:v9sylBTBSFkki1ML2WJQnExwhc3OZf089j6vJ69oyT8=:"
+          ],
+          [
+            "signature-agent",
+            "sig1=\"https://agents.example/agents/8\""
+          ],
+          [
+            "signature-input",
+            "sig1=(\"@method\" \"@target-uri\" \"content-type\" \"content-digest\" \"signature-agent\";key=\"sig1\");created=1767225600;expires=1767225660;nonce=\"54b4890f-8582-4a32-a492-c623214ce280\";keyid=\"CO-xthfSXnUCPAuyd1IsA2mPhhB6LsP9lTtKRUUQXV8\";alg=\"ed25519\";tag=\"web-bot-auth\""
+          ],
+          [
+            "signature",
+            "sig1=:a7yRpLzuAJus/rzVkEt+tPcikdOpmVxgY8Mi6+fsJ2RivmEE508MZEfdWbxHTrcJTvaWyBe6S6lBf4+25escCw==:"
+          ]
+        ],
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"SendMessage\",\"params\":{\"message\":{\"messageId\":\"fixture-notice-1\",\"role\":\"ROLE_USER\",\"parts\":[{\"text\":\"Deploy finished\"}],\"extensions\":[\"https://mentionable.dev/ns/publication/v0.1\"],\"metadata\":{\"https://mentionable.dev/ns/publication/v0.1\":{\"destinationId\":\"dst_fixture\"}}}}}"
+      }
+    },
+    {
+      "name": "uncovered-label",
+      "request": {
+        "method": "POST",
+        "url": "https://connector.example/api/publications",
+        "headers": [
+          [
+            "a2a-version",
+            "1.0"
+          ],
+          [
+            "a2a-extensions",
+            "https://mentionable.dev/ns/publication/v0.1"
+          ],
+          [
+            "content-type",
+            "application/json"
+          ],
+          [
+            "content-digest",
+            "sha-256=:v9sylBTBSFkki1ML2WJQnExwhc3OZf089j6vJ69oyT8=:"
+          ],
+          [
+            "signature-agent",
+            "sig1=\"https://agents.example/agents/7\""
+          ],
+          [
+            "signature-input",
+            "sig1=(\"@method\" \"@target-uri\" \"content-type\" \"content-digest\" \"signature-agent\";key=\"other\");created=1767225600;expires=1767225660;nonce=\"54b4890f-8582-4a32-a492-c623214ce280\";keyid=\"CO-xthfSXnUCPAuyd1IsA2mPhhB6LsP9lTtKRUUQXV8\";alg=\"ed25519\";tag=\"web-bot-auth\""
+          ],
+          [
+            "signature",
+            "sig1=:a7yRpLzuAJus/rzVkEt+tPcikdOpmVxgY8Mi6+fsJ2RivmEE508MZEfdWbxHTrcJTvaWyBe6S6lBf4+25escCw==:"
+          ]
+        ],
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"SendMessage\",\"params\":{\"message\":{\"messageId\":\"fixture-notice-1\",\"role\":\"ROLE_USER\",\"parts\":[{\"text\":\"Deploy finished\"}],\"extensions\":[\"https://mentionable.dev/ns/publication/v0.1\"],\"metadata\":{\"https://mentionable.dev/ns/publication/v0.1\":{\"destinationId\":\"dst_fixture\"}}}}}"
+      }
+    }
+  ]
 }

@@ -1,24 +1,18 @@
-// Reference receiver for the fixed v1 profile in docs/outbound-signatures.md.
-// Use the actual method, external target URI, raw body and incoming Headers.
-// Supply the public keys for ONE locally configured, trusted issuer.
+// Reference receiver. allowedOrigins comes from receiver configuration.
+// loadJson must fetch the supplied HTTPS URL without redirects or stale caching.
 import { createHash, createPublicKey, verify } from 'node:crypto';
 
-export function trustedKeys(pems) {
-  return new Map(pems.map(pem => {
-    const key = createPublicKey(pem);
-    if (key.asymmetricKeyType !== 'ed25519') throw new Error('Expected Ed25519 public key');
-    const kid = createHash('sha256').update(key.export({ format: 'der', type: 'spki' })).digest('base64url');
-    return [kid, key];
-  }));
-}
+const relation = 'https://mentionable.dev/ns/rel/publication-identity';
+const components = '("@method" "@target-uri" "content-type" "content-digest" "signature-agent";key="sig1")';
+const paramsPattern = /^;created=(0|[1-9]\d{0,11});expires=(0|[1-9]\d{0,11});nonce="([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})";keyid="([\w-]{43})";alg="ed25519";tag="web-bot-auth"$/;
 
-const components = '("@method" "@target-uri" "content-type" "content-digest" "vicoop-recipient" "vicoop-sender")';
-const paramsPattern = /^;created=(\d{1,12});expires=(\d{1,12});nonce="([0-9a-f-]{36})";keyid="([\w-]{43})";alg="ed25519";tag="vicoop-publish-v1"$/;
+function check(ok) { if (!ok) throw new Error('Invalid publication'); }
 
-export async function verifyPublication({ method, url, headers, body }, { recipient, keys, consumeNonce, now = Math.floor(Date.now() / 1000) }) {
-  function check(ok) { if (!ok) throw new Error('Invalid outbound publication'); }
-  check(method === 'POST' && !headers.has('content-encoding') && headers.get('content-type') === 'application/json');
-  check(headers.get('vicoop-recipient') === recipient);
+export async function verifyPublication({ method, url, headers, body }, {
+  endpoint, grant, allowedOrigins, loadJson, consumeNonce, now = Math.floor(Date.now() / 1000),
+}) {
+  check(method === 'POST' && url === endpoint && !headers.has('content-encoding') &&
+    headers.get('content-type') === 'application/json');
   const digest = 'sha-256=:' + createHash('sha256').update(body).digest('base64') + ':';
   check(headers.get('content-digest') === digest);
   const input = headers.get('signature-input') ?? '';
@@ -28,19 +22,48 @@ export async function verifyPublication({ method, url, headers, body }, { recipi
   check(match);
   const [, created, expires, nonce, kid] = match;
   check(Number(expires) === Number(created) + 60 && Number(created) <= now + 5 && now < Number(expires) + 5);
+  const signature = /^sig1=:([A-Za-z0-9+/]{86}==):$/.exec(headers.get('signature') ?? '');
+  check(signature && Buffer.from(signature[1], 'base64').toString('base64') === signature[1]);
+  // The application looks up the destination or reply grant in its own store.
+  // Only trust the address/ID from that grant, even for keys shared across agents.
+  const { address, id } = grant;
+  check(typeof id === 'string' && headers.get('signature-agent') === 'sig1="' + id + '"');
+  const account = /^acct:([^@\s]+)@([a-z0-9._-]+)$/.exec(address);
+  check(account);
+  const origin = 'https://' + account[2];
+  check(allowedOrigins.has(origin));
+  const jrdUrl = new URL('/.well-known/webfinger', origin);
+  jrdUrl.searchParams.set('resource', address);
+  const jrd = await loadJson(jrdUrl.href);
+  check(jrd.subject === address && Array.isArray(jrd.links));
+  const links = jrd.links.filter(link => link.rel === relation);
+  check(links.length === 1 && links[0].href === id);
+  const identityUrl = new URL(id);
+  check(identityUrl.protocol === 'https:' && allowedOrigins.has(identityUrl.origin) && id.length <= 2048 && !identityUrl.username && !identityUrl.password &&
+    !/[?#"\\]/.test(id) && identityUrl.href === id);
+  const doc = await loadJson(id);
+  check(Array.isArray(doc.keys));
+  const keys = new Map();
+  for (const jwk of doc.keys) {
+    check(jwk && jwk.kty === 'OKP' && jwk.crv === 'Ed25519' && !('d' in jwk) &&
+      typeof jwk.x === 'string' && /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(jwk.x) &&
+      (jwk.use === undefined || jwk.use === 'sig') &&
+      (jwk.alg === undefined || ['EdDSA', 'Ed25519'].includes(jwk.alg)) &&
+      (jwk.key_ops === undefined || (Array.isArray(jwk.key_ops) && jwk.key_ops.length === 1 && jwk.key_ops[0] === 'verify')));
+    const key = createPublicKey({ key: { kty: 'OKP', crv: 'Ed25519', x: jwk.x }, format: 'jwk' });
+    const { crv, kty, x } = jwk;
+    const fingerprint = createHash('sha256').update(JSON.stringify({ crv, kty, x })).digest('base64url');
+    check(!keys.has(fingerprint));
+    keys.set(fingerprint, key);
+  }
   const key = keys.get(kid);
-  const sig = /^sig1=:([A-Za-z0-9+/]{86}==):$/.exec(headers.get('signature') ?? '');
-  check(key && sig);
-  const sender = headers.get('vicoop-sender');
-  check(sender && sender.length <= 8192 && /^[A-Za-z0-9_-]+$/.test(sender));
+  check(key);
   const base = [
-    '"@method": ' + method, '"@target-uri": ' + url, '"content-type": application/json',
-    '"content-digest": ' + digest, '"vicoop-recipient": ' + recipient, '"vicoop-sender": ' + sender,
+    '"@method": POST', '"@target-uri": ' + url, '"content-type": application/json',
+    '"content-digest": ' + digest, '"signature-agent";key="sig1": "' + id + '"',
     '"@signature-params": ' + params,
   ].join('\n');
-  check(verify(null, Buffer.from(base), key, Buffer.from(sig[1], 'base64')));
-  const identity = JSON.parse(Buffer.from(sender, 'base64url').toString('utf8'));
-  check(Array.isArray(identity) && identity.length === 3 && identity.every(x => typeof x === 'string' && x.length));
-  check(await consumeNonce(nonce, Number(expires) + 5));
-  return { agentId: identity[0], clientId: identity[1], ownerRevision: identity[2] };
+  check(verify(null, Buffer.from(base), key, Buffer.from(signature[1], 'base64')));
+  check(await consumeNonce(id, nonce, Number(expires) + 5));
+  return { address, id };
 }

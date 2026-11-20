@@ -76,7 +76,7 @@ async function lookupByTokenHash(sql: Sql, hash: string): Promise<ClientRow | nu
 export interface ServerWsOptions {
   db: Sql;
   registry: Registry;
-  outboundSigner?: ReturnType<typeof loadOutboundSigner>;
+  outboundSigner?: ReturnType<typeof loadOutboundSigner>['signRequest'];
   helloTimeoutMs?: number;
 }
 

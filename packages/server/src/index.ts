@@ -87,12 +87,13 @@ export interface ServerOptions {
 
 export async function startServer(opts: ServerOptions) {
   const signingKey = process.env.VICOOP_OUTBOUND_KEY_FILE;
-  const outboundSigner = signingKey ? loadOutboundSigner(signingKey) : undefined;
+  const outboundSigner = signingKey ? loadOutboundSigner(signingKey, opts.publicUrl, process.env.VICOOP_OUTBOUND_PUBLIC_KEYS_FILE) : undefined;
   const policies = readOperationRegistry(process.env.VICOOP_OPERATIONS);
   await reconcileOperationPolicies(opts.db, policies);
   const registry = new Registry();
   const app = createHttpApp({
     registry,
+    publicationAuthority: outboundSigner,
     operationPolicies: policies,
     publicUrl: opts.publicUrl,
     db: opts.db,
@@ -108,7 +109,7 @@ export async function startServer(opts: ServerOptions) {
 
   attachWsServer(server as unknown as import('node:http').Server, {
     db: opts.db,
-    outboundSigner,
+    outboundSigner: outboundSigner?.signRequest,
     registry,
   });
 

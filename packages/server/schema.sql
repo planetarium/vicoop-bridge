@@ -258,6 +258,9 @@ CREATE TABLE IF NOT EXISTS agents (
   updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Account discovery checks for ambiguous case-folded local parts, including offline registrations.
+CREATE INDEX IF NOT EXISTS agents_webfinger_local_idx ON agents (lower(id));
+
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS owner_email TEXT;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS client_id TEXT UNIQUE DEFAULT gen_random_uuid()::text;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS allowed_callers TEXT[] NOT NULL DEFAULT '{}';
