@@ -1,5 +1,11 @@
 # @vicoop-bridge/client
 
+## 0.52.0
+
+### Minor Changes
+
+- d882028: Allow a host scheduler to obtain request-bound HTTP signatures over its daemon's authenticated bridge connection using an opt-in local Unix socket.
+
 ## 0.51.0
 
 ### Minor Changes
