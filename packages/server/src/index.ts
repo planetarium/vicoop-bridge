@@ -1,3 +1,4 @@
+import { loadRegistrationSigner } from './registration-signing.js';
 import { loadOutboundSigner } from './outbound-signature.js';
 import { watchAgentOwners } from './agent-transfer.js';
 import { serve } from '@hono/node-server';
@@ -87,7 +88,13 @@ export interface ServerOptions {
 
 export async function startServer(opts: ServerOptions) {
   const signingKey = process.env.VICOOP_OUTBOUND_KEY_FILE;
-  const outboundSigner = signingKey ? loadOutboundSigner(signingKey, opts.publicUrl, process.env.VICOOP_OUTBOUND_PUBLIC_KEYS_FILE) : undefined;
+  const wrappingKey = process.env.VICOOP_OUTBOUND_WRAPPING_KEY_FILE;
+  if (wrappingKey && (signingKey || process.env.VICOOP_OUTBOUND_PUBLIC_KEYS_FILE)) {
+    throw new Error('Configure either registration signing or legacy shared signing');
+  }
+  let outboundSigner;
+  if (wrappingKey) outboundSigner = loadRegistrationSigner(opts.db, wrappingKey, opts.publicUrl);
+  else if (signingKey) outboundSigner = loadOutboundSigner(signingKey, opts.publicUrl, process.env.VICOOP_OUTBOUND_PUBLIC_KEYS_FILE);
   const policies = readOperationRegistry(process.env.VICOOP_OPERATIONS);
   await reconcileOperationPolicies(opts.db, policies);
   const registry = new Registry();

@@ -108,7 +108,7 @@ import {
 } from './oauth/token-exchange/authorization.js';
 
 export interface ServerHttpOptions {
-  publicationAuthority?: ReturnType<typeof import('./outbound-signature.js').loadOutboundSigner>;
+  publicationAuthority?: import('./outbound-signature.js').PublicationAuthority;
   operationPolicies?: OperationDefinition[];
   registry: Registry;
   publicUrl?: string;
@@ -657,7 +657,9 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       `;
       if (rows.length !== 1) return;
       const identity = authority.identity(rows[0]);
-      if (identity) return { ...identity, keys: authority.keys };
+      if (!identity) return;
+      const keys = await authority.keysFor(rows[0]);
+      if (keys.length) return { ...identity, keys };
     } : undefined,
     listAgents: () => opts.registry.listAgents(),
     getAgentCard: (conn) => getAgentForConn(conn).getAgentCard() as AgentCardV03,

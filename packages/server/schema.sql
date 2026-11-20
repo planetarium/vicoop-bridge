@@ -1309,3 +1309,12 @@ EXECUTE FUNCTION infra.invalidate_operation_approvals();
 REVOKE ALL ON infra.operation_requests FROM app_anonymous, app_authenticated, PUBLIC;
 GRANT SELECT, INSERT, UPDATE ON infra.operation_requests TO app_postgraphile;
 REVOKE DELETE ON infra.operation_requests FROM app_postgraphile;
+
+-- Outside the GraphQL schemas. A NULL envelope disables this registration epoch.
+CREATE SCHEMA IF NOT EXISTS bridge_private;
+CREATE TABLE IF NOT EXISTS bridge_private.publication_keys (
+  client_id TEXT NOT NULL REFERENCES agents(client_id) ON DELETE CASCADE,
+  owner_revision BIGINT NOT NULL,
+  envelope TEXT,
+  PRIMARY KEY (client_id, owner_revision)
+);

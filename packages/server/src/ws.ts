@@ -1,5 +1,5 @@
 import { OUTBOUND_CAPABILITY } from '@vicoop-bridge/protocol';
-import type { loadOutboundSigner } from './outbound-signature.js';
+import type { PublicationAuthority } from './outbound-signature.js';
 import { operationGrantIsActive } from './operation-callers.js';
 import { approvalStatus } from './tool-approvals.js';
 import { APPROVAL_EXTENSION_URI, REMOTE_APPROVAL_CAPABILITY } from '@vicoop-bridge/protocol';
@@ -76,7 +76,7 @@ async function lookupByTokenHash(sql: Sql, hash: string): Promise<ClientRow | nu
 export interface ServerWsOptions {
   db: Sql;
   registry: Registry;
-  outboundSigner?: ReturnType<typeof loadOutboundSigner>['signRequest'];
+  outboundSigner?: PublicationAuthority['signRequest'];
   helloTimeoutMs?: number;
 }
 
@@ -410,9 +410,10 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           return;
         }
         signing = true;
-        void lookupByTokenHash(opts.db, outboundTokenHash).then(row => {
+        void lookupByTokenHash(opts.db, outboundTokenHash).then(async row => {
           if (!row || row.id !== agentId || opts.registry.getAgent(row.id)?.ws !== ws) return reply(null);
-          reply(signer(frame.request, row));
+          const headers = await signer(frame.request, row);
+          reply(opts.registry.getAgent(row.id)?.ws === ws ? headers : null);
         }).catch(() => reply(null)).finally(() => { signing = false; });
         break;
       }
