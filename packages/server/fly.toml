@@ -7,7 +7,12 @@ primary_region = "nrt"
   [build.args]
     VITE_WALLETCONNECT_PROJECT_ID = "e2ead043530cfc0d06ef42a09b97ebe2"
 
+[[files]]
+  guest_path = "/root/vicoop-outbound-signing.pem"
+  secret_name = "VICOOP_OUTBOUND_PEM_B64"
+
 [env]
+  VICOOP_OUTBOUND_KEY_FILE = "/root/vicoop-outbound-signing.pem"
   PORT = "8787"
   POSTGRAPHILE_PORT = "5433"
   # Sentry → dedicated "vicoop-bridge-server" project (spans + logs both land
