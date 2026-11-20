@@ -1,0 +1,21 @@
+{
+  "publicKey": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAMxmeDId490sYm+QxGtJBzhE9TeDdtoQodV4m6qIcU7Q=\n-----END PUBLIC KEY-----\n",
+  "now": 1795169410,
+  "method": "POST",
+  "url": "https://receiver.example/a2a?profile=publication",
+  "recipient": "reports",
+  "body": "{\"messageId\":\"notice-42\",\"destination\":\"operations\",\"replyTo\":\"parent-7\",\"text\":\"점검 완료\"}",
+  "headers": {
+    "content-type": "application/json",
+    "content-digest": "sha-256=:jLlkc1STNplDNRLhFCdV1DvWuPanpXRPajyNr7VQfr0=:",
+    "vicoop-sender": "WyJvcGVyYXRpb25zIiwicmVnaXN0cmF0aW9uLTEiLCIwIl0",
+    "vicoop-recipient": "reports",
+    "signature-input": "sig1=(\"@method\" \"@target-uri\" \"content-type\" \"content-digest\" \"vicoop-recipient\" \"vicoop-sender\");created=1795169410;expires=1795169470;nonce=\"13b87f08-8de8-490e-b9dd-5eb76ec2b9f5\";keyid=\"P0S18pe8Fa4DSa75SgWnCYVrx_jqYZPOK9Gu-I40WOY\";alg=\"ed25519\";tag=\"vicoop-publish-v1\"",
+    "signature": "sig1=:362D3Tt4Ozgy6tymmPcrl771l8hGaEvGbDKAXJ++htZQfkgMQzuQdh7yuYoHB64R4QShnaGehWjIAi4Qy0EvBg==:"
+  },
+  "expected": {
+    "agentId": "operations",
+    "clientId": "registration-1",
+    "ownerRevision": "0"
+  }
+}

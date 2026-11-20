@@ -1,3 +1,5 @@
+import { OutboundSignFrame, OutboundResultFrame } from './outbound.js';
+export * from './outbound.js';
 import { z } from 'zod';
 export * from './federated-principal.js';
 
@@ -596,6 +598,7 @@ export const ApprovalResolveFrame = z.object({
 
 export const UpFrame = z.discriminatedUnion('type', [
   HelloFrame,
+  OutboundSignFrame,
   ApprovalRequestFrame,
   ApprovalReceivedFrame,
   TaskStatusFrame,
@@ -657,6 +660,7 @@ export type UsageRequestFrame = z.infer<typeof UsageRequestFrame>;
 
 export const DownFrame = z.discriminatedUnion('type', [
   HelloAckFrame,
+  OutboundResultFrame,
   ApprovalResolveFrame,
   TaskAckFrame,
   TaskAssignFrame,

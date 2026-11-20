@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { OUTBOUND_CAPABILITY, type OutboundRequest, type OutboundHeaders } from '@vicoop-bridge/protocol';
 import { RemoteApprovalBroker } from './remote-approval.js';
 import WebSocket from 'ws';
 import {
@@ -36,6 +38,7 @@ import {
 } from './identity.js';
 
 export interface ClientOptions {
+  outboundSigning?: boolean;
   serverUrl: string;
   token: string;
   agentId: string;
@@ -184,6 +187,31 @@ export class Client {
     this.logger = createLogger(opts.logLevel, opts.logSink);
   }
 
+  private outboundReady = false;
+  private pendingSignature?: { id: string; finish: (headers: OutboundHeaders | null) => void };
+
+  async signOutbound(request: OutboundRequest): Promise<OutboundHeaders> {
+    const ws = this.ws;
+    if (!this.outboundReady || this.stopped || ws?.readyState !== WebSocket.OPEN || this.pendingSignature) {
+      throw new Error('Outbound signer unavailable or busy');
+    }
+    const id = randomUUID();
+    return new Promise((resolve, reject) => {
+      const finish = (headers: OutboundHeaders | null) => {
+        if (this.pendingSignature?.id !== id) return;
+        this.pendingSignature = undefined;
+        clearTimeout(timer);
+        if (headers) resolve(headers);
+        else reject(new Error('Outbound signing failed'));
+      };
+      const timer = setTimeout(() => finish(null), 5000);
+      this.pendingSignature = { id, finish };
+      try {
+        ws.send(encodeFrame({ type: 'outbound.sign', requestId: id, request }), err => { if (err) finish(null); });
+      } catch { finish(null); }
+    });
+  }
+
   start(): void {
     // Kick off the capability probe before opening the bridge WS so it runs
     // in parallel with (and usually finishes before) the server's hello
@@ -197,6 +225,7 @@ export class Client {
 
   stop(): void {
     this.stopped = true;
+    this.pendingSignature?.finish(null);
     this.clearReconnectTimer();
     this.clearReconnectResetTimer();
     this.clearHeartbeat();
@@ -371,6 +400,7 @@ export class Client {
             version: PROTOCOL_VERSION,
             token: this.opts.token,
             protocolCapabilities: [
+              ...(this.opts.outboundSigning ? [OUTBOUND_CAPABILITY] : []),
               CALLER_CONTEXT_V2_CAPABILITY,
               CALLER_CONTEXT_V1_CAPABILITY,
               TASK_REPLAY_CAPABILITY,
@@ -424,7 +454,11 @@ export class Client {
         case 'approval.resolve':
           if (this.approvalsReady) this.approvals.resolve(frame);
           break;
+        case 'outbound.result':
+          if (this.pendingSignature?.id === frame.requestId) this.pendingSignature.finish(frame.headers);
+          break;
         case 'hello.ack':
+          this.outboundReady = !!this.opts.outboundSigning && frame.protocolCapabilities.includes(OUTBOUND_CAPABILITY);
           this.approvalsReady = frame.protocolCapabilities.includes(REMOTE_APPROVAL_CAPABILITY);
           this.federatedScopeReady = frame.protocolCapabilities.includes(FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY);
           this.callerScopeReady = [TASK_REPLAY_CAPABILITY, CALLER_CONTEXT_V2_CAPABILITY, EXECUTION_SCOPE_V1_CAPABILITY, CALLER_RUNTIME_V1_CAPABILITY]
@@ -508,6 +542,8 @@ export class Client {
       this.logger.info(`disconnected: ${code} ${safeToken(reason.toString())}`);
       if (!current) return;
       this.ws = null;
+      this.outboundReady = false;
+      this.pendingSignature?.finish(null);
       this.approvalsReady = false;
       // Legacy frames, and reliable runs whose retention was explicitly
       // disabled, cannot safely continue after losing their socket. Stop them

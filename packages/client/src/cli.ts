@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { sendFilePendingBytes } from './send-file-config.js';
 import { callerFilePendingBytes } from './caller-file-delivery.js';
+import { listenOutbound } from './outbound-socket.js';
 import { SHUTDOWN_TIMEOUT_MS, createDaemonShutdown } from './daemon-shutdown.js';
 import { callerStateCmd, runCallerState } from './caller-runtime-admin.js';
 import { createCallerRuntime } from './caller-runtime.js';
@@ -583,8 +584,10 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
   // long-lived runtime container before construction (#249).
   const { backend, shutdown: backendShutdown } = await pickBackend(args.backend, args);
 
+  let socket: Awaited<ReturnType<typeof listenOutbound>> | undefined;
+  const socketPath = process.env.VICOOP_OUTBOUND_SOCKET;
   const shutdown = createDaemonShutdown({
-    stop: () => client.stop(),
+    stop: () => { socket?.close(); client.stop(); },
     shutdown: backendShutdown,
     logger,
     timeoutMs: backend.requiresCallerScope ? CALLER_RUNTIME_SHUTDOWN_TIMEOUT_MS : SHUTDOWN_TIMEOUT_MS,
@@ -595,6 +598,7 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
   const callerRuntime = args.runtime === 'container'
     ? args.backends?.[args.backend as 'claude' | 'codex']?.caller_runtime : undefined;
   const client = new Client({
+    outboundSigning: Boolean(socketPath),
     serverUrl: args.server,
     token: args.token,
     agentId: args.agentId,
@@ -654,6 +658,14 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
       // best-effort — never throw out of an exit handler
     }
   });
+  if (socketPath) {
+    try { socket = await listenOutbound(socketPath, input => client.signOutbound(input)); }
+    catch (err) {
+      logger.error('cannot start outbound signing socket:', err instanceof Error ? err.message : String(err));
+      await shutdown(true);
+      return;
+    }
+  }
   client.start();
 }
 

@@ -1507,3 +1507,46 @@ test('remote approval frames negotiate, preserve auth-required through heartbeat
     assert.equal(registry.approvals.list().length, 0);
   } finally { registry.unbindTask(b.taskId, b); ws.close(); await once(ws, 'close'); await closeServer(server); }
 });
+
+test('outbound signing uses the live token registration without a Task and stops after revocation', async () => {
+  const registry = new Registry();
+  const server = createServer();
+  const registration = { id: 'agent-1', client_id: 'client-1', owner_revision: '3', allowed_callers: [],
+    owner_principal: 'owner' };
+  let valid = true;
+  const db = (async (_: unknown, hash: string) => valid && hash === hashToken('token') ? [registration] : []) as unknown as Sql;
+  let issued = 0;
+  attachWsServer(server, { registry, db, outboundSigner(request, row) {
+    assert.equal(row.id, 'agent-1');
+    issued++;
+    return { 'content-type': 'application/json', 'content-digest': request.digest, 'vicoop-sender': row.id,
+      'vicoop-recipient': request.recipient, 'signature-input': 'test', signature: 'test' };
+  } });
+  const ws = new WebSocket('ws://127.0.0.1:' + await listen(server) + '/connect');
+  async function exchange(frame: unknown) {
+    const received = withTimeout(once(ws, 'message'), 2000, 'response');
+    ws.send(JSON.stringify(frame));
+    return JSON.parse((await received)[0].toString());
+  }
+  try {
+    await once(ws, 'open');
+    const hello = JSON.parse(helloFrame());
+    hello.protocolCapabilities.push('outbound-http-signature-v1');
+    assert.ok((await exchange(hello)).protocolCapabilities.includes('outbound-http-signature-v1'));
+    const frame = { type: 'outbound.sign', requestId: crypto.randomUUID(), request: {
+      target: 'https://receiver.example/a2a', recipient: 'ops', digest: Buffer.alloc(32).toString('base64'),
+    } };
+    assert.equal((await exchange(frame)).headers['vicoop-sender'], 'agent-1');
+    valid = false;
+    assert.equal((await exchange(frame)).headers, null);
+    assert.equal(issued, 1);
+    const closed = once(ws, 'close');
+    ws.send(JSON.stringify({ ...frame, request: { ...frame.request, agentId: 'another' } }));
+    const [code, reason] = await withTimeout(closed, 2000, 'protocol error');
+    assert.equal(code, 4002);
+    assert.equal(reason.toString(), 'invalid protocol frame');
+  } finally {
+    ws.terminate();
+    await closeServer(server);
+  }
+});

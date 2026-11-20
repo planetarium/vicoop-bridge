@@ -1328,3 +1328,5 @@ isolation between local processes; do not configure roots containing credentials
 Caller-container runtimes do not yet support this tool; enabling it with
 `--runtime container` fails at startup rather than silently dropping attachments.
 It is disabled by default and does not enable file delivery for other backends.
+
+Hosts that initiate publications can enable the [local outbound signing socket](./outbound-signatures.md).

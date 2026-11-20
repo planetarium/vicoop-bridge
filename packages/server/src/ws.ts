@@ -1,3 +1,5 @@
+import { OUTBOUND_CAPABILITY } from '@vicoop-bridge/protocol';
+import type { loadOutboundSigner } from './outbound-signature.js';
 import { operationGrantIsActive } from './operation-callers.js';
 import { approvalStatus } from './tool-approvals.js';
 import { APPROVAL_EXTENSION_URI, REMOTE_APPROVAL_CAPABILITY } from '@vicoop-bridge/protocol';
@@ -74,6 +76,7 @@ async function lookupByTokenHash(sql: Sql, hash: string): Promise<ClientRow | nu
 export interface ServerWsOptions {
   db: Sql;
   registry: Registry;
+  outboundSigner?: ReturnType<typeof loadOutboundSigner>;
   helloTimeoutMs?: number;
 }
 
@@ -244,6 +247,8 @@ function wireStatusToA2X(
 
 function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOptions): void {
   let agentId: string | null = null;
+  let outboundTokenHash: string | undefined;
+  let signing = false;
   let authed = false;
   let helloProcessing = false;
   // Authentication can finish after the close handler. Preserve the code even
@@ -298,12 +303,12 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
     let frame;
     try {
       frame = parseUpFrame(typeof raw === 'string' ? raw : raw.toString('utf8'));
-    } catch (err) {
+    } catch {
       // A protocol violation is our verdict on this connection, so its
       // in-flight tasks must not earn a reconnect grace hold no matter what
       // close code we end up observing (see Registry.noteServerClose).
       opts.registry.noteServerClose(ws);
-      ws.close(4002, `invalid frame: ${(err as Error).message}`);
+      ws.close(4002, 'invalid protocol frame');
       return;
     }
 
@@ -350,6 +355,9 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         }
         agentId = frame.agentId;
         authed = true;
+        if (opts.outboundSigner && frame.protocolCapabilities?.includes(OUTBOUND_CAPABILITY)) {
+          outboundTokenHash = hashToken(frame.token);
+        }
         clearTimeout(helloTimeout);
         if (frame.protocolCapabilities?.includes(TASK_REPLAY_CAPABILITY)) {
           ws.send(
@@ -357,6 +365,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
               type: 'hello.ack',
               protocolCapabilities: [
                 TASK_REPLAY_CAPABILITY,
+                ...(outboundTokenHash ? [OUTBOUND_CAPABILITY] : []),
                 ...(frame.protocolCapabilities?.includes(REMOTE_APPROVAL_CAPABILITY) ? [REMOTE_APPROVAL_CAPABILITY] : []),
                 ...(frame.protocolCapabilities?.includes(CALLER_CONTEXT_V2_CAPABILITY) ? [CALLER_CONTEXT_V2_CAPABILITY] : []),
                 ...(supportsExecutionScopeV1(frame.protocolCapabilities) ? [EXECUTION_SCOPE_V1_CAPABILITY,
@@ -391,6 +400,22 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
 
   function processAuthedFrame(frame: UpFrame): void {
     switch (frame.type) {
+      case 'outbound.sign': {
+        const reply = (headers: import('@vicoop-bridge/protocol').OutboundHeaders | null) => {
+          if (ws.readyState === ws.OPEN) ws.send(encodeFrame({ type: 'outbound.result', requestId: frame.requestId, headers }));
+        };
+        const signer = opts.outboundSigner;
+        if (!outboundTokenHash || !signer || !agentId || signing || opts.registry.getAgent(agentId)?.ws !== ws) {
+          reply(null);
+          return;
+        }
+        signing = true;
+        void lookupByTokenHash(opts.db, outboundTokenHash).then(row => {
+          if (!row || row.id !== agentId || opts.registry.getAgent(row.id)?.ws !== ws) return reply(null);
+          reply(signer(frame.request, row));
+        }).catch(() => reply(null)).finally(() => { signing = false; });
+        break;
+      }
       case 'approval.request': {
         const accepted = acceptTaskFrame(frame);
         if (!accepted || accepted.kind === 'handled') return;
