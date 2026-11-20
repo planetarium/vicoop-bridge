@@ -1,5 +1,11 @@
 # @vicoop-bridge/client
 
+## 0.53.0
+
+### Minor Changes
+
+- f1c8287: Replace the initial bridge-specific signing contract with Web Bot Auth draft-01 for request-bound publications. The local signing socket takes the target URL and digest and returns HTTP headers identifying the agent by its domain-authorized, non-reassigned ID. Upgrade signing daemons and servers together.
+
 ## 0.52.0
 
 ### Minor Changes
