@@ -2023,3 +2023,67 @@ test('federated assignments require their additive capability', async () => {
     } finally { client.stop(); await closeServer(server, wss); }
   }
 });
+
+test('private signing socket negotiates the daemon connection and correlates responses', { skip: process.platform === 'win32' }, async (t) => {
+  const { listenOutbound } = await import('./outbound-socket.js');
+  const { mkdtempSync, realpathSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { request } = await import('node:http');
+  const dir = mkdtempSync(realpathSync(tmpdir()) + '/sign-');
+  t.after(() => rmSync(dir, { force: true, recursive: true }));
+  const server = createServer();
+  const wss = new WebSocketServer({ server, path: '/connect' });
+  const client = new Client({
+    serverUrl: await listen(server), token: 'token', agentId: 'agent', backendKind: 'echo',
+    backend: backendOf('stub', async () => {}), outboundSigning: true, logSink: makeSink().sink,
+  });
+  t.after(async () => { client.stop(); await closeServer(server, wss); });
+  const path = dir + '/s';
+  const socket = await listenOutbound(path, input => client.signOutbound(input));
+  t.after(() => new Promise<void>(resolve => socket.close(() => resolve())));
+  const input = { target: 'https://receiver.example/a2a', recipient: 'ops', digest: Buffer.alloc(32).toString('base64') };
+  function post(payload: object) {
+    return new Promise<{ status?: number; body: string }>((resolve, reject) => {
+      const req = request({ method: 'POST', socketPath: path, path: '/sign' }, res => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', chunk => { body += chunk; });
+        res.on('end', () => resolve({ status: res.statusCode, body }));
+      });
+      req.on('error', reject);
+      req.end(JSON.stringify(payload));
+    });
+  }
+  assert.equal((await post(input)).status, 503);
+  assert.equal((await post({ ...input, agentId: 'another' })).status, 400);
+  let completed = false;
+  wss.on('connection', ws => ws.on('message', data => {
+    const frame = parseUpFrame(data.toString());
+    if (frame.type === 'hello') {
+      assert.ok(frame.protocolCapabilities?.includes('outbound-http-signature-v1'));
+      ws.send(encodeFrame({ type: 'hello.ack', protocolCapabilities: ['outbound-http-signature-v1'],
+        disconnectGraceMs: 0, maxFrameBytes: 8192 }));
+    }
+    if (frame.type === 'outbound.sign') {
+      assert.deepEqual(frame.request, input);
+      ws.send(encodeFrame({ type: 'outbound.result', requestId: crypto.randomUUID(), headers: null }));
+      ws.send(encodeFrame({ type: 'outbound.result', requestId: frame.requestId, headers: {
+        'content-type': 'application/json', 'content-digest': 'digest', 'vicoop-recipient': 'ops',
+        'vicoop-sender': 'subject', signature: 'proof', 'signature-input': 'params',
+      } }));
+      completed = true;
+    }
+  }));
+  client.start();
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const response = await post(input);
+    if (response.status === 200) {
+      assert.equal(JSON.parse(response.body).signature, 'proof');
+      assert.ok(completed);
+      return;
+    }
+    assert.equal(response.status, 503);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.fail('signer did not become ready');
+});

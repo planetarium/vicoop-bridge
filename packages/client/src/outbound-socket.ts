@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { OutboundRequest, type OutboundHeaders } from '@vicoop-bridge/protocol';
 
 export async function listenOutbound(path: string, issue: (input: OutboundRequest) => Promise<OutboundHeaders>) {
+  if (Buffer.byteLength(path) > 103) throw new Error('Outbound socket path exceeds 103 bytes');
   const parent = dirname(path);
   const stat = lstatSync(parent);
   if (!process.getuid || path !== resolve(path) || realpathSync(parent) !== parent ||

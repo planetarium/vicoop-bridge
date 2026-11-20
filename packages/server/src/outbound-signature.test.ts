@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadOutboundSigner } from './outbound-signature.js';
@@ -53,4 +53,13 @@ test('v1 receiver verifies body, identity, audience, purpose, rotation and singl
   assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
   const result = await verifyPublication(signed(active.sign), policy);
   assert.deepEqual(result, { agentId: 'agent-a', clientId: 'registration-1', ownerRevision: '0' });
+});
+
+test('published conformance fixture verifies with the receiver example', async () => {
+  const { verifyPublication, trustedKeys } = await import(new URL('../../../examples/outbound/verify.mjs', import.meta.url).href);
+  const data = JSON.parse(readFileSync(new URL('../../../examples/outbound/fixture.json', import.meta.url), 'utf8'));
+  const identity = await verifyPublication({ ...data, headers: new Headers(data.headers), body: Buffer.from(data.body) }, {
+    recipient: data.recipient, now: data.now, keys: trustedKeys([data.publicKey]), consumeNonce: () => true,
+  });
+  assert.deepEqual(identity, data.expected);
 });

@@ -1540,6 +1540,11 @@ test('outbound signing uses the live token registration without a Task and stops
     valid = false;
     assert.equal((await exchange(frame)).headers, null);
     assert.equal(issued, 1);
+    const closed = once(ws, 'close');
+    ws.send(JSON.stringify({ ...frame, request: { ...frame.request, agentId: 'another' } }));
+    const [code, reason] = await withTimeout(closed, 2000, 'protocol error');
+    assert.equal(code, 4002);
+    assert.equal(reason.toString(), 'invalid protocol frame');
   } finally {
     ws.terminate();
     await closeServer(server);

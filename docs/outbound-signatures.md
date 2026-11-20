@@ -6,7 +6,7 @@ A trusted host can send a new JSON POST without an A2A Task. The bridge issues a
 
 Generate a dedicated Ed25519 key pair on the bridge, for example with `openssl genpkey -algorithm Ed25519 -out signing.pem` under umask 077. Export the public key with `openssl pkey -in signing.pem -pubout -out signing.pub`. Set `VICOOP_OUTBOUND_KEY_FILE` to the private PEM path on each server before starting it. Distribute the public PEM through trusted receiver configuration and assign it to this bridge issuer. Each issuer needs its own keys. The key ID is unpadded base64url of SHA-256 over the DER SubjectPublicKeyInfo.
 
-On the POSIX daemon host, choose an absolute canonical path in an owner-only directory. For example, create it with `install -d -m 700 "$HOME/.vicoop-outbound"` and start the daemon with `VICOOP_OUTBOUND_SOCKET="$HOME/.vicoop-outbound/sign.sock" vicoop-client start`. All processes with access to that socket can act as the daemon's registered agent. If a crash leaves a socket file, first confirm the owning daemon has exited before removing it.
+On the POSIX daemon host, choose an absolute canonical path of at most 103 bytes in an owner-only directory. For example, create it with `install -d -m 700 "$HOME/.vicoop-outbound"` and start the daemon with `VICOOP_OUTBOUND_SOCKET="$HOME/.vicoop-outbound/sign.sock" vicoop-client start`. All processes with access to that socket can act as the daemon's registered agent. If a crash leaves a socket file, first confirm the owning daemon has exited before removing it.
 
 ## Send a publication
 
@@ -35,3 +35,5 @@ The signature covers, in order, `@method`, `@target-uri`, `content-type`, `conte
 Select the issuer and its pinned key set from receiver configuration. Scope posting grants to that issuer and the returned identity tuple. Transfer changes the revision, and a new registration has its own client ID. A previously issued signature remains valid for its bounded lifetime. For normal rotation, install the new public key alongside the old one on every receiver, switch all issuers, then retain the old public key for at least 65 seconds after its last issuance (plus any clock difference between issuer and receiver). Remove a compromised key immediately.
 
 Supply an atomic `consumeNonce(nonce, retainUntilEpochSeconds)` shared across all receiver instances, scoped by issuer. Return true only on first insertion and retain the entry through its acceptance window. On a lost HTTP response, obtain a fresh signature for the same bytes. The receiver owns destination and reply permissions and durable publication deduplication by sender and message ID. Record the body digest alongside the result and reject reuse of an ID with different content.
+
+The [conformance fixture](../examples/outbound/fixture.json) contains a complete signed request, the exact UTF-8 body string, a public verification key, verification time and expected sender. Use the fixture time when testing expiration.

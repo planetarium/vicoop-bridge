@@ -303,12 +303,12 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
     let frame;
     try {
       frame = parseUpFrame(typeof raw === 'string' ? raw : raw.toString('utf8'));
-    } catch (err) {
+    } catch {
       // A protocol violation is our verdict on this connection, so its
       // in-flight tasks must not earn a reconnect grace hold no matter what
       // close code we end up observing (see Registry.noteServerClose).
       opts.registry.noteServerClose(ws);
-      ws.close(4002, `invalid frame: ${(err as Error).message}`);
+      ws.close(4002, 'invalid protocol frame');
       return;
     }
 

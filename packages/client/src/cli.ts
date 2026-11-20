@@ -660,7 +660,11 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
   });
   if (socketPath) {
     try { socket = await listenOutbound(socketPath, input => client.signOutbound(input)); }
-    catch (err) { await shutdown(true); throw err; }
+    catch (err) {
+      logger.error('cannot start outbound signing socket:', err instanceof Error ? err.message : String(err));
+      await shutdown(true);
+      return;
+    }
   }
   client.start();
 }
