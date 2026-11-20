@@ -2,4 +2,4 @@
 '@vicoop-bridge/client': minor
 ---
 
-Replace the initial bridge-specific signing contract with mentionable-publication-v1. The local signing socket takes the target URL and digest and returns HTTP headers identifying the agent by its domain-authorized, non-reassigned ID. Upgrade signing daemons and servers together.
+Replace the initial bridge-specific signing contract with Web Bot Auth draft-01 for request-bound publications. The local signing socket takes the target URL and digest and returns HTTP headers identifying the agent by its domain-authorized, non-reassigned ID. Upgrade signing daemons and servers together.

@@ -245,8 +245,8 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
         { rel: 'http://webfinger.net/rel/profile-page', type: 'text/html', href: `${deps.publicUrl}/` },
       );
     }
-    if (identity) links.push({ rel: PUBLICATION_IDENTITY_REL, type: 'application/json', href: identity.id });
-    const subject = identity ? 'acct:' + identity.address.slice(1) : `acct:${resolved!.local}@${deps.domain.toLowerCase()}`;
+    if (identity) links.push({ rel: PUBLICATION_IDENTITY_REL, type: 'application/jwk-set+json', href: identity.id });
+    const subject = identity?.address ?? `acct:${resolved!.local}@${deps.domain.toLowerCase()}`;
     const jrd = { subject, aliases, links };
     // Cache-Control: no-store is applied uniformly by the route-scoped
     // middleware above, so every status (including the 400/404 errors)
@@ -266,7 +266,7 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
     const identity = await deps.publicationIdentity?.(local);
     const expected = new URL(deps.publicUrl).origin + '/publication-identities/' + local + '/' + c.req.param('epoch');
     if (!identity || identity.id !== expected) return c.notFound();
-    return c.json({ id: identity.id, keys: identity.keys });
+    return c.json({ keys: identity.keys }, 200, { 'Content-Type': 'application/jwk-set+json' });
   });
 
   app.get('/.well-known/agent-card/:local', (c) => {

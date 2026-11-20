@@ -39,7 +39,8 @@ test('receiver resolves bridge authorization through WebFinger and the current r
     return { method: 'POST', url: request.target, body, headers: new Headers(authority.signRequest(request, registration)) };
   }
   const seen = new Set<string>();
-  const policy = { endpoint: request.target, allowedOrigins: new Set([origin]), async loadJson(url: string) {
+  const approved = authority.identity(registration)!;
+  const policy = { grant: approved, endpoint: request.target, allowedOrigins: new Set([origin]), async loadJson(url: string) {
     const response = await server.request(url);
     assert.equal(response.status, 200);
     assert.equal(response.headers.get('cache-control'), 'no-store');
@@ -57,9 +58,11 @@ test('receiver resolves bridge authorization through WebFinger and the current r
   await assert.rejects(check({}, { now: Math.floor(Date.now() / 1000) + 70 }));
   await assert.rejects(check({ body: Buffer.from(body.toString().replace('parent', 'other')) }));
   for (const [field, value] of [
-    ['mentionable-agent', '@other@agents.example'],
-    ['mentionable-subject', origin + '/id/other'],
-    ['signature-input', msg.headers.get('signature-input')!.replace('publication-v1', 'another-v1')],
+    ['signature-agent', 'sig1="' + origin + '/id/other"'],
+    ['signature-agent', '"' + approved.id + '"'],
+    ['signature-agent', 'sig2="' + approved.id + '"'],
+    ['signature-agent', 'sig1="' + approved.id + '";extra=1'],
+    ['signature-input', msg.headers.get('signature-input')!.replace('web-bot-auth', 'other')],
   ]) {
     const headers = new Headers(msg.headers);
     headers.set(field, value);
@@ -84,7 +87,11 @@ test('receiver resolves bridge authorization through WebFinger and the current r
     const previous = signed();
     registration = updated;
     await assert.rejects(verifyPublication(previous, policy));
-    assert.notDeepEqual(await verifyPublication(signed(), policy), grant);
+    const successor = signed();
+    await assert.rejects(verifyPublication(successor, policy));
+    const reapproved = authority.identity(registration)!;
+    assert.notDeepEqual(reapproved, grant);
+    assert.deepEqual(await verifyPublication(successor, { ...policy, grant: reapproved }), reapproved);
     assert.equal((await server.request(grant.id)).status, 404);
   }
 });
@@ -96,28 +103,28 @@ test('direct signer uses the same receiver, scoped to the discovered key for its
   const data = JSON.parse(readFileSync(new URL('../../../examples/outbound/fixture.json', import.meta.url), 'utf8'));
   const pair = generateKeyPairSync('ed25519');
   const endpoint = data.audience;
-  const subject = { address: '@ops@agents.example', id: data.subject };
+  const subject = data.grant;
   const body = Buffer.from('{"messageId":"direct"}');
   const headers = signDirect({ ...subject, endpoint, body, privateKey: pair.privateKey });
   const msg = { method: 'POST', url: endpoint, body, headers };
-  const policy = { endpoint, allowedOrigins: new Set([origin]), consumeNonce: () => true,
+  const policy = { grant: subject, endpoint, allowedOrigins: new Set([origin]), consumeNonce: () => true,
     loadJson: (url: string) => url === subject.id ? data.discovery.identity.document : data.discovery.webfinger.document };
   await assert.rejects(verifyPublication(msg, policy));
   data.discovery.identity.document.keys = [{ ...pair.publicKey.export({ format: 'jwk' }) }];
   assert.deepEqual(await verifyPublication(msg, policy), subject);
 });
 
-test('Mentionable #670 conformance vectors verify under the published discovery contract', async () => {
+test('independent draft-01 publication vectors cover the labeled member and authorized JWK thumbprint', async () => {
   const { verifyPublication } = await import(verifier.href);
   const data = JSON.parse(readFileSync(new URL('../../../examples/outbound/fixture.json', import.meta.url), 'utf8'));
   const { webfinger, identity } = data.discovery;
   const records = new Map([[webfinger.url, webfinger.document], [identity.url, identity.document]]);
-  const policy = { endpoint: data.audience, now: data.now, allowedOrigins: new Set([origin]),
+  const policy = { grant: data.grant, endpoint: data.audience, now: data.now, allowedOrigins: new Set([origin]),
     loadJson: (url: string) => records.get(url), consumeNonce: () => true };
   for (const { request, expected } of [...data.valid, ...data.invalid]) {
     const msg = { ...request, headers: new Headers(request.headers), body: Buffer.from(request.body) };
     const verified = verifyPublication(msg, policy);
-    if (expected) assert.deepEqual(await verified, { id: expected.subject, address: expected.sender });
+    if (expected) assert.deepEqual(await verified, expected);
     else await assert.rejects(verified);
   }
 });

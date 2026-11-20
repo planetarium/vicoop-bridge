@@ -8,8 +8,10 @@ type Registration = { id: string; client_id: string; owner_revision: string };
 
 function verificationKey(key: KeyObject) {
   if (key.asymmetricKeyType !== 'ed25519') throw new Error('Expected an Ed25519 publication key');
-  const kid = createHash('sha256').update(key.export({ type: 'spki', format: 'der' })).digest('base64url');
-  return { ...key.export({ format: 'jwk' }), kid };
+  const { crv, kty, x } = key.export({ format: 'jwk' });
+  // RFC 8037 Appendix A.3: lexicographic ordering of the required public members.
+  const kid = createHash('sha256').update(JSON.stringify({ crv, kty, x })).digest('base64url');
+  return { crv, kty, x, kid };
 }
 
 function isPublicationLocal(local: string) {
@@ -35,8 +37,8 @@ export function loadOutboundSigner(path: string, publicUrl?: string, publicKeysP
   }
 
   function identity(reg: Registration) {
-    const address = '@' + reg.id + '@' + url.hostname;
-    if (!isPublicationLocal(reg.id) || address.length > 256) return undefined;
+    const address = 'acct:' + reg.id + '@' + url.hostname;
+    if (!isPublicationLocal(reg.id) || address.slice(4).length > 256) return undefined;
     const epoch = createHash('sha256').update(JSON.stringify([reg.id, reg.client_id, reg.owner_revision])).digest('base64url');
     return { address,
       id: url.origin + '/publication-identities/' + reg.id + '/' + epoch };
@@ -47,17 +49,18 @@ export function loadOutboundSigner(path: string, publicUrl?: string, publicKeysP
     if (!sender) throw new Error('Agent has no publishable account address');
     const created = Math.floor(Date.now() / 1000);
     const digest = 'sha-256=:' + request.digest + ':';
-    const fields = [
-      ['@method', 'POST'], ['@target-uri', request.target], ['content-type', 'application/json'],
-      ['content-digest', digest], ['mentionable-agent', sender.address], ['mentionable-subject', sender.id],
-    ];
-    const covered = fields.map(([name]) => '"' + name + '"').join(' ');
-    const params = '(' + covered + ');created=' + created + ';expires=' + (created + 60) +
-      ';nonce="' + randomUUID() + '";keyid="' + active.kid + '";alg="ed25519";tag="mentionable-publication-v1"';
-    const base = [...fields, ['@signature-params', params]].map(([k, v]) => '"' + k + '": ' + v).join('\n');
+    const member = '"' + sender.id + '"';
+    const components = '("@method" "@target-uri" "content-type" "content-digest" "signature-agent";key="sig1")';
+    const params = components + ';created=' + created + ';expires=' + (created + 60) +
+      ';nonce="' + randomUUID() + '";keyid="' + active.kid + '";alg="ed25519";tag="web-bot-auth"';
+    const base = [
+      '"@method": POST', '"@target-uri": ' + request.target, '"content-type": application/json',
+      '"content-digest": ' + digest, '"signature-agent";key="sig1": ' + member,
+      '"@signature-params": ' + params,
+    ].join('\n');
     return {
-      'content-type': 'application/json', 'content-digest': digest, 'mentionable-agent': sender.address,
-      'mentionable-subject': sender.id, 'signature-input': 'sig1=' + params,
+      'content-type': 'application/json', 'content-digest': digest,
+      'signature-agent': 'sig1=' + member, 'signature-input': 'sig1=' + params,
       signature: 'sig1=:' + sign(null, Buffer.from(base), key).toString('base64') + ':',
     };
   }

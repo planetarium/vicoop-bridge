@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const OUTBOUND_CAPABILITY = 'mentionable-publication-v1';
+export const OUTBOUND_CAPABILITY = 'publication-web-bot-auth-draft-01';
 
 export const OutboundRequest = z.object({
   target: z.string().max(4096).refine((value) => {
@@ -18,8 +18,7 @@ export type OutboundRequest = z.infer<typeof OutboundRequest>;
 export const OutboundHeaders = z.object({
   'content-type': z.literal('application/json'),
   'content-digest': z.string().max(80),
-  'mentionable-agent': z.string().max(256),
-  'mentionable-subject': z.string().max(2048),
+  'signature-agent': z.string().max(2055),
   'signature-input': z.string().max(1024),
   signature: z.string().max(128),
 }).strict();
