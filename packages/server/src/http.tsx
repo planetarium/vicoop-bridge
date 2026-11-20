@@ -651,13 +651,13 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // cannot shadow the admin entry.
   const authority = opts.publicationAuthority;
   const wellKnownDeps: WellKnownDeps = {
-    publicationIdentity: authority ? async local => {
-      const rows = await opts.db<{ id: string; client_id: string; owner_revision: string }[]>`
-        SELECT id, client_id, owner_revision::text FROM agents WHERE lower(id) = lower(${local}) LIMIT 2
+    publicationIdentity: authority ? async (local, expectedId) => {
+      const rows = await opts.db<{ id: string; client_id: string; publication_revision: string }[]>`
+        SELECT id, client_id, publication_revision::text FROM agents WHERE lower(id) = lower(${local}) LIMIT 2
       `;
       if (rows.length !== 1) return;
       const identity = authority.identity(rows[0]);
-      if (!identity) return;
+      if (!identity || (expectedId !== undefined && identity.id !== expectedId)) return;
       const keys = await authority.keysFor(rows[0]);
       if (keys.length) return { ...identity, keys };
     } : undefined,

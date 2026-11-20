@@ -4,7 +4,7 @@ import type { OutboundRequest, OutboundHeaders } from '@vicoop-bridge/protocol';
 import { isValidMentionableLocal } from './mentionable.js';
 
 export const PUBLICATION_IDENTITY_REL = 'https://mentionable.dev/ns/rel/publication-identity';
-export type Registration = { id: string; client_id: string; owner_revision: string };
+export type Registration = { id: string; client_id: string; publication_revision: string };
 
 export function verificationKey(key: KeyObject) {
   if (key.asymmetricKeyType !== 'ed25519') throw new Error('Expected an Ed25519 publication key');
@@ -26,7 +26,7 @@ export function publicationIdentity(publicUrl?: string) {
   return function identity(reg: Registration) {
     const address = 'acct:' + reg.id + '@' + url.hostname;
     if (!isPublicationLocal(reg.id) || address.slice(4).length > 256) return undefined;
-    const epoch = createHash('sha256').update(JSON.stringify([reg.id, reg.client_id, reg.owner_revision])).digest('base64url');
+    const epoch = createHash('sha256').update(JSON.stringify([reg.id, reg.client_id, reg.publication_revision])).digest('base64url');
     return { address,
       id: url.origin + '/publication-identities/' + reg.id + '/' + epoch };
   };
@@ -80,5 +80,6 @@ export function loadOutboundSigner(path: string, publicUrl?: string, publicKeysP
 export interface PublicationAuthority {
   identity: ReturnType<typeof publicationIdentity>;
   keysFor(registration: Registration): ReturnType<typeof verificationKey>[] | Promise<ReturnType<typeof verificationKey>[]>;
-  signRequest(request: OutboundRequest, registration: Registration): OutboundHeaders | Promise<OutboundHeaders>;
+  prepareRegistration?(registration: Registration, tokenHash: string): Promise<void>;
+  signRequest(request: OutboundRequest, registration: Registration, tokenHash: string): OutboundHeaders | Promise<OutboundHeaders>;
 }

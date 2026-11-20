@@ -29,7 +29,7 @@ test('receiver resolves bridge authorization through WebFinger and the current r
   let authority = loadOutboundSigner(old.path, origin);
   const body = Buffer.from('{"messageId":"one","destination":"ops","replyTo":"parent"}');
   const request = { target: 'https://receiver.example/a2a', digest: createHash('sha256').update(body).digest('base64') };
-  let registration = { id: 'agent-a', client_id: 'registration-1', owner_revision: '0' };
+  let registration = { id: 'agent-a', client_id: 'registration-1', publication_revision: '0' };
   const db = (async (_: unknown, local: string) => local === registration.id ? [registration] : []) as unknown as Sql;
   function app() {
     return createHttpApp({ registry: new Registry(), publicUrl: origin, publicationAuthority: authority, db });
@@ -82,8 +82,8 @@ test('receiver resolves bridge authorization through WebFinger and the current r
   authority = loadOutboundSigner(next.path, origin);
   server = app();
   await assert.rejects(verifyPublication(msg, { ...policy, consumeNonce: () => true }));
-  for (const updated of [{ ...registration, owner_revision: '1' },
-    { ...registration, client_id: 'replacement', owner_revision: '0' }]) {
+  for (const updated of [{ ...registration, publication_revision: '1' },
+    { ...registration, client_id: 'replacement', publication_revision: '0' }]) {
     const previous = signed();
     registration = updated;
     await assert.rejects(verifyPublication(previous, policy));

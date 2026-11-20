@@ -14,7 +14,7 @@ import {
 } from './mentionable.js';
 
 export interface WellKnownDeps {
-  publicationIdentity?: (local: string) => Promise<{ address: string; id: string; keys: unknown[] } | undefined>;
+  publicationIdentity?: (local: string, expectedId?: string) => Promise<{ address: string; id: string; keys: unknown[] } | undefined>;
   // Snapshot of currently connected client agents. Called per-request so
   // connect/disconnect changes are reflected immediately (no caching here —
   // the registry is already in-memory).
@@ -209,6 +209,15 @@ const noStoreOnAllResponses: MiddlewareHandler = async (c, next) => {
 };
 
 export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
+  async function publicationFor(local: string, expectedId?: string) {
+    try {
+      return await deps.publicationIdentity?.(local, expectedId);
+    } catch {
+      console.warn('[server] Publication directory lookup unavailable');
+      return null;
+    }
+  }
+
   app.use('/.well-known/webfinger', noStoreOnAllResponses);
   app.use('/.well-known/agent-card/:local', noStoreOnAllResponses);
   app.use('/.well-known/mentionable-agents.json', noStoreOnAllResponses);
@@ -231,7 +240,8 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
     }
     const resolved = resolveLocal(deps, parsed.local);
     const identity = parsed.local.toLowerCase() === MENTIONABLE_ADMIN_LOCAL
-      ? undefined : await deps.publicationIdentity?.(parsed.local);
+      ? undefined : await publicationFor(parsed.local);
+    if (!resolved && identity === null) return c.json({ error: 'publication directory unavailable' }, 503);
     if (!resolved && !identity) return c.json({ error: 'not found' }, 404);
 
     const aliases: string[] = [];
@@ -263,8 +273,9 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
     const local = c.req.param('local');
     if (!isMentionableEligible(deps) || !isValidMentionableLocal(local) ||
         local.toLowerCase() === MENTIONABLE_ADMIN_LOCAL) return c.notFound();
-    const identity = await deps.publicationIdentity?.(local);
     const expected = new URL(deps.publicUrl).origin + '/publication-identities/' + local + '/' + c.req.param('epoch');
+    const identity = await publicationFor(local, expected);
+    if (identity === null) return c.json({ error: 'publication directory unavailable' }, 503);
     if (!identity || identity.id !== expected) return c.notFound();
     return c.json({ keys: identity.keys }, 200, { 'Content-Type': 'application/jwk-set+json' });
   });

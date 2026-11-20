@@ -73,9 +73,11 @@ function makeApp(opts: {
   publicUrl?: string;
   domain?: string;
   deviceFlowEnabled?: boolean;
+  publicationIdentity?: WellKnownDeps['publicationIdentity'];
 }) {
   const app = new Hono();
   const deps: WellKnownDeps = {
+    publicationIdentity: opts.publicationIdentity,
     listAgents: () => opts.agents,
     getAgentCard: (conn) => fakeCardV03(conn.agentId),
     adminCard: fakeAdminCard(),
@@ -450,4 +452,19 @@ test('all routes serve when PUBLIC_URL is https with an IPv6 literal hostname', 
     '/.well-known/webfinger?resource=acct:foo@[::1]',
   );
   assert.equal(res.status, 200);
+});
+
+test('unavailable publication storage preserves a connected agent’s ordinary discovery', async () => {
+  const app = makeApp({
+    agents: [fakeConn('foo')],
+    publicationIdentity: async () => { throw new Error('internal detail'); },
+  });
+  const response = await app.request('/.well-known/webfinger?resource=acct:foo@bridge.example.com');
+  assert.equal(response.status, 200);
+  const { links } = await response.json() as { links: { rel: string }[] };
+  assert.deepEqual(links.map(link => link.rel), ['https://mentionable.dev/agent-card', 'http://webfinger.net/rel/profile-page']);
+  const directory = await app.request('/publication-identities/foo/test');
+  assert.equal(directory.status, 503);
+  assert.equal(directory.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await directory.json(), { error: 'publication directory unavailable' });
 });

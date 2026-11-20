@@ -566,7 +566,7 @@ BEGIN
   UPDATE clients AS c
   SET token_hash = v_token_hash
   WHERE c.id = rotate_client_token.client_id
-     OR c.id = (SELECT client_id FROM agents WHERE id = rotate_client_token.client_id)
+     OR c.id = (SELECT a.client_id FROM agents AS a WHERE a.id = rotate_client_token.client_id)
   RETURNING c.id, c.owner_principal, c.client_name, c.allowed_agent_ids, c.created_at, v_raw_token
   INTO v_row;
 
@@ -853,6 +853,9 @@ CREATE POLICY agent_policies_postgraphile ON agent_policies
   USING (true)
   WITH CHECK (true);
 
+CREATE SCHEMA IF NOT EXISTS bridge_private;
+CREATE TABLE IF NOT EXISTS bridge_private.issued_registration_ids (client_id TEXT PRIMARY KEY);
+
 -- One-time compatibility backfill. Legacy rows allowed multiple agent ids per
 -- client token; the new model is 1:1 and the daemon config only stores one
 -- agent_id, so we migrate the first allowed id as the persisted agent id.
@@ -880,6 +883,9 @@ SELECT
 FROM clients c
 LEFT JOIN agent_policies ap ON ap.agent_id = c.allowed_agent_ids[1]
 WHERE array_length(c.allowed_agent_ids, 1) >= 1
+  -- A renamed canonical registration can have an older shadow address.
+  AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.client_id = c.id)
+  AND NOT EXISTS (SELECT 1 FROM bridge_private.issued_registration_ids r WHERE r.client_id = c.id)
 ON CONFLICT (id) DO NOTHING;
 
 -- ------------------------------------------------------------
@@ -1208,6 +1214,72 @@ CREATE TRIGGER agents_owner_revision BEFORE UPDATE ON agents
 
 COMMENT ON COLUMN agents.owner_revision IS E'@omit create,update';
 
+-- The public publication principal is derived from address, registration ID and
+-- generation. Seed the existing generation once to preserve already-approved URLs.
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS publication_revision BIGINT;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS publication_blocked_token_hash TEXT;
+UPDATE agents SET publication_revision = owner_revision,
+  publication_blocked_token_hash = CASE WHEN owner_revision > 0 THEN token_hash END
+WHERE publication_revision IS NULL;
+ALTER TABLE agents ALTER COLUMN publication_revision SET DEFAULT 0;
+ALTER TABLE agents ALTER COLUMN publication_revision SET NOT NULL;
+COMMENT ON COLUMN agents.client_id IS E'@omit create,update';
+-- The compatibility backfill also takes the registration ID from clients.id.
+COMMENT ON COLUMN clients.id IS E'@omit create,update';
+CREATE OR REPLACE FUNCTION preserve_client_registration_id() RETURNS TRIGGER AS $$
+BEGIN
+  RAISE EXCEPTION 'A client registration ID is immutable';
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS clients_immutable_id ON clients;
+CREATE TRIGGER clients_immutable_id BEFORE UPDATE OF id ON clients
+  FOR EACH ROW WHEN (NEW.id IS DISTINCT FROM OLD.id) EXECUTE FUNCTION preserve_client_registration_id();
+COMMENT ON COLUMN agents.publication_revision IS E'@omit';
+COMMENT ON COLUMN agents.publication_blocked_token_hash IS E'@omit';
+
+CREATE OR REPLACE FUNCTION maintain_agent_publication_epoch() RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    NEW.publication_revision := 0;
+    NEW.publication_blocked_token_hash := NULL;
+    RETURN NEW;
+  END IF;
+  IF NEW.client_id IS DISTINCT FROM OLD.client_id THEN
+    RAISE EXCEPTION 'An agent registration ID is immutable';
+  END IF;
+  NEW.publication_revision := OLD.publication_revision;
+  NEW.publication_blocked_token_hash := OLD.publication_blocked_token_hash;
+  IF NEW.id IS DISTINCT FROM OLD.id OR NEW.owner_principal IS DISTINCT FROM OLD.owner_principal THEN
+    NEW.publication_revision := OLD.publication_revision + 1;
+  END IF;
+  IF NEW.owner_principal IS DISTINCT FROM OLD.owner_principal THEN
+    -- The transfer API preserves the daemon token for ordinary bridge service.
+    -- Require the successor to rotate it before publishing in their name.
+    NEW.publication_blocked_token_hash := OLD.token_hash;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS agents_publication_epoch ON agents;
+CREATE TRIGGER agents_publication_epoch BEFORE INSERT OR UPDATE ON agents
+  FOR EACH ROW EXECUTE FUNCTION maintain_agent_publication_epoch();
+
+-- A deleted registration ID never becomes available for reuse. Other database
+-- roles receive neither schema usage nor table privileges on this inventory.
+INSERT INTO bridge_private.issued_registration_ids SELECT client_id FROM agents ON CONFLICT DO NOTHING;
+CREATE OR REPLACE FUNCTION bridge_private.reserve_registration_id() RETURNS TRIGGER
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+BEGIN
+  INSERT INTO bridge_private.issued_registration_ids (client_id) VALUES (NEW.client_id);
+  RETURN NULL;
+END;
+$$;
+REVOKE ALL ON FUNCTION bridge_private.reserve_registration_id() FROM PUBLIC;
+DROP TRIGGER IF EXISTS agents_reserve_registration_id ON agents;
+CREATE TRIGGER agents_reserve_registration_id AFTER INSERT ON agents
+  FOR EACH ROW EXECUTE FUNCTION bridge_private.reserve_registration_id();
+
+
 -- Delegation is an explicit policy kind stored alongside legacy exact callers.
 -- The sticky restriction cannot be erased by generic or GraphQL policy writes.
 CREATE OR REPLACE FUNCTION preserve_federation_restriction() RETURNS trigger
@@ -1314,7 +1386,17 @@ REVOKE DELETE ON infra.operation_requests FROM app_postgraphile;
 CREATE SCHEMA IF NOT EXISTS bridge_private;
 CREATE TABLE IF NOT EXISTS bridge_private.publication_keys (
   client_id TEXT NOT NULL REFERENCES agents(client_id) ON DELETE CASCADE,
-  owner_revision BIGINT NOT NULL,
+  publication_revision BIGINT NOT NULL,
   envelope TEXT,
-  PRIMARY KEY (client_id, owner_revision)
+  public_x TEXT,
+  public_mac TEXT,
+  PRIMARY KEY (client_id, publication_revision)
+);
+
+-- Pin this database to its publication wrapping key. Pausing affects discovery
+-- and signing together, so a recovered database can be reconciled offline.
+CREATE TABLE IF NOT EXISTS bridge_private.publication_control (
+  singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+  wrapping_tag TEXT NOT NULL,
+  paused BOOLEAN NOT NULL DEFAULT FALSE
 );

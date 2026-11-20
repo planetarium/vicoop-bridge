@@ -1,5 +1,5 @@
 import { loadRegistrationSigner } from './registration-signing.js';
-import { loadOutboundSigner } from './outbound-signature.js';
+import { loadOutboundSigner, type PublicationAuthority } from './outbound-signature.js';
 import { watchAgentOwners } from './agent-transfer.js';
 import { serve } from '@hono/node-server';
 import { Registry } from './registry.js';
@@ -86,15 +86,27 @@ export interface ServerOptions {
   deviceFlowStateSecret?: string;
 }
 
-export async function startServer(opts: ServerOptions) {
-  const signingKey = process.env.VICOOP_OUTBOUND_KEY_FILE;
-  const wrappingKey = process.env.VICOOP_OUTBOUND_WRAPPING_KEY_FILE;
-  if (wrappingKey && (signingKey || process.env.VICOOP_OUTBOUND_PUBLIC_KEYS_FILE)) {
+export async function configuredPublicationAuthority(
+  db: Sql, publicUrl: string | undefined, env: NodeJS.ProcessEnv = process.env,
+): Promise<PublicationAuthority | undefined> {
+  const signingKey = env.VICOOP_OUTBOUND_KEY_FILE;
+  const wrappingKey = env.VICOOP_OUTBOUND_WRAPPING_KEY_FILE;
+  if (wrappingKey && (signingKey || env.VICOOP_OUTBOUND_PUBLIC_KEYS_FILE)) {
     throw new Error('Configure either registration signing or legacy shared signing');
   }
-  let outboundSigner;
-  if (wrappingKey) outboundSigner = loadRegistrationSigner(opts.db, wrappingKey, opts.publicUrl);
-  else if (signingKey) outboundSigner = loadOutboundSigner(signingKey, opts.publicUrl, process.env.VICOOP_OUTBOUND_PUBLIC_KEYS_FILE);
+  if (wrappingKey) return loadRegistrationSigner(db, wrappingKey, publicUrl);
+  if (!signingKey) return undefined;
+
+  const [current] = await db`SELECT EXISTS (SELECT FROM bridge_private.publication_control)
+    OR EXISTS (SELECT FROM bridge_private.publication_keys) AS migrated`;
+  if (current?.migrated) {
+    throw new Error('Shared publication signing is disabled for a migrated database');
+  }
+  return loadOutboundSigner(signingKey, publicUrl, env.VICOOP_OUTBOUND_PUBLIC_KEYS_FILE);
+}
+
+export async function startServer(opts: ServerOptions) {
+  const outboundSigner = await configuredPublicationAuthority(opts.db, opts.publicUrl);
   const policies = readOperationRegistry(process.env.VICOOP_OPERATIONS);
   await reconcileOperationPolicies(opts.db, policies);
   const registry = new Registry();
@@ -117,6 +129,7 @@ export async function startServer(opts: ServerOptions) {
   attachWsServer(server as unknown as import('node:http').Server, {
     db: opts.db,
     outboundSigner: outboundSigner?.signRequest,
+    prepareOutboundRegistration: outboundSigner?.prepareRegistration,
     registry,
   });
 
