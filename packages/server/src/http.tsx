@@ -108,7 +108,7 @@ import {
 } from './oauth/token-exchange/authorization.js';
 
 export interface ServerHttpOptions {
-  publicationAuthority?: ReturnType<typeof import('./outbound-signature.js').loadOutboundSigner>;
+  publicationAuthority?: import('./outbound-signature.js').PublicationAuthority;
   operationPolicies?: OperationDefinition[];
   registry: Registry;
   publicUrl?: string;
@@ -651,13 +651,15 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // cannot shadow the admin entry.
   const authority = opts.publicationAuthority;
   const wellKnownDeps: WellKnownDeps = {
-    publicationIdentity: authority ? async local => {
-      const rows = await opts.db<{ id: string; client_id: string; owner_revision: string }[]>`
-        SELECT id, client_id, owner_revision::text FROM agents WHERE lower(id) = lower(${local}) LIMIT 2
+    publicationIdentity: authority ? async (local, expectedId) => {
+      const rows = await opts.db<{ id: string; client_id: string; publication_revision: string }[]>`
+        SELECT id, client_id, publication_revision::text FROM agents WHERE lower(id) = lower(${local}) LIMIT 2
       `;
       if (rows.length !== 1) return;
       const identity = authority.identity(rows[0]);
-      if (identity) return { ...identity, keys: authority.keys };
+      if (!identity || (expectedId !== undefined && identity.id !== expectedId)) return;
+      const keys = await authority.keysFor(rows[0]);
+      if (keys.length) return { ...identity, keys };
     } : undefined,
     listAgents: () => opts.registry.listAgents(),
     getAgentCard: (conn) => getAgentForConn(conn).getAgentCard() as AgentCardV03,

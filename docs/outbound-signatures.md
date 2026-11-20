@@ -4,7 +4,11 @@ A trusted host can send a new JSON POST without an A2A Task. The bridge issues a
 
 ## Configure keys and the daemon
 
-Generate a dedicated Ed25519 key pair on the bridge, for example with `openssl genpkey -algorithm Ed25519 -out signing.pem` under umask 077. Export the public key with `openssl pkey -in signing.pem -pubout -out signing.pub`. Set `VICOOP_OUTBOUND_KEY_FILE` to the private PEM path on each server before starting it. Set PUBLIC_URL to the canonical HTTPS address-domain origin (default port). The bridge serves WebFinger and the public verification keys there. Each issuer needs its own keys. The key ID is unpadded base64url of the SHA-256 JWK thumbprint (RFC 8037 Appendix A.3), computed over the UTF-8 JSON object containing only `crv`, `kty`, and `x` in that order, without whitespace.
+Bridge holds an independent Ed25519 key for each registration and publication revision. A signing-enabled daemon provisions it on authenticated connection or first signing request. Public discovery reads its authenticated public-key record. The encrypted PKCS#8 private key stays in a private PostgreSQL schema. Bridge holds a separate persistent 32-byte wrapping key. Compromise of a single signing key affects its registration; access to the wrapping key and the encrypted database affects every registration.
+
+Use `VICOOP_OUTBOUND_WRAPPING_KEY_FILE` for the owner-only wrapping-key file. Fly mounts `VICOOP_OUTBOUND_WRAPPING_KEY_B64` there at startup. Existing channel approvals keep the same principal URL during migration. Rename, ownership transfer or re-registration changes that principal. After a transfer, the successor must rotate the daemon token before it can publish. Previously transferred registrations also need a one-time token rotation during migration.
+
+See the [publication key operations runbook](publication-key-operations.md) for deployment verification, per-registration revocation, wrapping-key rotation, and failure recovery.
 
 On the POSIX daemon host, choose an absolute canonical path of at most 103 bytes in an owner-only directory. For example, create it with `install -d -m 700 "$HOME/.vicoop-outbound"` and start the daemon with `VICOOP_OUTBOUND_SOCKET="$HOME/.vicoop-outbound/sign.sock" vicoop-client start`. All processes with access to that socket can act as the daemon's registered agent. If a crash leaves a socket file, first confirm the owning daemon has exited before removing it.
 
@@ -38,7 +42,7 @@ At channel approval, resolve the administrator's `acct:local@domain` at that dom
 
 The [standalone direct signer](../examples/outbound/sign-direct.mjs) can use its own authorized key. The [example verifier](../examples/outbound/verify.mjs) accepts configured HTTPS origins and a JSON loader. Fetch directly with HTTP 200, no redirects, bounded responses and timeouts. Revalidate current discovery before accepting publication and check the active grant on queued dispatch. Key rotation preserves the URL. Transfer or re-registration requires reapproval for a new URL.
 
-For rolling key changes, set `VICOOP_OUTBOUND_PUBLIC_KEYS_FILE` to a JSON array of public PEM strings for overlap. First deploy the next public key on every instance, switch the signing key on all instances while advertising both public keys, then remove the retired key after the last signature acceptance window. The active key is always included. For compromise, remove the affected key from all instances immediately.
+For legacy shared signing, set `VICOOP_OUTBOUND_KEY_FILE` to an Ed25519 private PEM. For rolling key changes in that mode, set `VICOOP_OUTBOUND_PUBLIC_KEYS_FILE` to a JSON array of public PEM strings for overlap. First deploy the next public key on every instance, switch the signing key on all instances while advertising both public keys, then remove the retired key after the last signature acceptance window. The active key is always included. For compromise, remove the affected key from all instances immediately.
 
 Supply an atomic `consumeNonce(id, nonce, retainUntilEpochSeconds)` shared by receiver instances. On a lost response, sign the same message and bytes again. The receiver owns durable deduplication by ID and message ID, destination authorization and reply permissions.
 

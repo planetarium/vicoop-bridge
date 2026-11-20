@@ -1,5 +1,5 @@
 import { OUTBOUND_CAPABILITY } from '@vicoop-bridge/protocol';
-import type { loadOutboundSigner } from './outbound-signature.js';
+import type { PublicationAuthority } from './outbound-signature.js';
 import { operationGrantIsActive } from './operation-callers.js';
 import { approvalStatus } from './tool-approvals.js';
 import { APPROVAL_EXTENSION_URI, REMOTE_APPROVAL_CAPABILITY } from '@vicoop-bridge/protocol';
@@ -56,6 +56,8 @@ interface ClientRow {
   owner_principal: string;
   owner_email: string | null;
   owner_revision: string;
+  publication_revision: string;
+  can_publish: boolean;
   allowed_callers: string[];
   x402_pricing: unknown;
 }
@@ -66,7 +68,8 @@ async function lookupByTokenHash(sql: Sql, hash: string): Promise<ClientRow | nu
   // deleted simply matches nothing and the daemon sees the 4005 "bad token"
   // path.
   const rows = await sql<ClientRow[]>`
-    SELECT id, client_id, owner_principal, owner_email, allowed_callers, x402_pricing, owner_revision::text
+    SELECT id, client_id, owner_principal, owner_email, allowed_callers, x402_pricing, owner_revision::text,
+      publication_revision::text, token_hash IS DISTINCT FROM publication_blocked_token_hash AS can_publish
     FROM agents
     WHERE token_hash = ${hash}
   `;
@@ -76,7 +79,8 @@ async function lookupByTokenHash(sql: Sql, hash: string): Promise<ClientRow | nu
 export interface ServerWsOptions {
   db: Sql;
   registry: Registry;
-  outboundSigner?: ReturnType<typeof loadOutboundSigner>['signRequest'];
+  outboundSigner?: PublicationAuthority['signRequest'];
+  prepareOutboundRegistration?: PublicationAuthority['prepareRegistration'];
   helloTimeoutMs?: number;
 }
 
@@ -113,6 +117,7 @@ type AuthResult =
   | {
       ok: true;
       clientId: string;
+      registration: ClientRow;
       cardName: string;
       cardSource: 'inline' | 'canonical';
       ownerPrincipal: string;
@@ -209,6 +214,7 @@ async function authenticateAndRegister(
   return {
     ok: true,
     clientId,
+    registration: client,
     cardName: resolvedCard.agentCard.name,
     cardSource: resolvedCard.source,
     ownerPrincipal,
@@ -355,8 +361,11 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         }
         agentId = frame.agentId;
         authed = true;
-        if (opts.outboundSigner && frame.protocolCapabilities?.includes(OUTBOUND_CAPABILITY)) {
+        if (opts.outboundSigner && result.registration.can_publish && frame.protocolCapabilities?.includes(OUTBOUND_CAPABILITY)) {
           outboundTokenHash = hashToken(frame.token);
+          void opts.prepareOutboundRegistration?.(result.registration, outboundTokenHash).catch(() => {
+            logEvent('publication_key_preparation_failed', { agentId: frame.agentId });
+          });
         }
         clearTimeout(helloTimeout);
         if (frame.protocolCapabilities?.includes(TASK_REPLAY_CAPABILITY)) {
@@ -410,9 +419,11 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           return;
         }
         signing = true;
-        void lookupByTokenHash(opts.db, outboundTokenHash).then(row => {
-          if (!row || row.id !== agentId || opts.registry.getAgent(row.id)?.ws !== ws) return reply(null);
-          reply(signer(frame.request, row));
+        const tokenHash = outboundTokenHash;
+        void lookupByTokenHash(opts.db, tokenHash).then(async row => {
+          if (!row?.can_publish || row.id !== agentId || opts.registry.getAgent(row.id)?.ws !== ws) return reply(null);
+          const headers = await signer(frame.request, row, tokenHash);
+          reply(opts.registry.getAgent(row.id)?.ws === ws ? headers : null);
         }).catch(() => reply(null)).finally(() => { signing = false; });
         break;
       }

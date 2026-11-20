@@ -1511,13 +1511,19 @@ test('remote approval frames negotiate, preserve auth-required through heartbeat
 test('outbound signing uses the live token registration without a Task and stops after revocation', async () => {
   const registry = new Registry();
   const server = createServer();
-  const registration = { id: 'agent-1', client_id: 'client-1', owner_revision: '3', allowed_callers: [],
+  const registration = { id: 'agent-1', client_id: 'client-1', owner_revision: '3', publication_revision: '5', can_publish: true, allowed_callers: [],
     owner_principal: 'owner' };
   let valid = true;
   const db = (async (_: unknown, hash: string) => valid && hash === hashToken('token') ? [registration] : []) as unknown as Sql;
   let issued = 0;
-  attachWsServer(server, { registry, db, outboundSigner(request, row) {
+  let prepared = 0;
+  attachWsServer(server, { registry, db, async prepareOutboundRegistration(row, tokenHash) {
+    assert.equal(row.publication_revision, '5');
+    assert.equal(tokenHash, hashToken('token'));
+    prepared++;
+  }, outboundSigner(request, row, tokenHash) {
     assert.equal(row.id, 'agent-1');
+    assert.equal(tokenHash, hashToken('token'));
     issued++;
     return { 'content-type': 'application/json', 'content-digest': request.digest,
       'signature-agent': 'sig1="https://agents.example/' + row.id + '"', 'signature-input': 'test', signature: 'test' };
@@ -1537,6 +1543,9 @@ test('outbound signing uses the live token registration without a Task and stops
       target: 'https://receiver.example/a2a', digest: Buffer.alloc(32).toString('base64'),
     } };
     assert.equal((await exchange(frame)).headers['signature-agent'], 'sig1="https://agents.example/agent-1"');
+    assert.equal(prepared, 1);
+    registration.can_publish = false;
+    assert.equal((await exchange(frame)).headers, null);
     valid = false;
     assert.equal((await exchange(frame)).headers, null);
     assert.equal(issued, 1);
