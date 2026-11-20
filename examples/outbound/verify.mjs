@@ -2,9 +2,9 @@
 // loadJson must fetch the supplied HTTPS URL without redirects or stale caching.
 import { createHash, createPublicKey, verify } from 'node:crypto';
 
-const relation = 'https://mentionable.dev/ns/publication/identity';
-const components = '("@method" "@target-uri" "content-type" "content-digest" "publication-address" "publication-agent-id")';
-const paramsPattern = /^;created=(\d{1,12});expires=(\d{1,12});nonce="([\w-]{22,128})";keyid="([\w-]{1,128})";alg="ed25519";tag="agent-publication-v1"$/;
+const relation = 'https://mentionable.dev/ns/rel/publication-identity';
+const components = '("@method" "@target-uri" "content-type" "content-digest" "mentionable-agent" "mentionable-subject")';
+const paramsPattern = /^;created=(0|[1-9]\d{0,11});expires=(0|[1-9]\d{0,11});nonce="([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})";keyid="([\w-]{43})";alg="ed25519";tag="mentionable-publication-v1"$/;
 
 function check(ok) { if (!ok) throw new Error('Invalid publication'); }
 
@@ -23,32 +23,47 @@ export async function verifyPublication({ method, url, headers, body }, {
   const [, created, expires, nonce, kid] = match;
   check(Number(expires) === Number(created) + 60 && Number(created) <= now + 5 && now < Number(expires) + 5);
   const signature = /^sig1=:([A-Za-z0-9+/]{86}==):$/.exec(headers.get('signature') ?? '');
-  check(signature);
-  const address = headers.get('publication-address');
-  const id = headers.get('publication-agent-id');
-  const account = /^acct:([^@\s]+)@([a-z0-9.-]+)$/.exec(address ?? '');
-  check(account);
+  check(signature && Buffer.from(signature[1], 'base64').toString('base64') === signature[1]);
+  const address = headers.get('mentionable-agent');
+  const id = headers.get('mentionable-subject');
+  const account = /^@([^@\s]+)@([a-z0-9._-]+)$/.exec(address ?? '');
+  check(account && address.length <= 256);
+  check(/^[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~]+(?:\.[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~]+)*$/.test(account[1]));
+  const labels = account[2].split('.');
+  check(labels.length >= 2 && labels.every(s => s.length && s.length <= 63 && !s.startsWith('-') && !s.endsWith('-')));
+  const acct = 'acct:' + address.slice(1);
   const origin = 'https://' + account[2];
   check(allowedOrigins.has(origin));
   const jrdUrl = new URL('/.well-known/webfinger', origin);
-  jrdUrl.searchParams.set('resource', address);
+  jrdUrl.searchParams.set('resource', acct);
   const jrd = await loadJson(jrdUrl.href);
-  check(jrd.subject === address && Array.isArray(jrd.links));
+  check(jrd.subject === acct && Array.isArray(jrd.links));
   const links = jrd.links.filter(link => link.rel === relation);
-  check(links.length === 1 && links[0].href === id && links[0].type === 'application/json');
+  check(links.length === 1 && links[0].href === id);
   const identityUrl = new URL(id);
-  check(identityUrl.origin === origin && !identityUrl.username && !identityUrl.password &&
-    !identityUrl.hash && identityUrl.href === id);
+  check(identityUrl.protocol === 'https:' && allowedOrigins.has(identityUrl.origin) && id.length <= 2048 && !identityUrl.username && !identityUrl.password &&
+    !id.includes('#') && identityUrl.href === id);
   const doc = await loadJson(id);
   check(doc.id === id && Array.isArray(doc.keys));
-  const keys = doc.keys.filter(key => key.kid === kid);
-  check(keys.length === 1 && keys[0].kty === 'OKP' && keys[0].crv === 'Ed25519' && !('d' in keys[0]));
+  const keys = new Map();
+  for (const jwk of doc.keys) {
+    check(jwk && jwk.kty === 'OKP' && jwk.crv === 'Ed25519' && !('d' in jwk) &&
+      typeof jwk.x === 'string' && /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(jwk.x) &&
+      (jwk.use === undefined || jwk.use === 'sig') &&
+      (jwk.alg === undefined || ['EdDSA', 'Ed25519'].includes(jwk.alg)) &&
+      (jwk.key_ops === undefined || (Array.isArray(jwk.key_ops) && jwk.key_ops.length === 1 && jwk.key_ops[0] === 'verify')));
+    const key = createPublicKey({ key: { kty: 'OKP', crv: 'Ed25519', x: jwk.x }, format: 'jwk' });
+    const fingerprint = createHash('sha256').update(key.export({ type: 'spki', format: 'der' })).digest('base64url');
+    check(!keys.has(fingerprint) && (jwk.kid === undefined || jwk.kid === fingerprint));
+    keys.set(fingerprint, key);
+  }
+  const key = keys.get(kid);
+  check(key);
   const base = [
     '"@method": POST', '"@target-uri": ' + url, '"content-type": application/json',
-    '"content-digest": ' + digest, '"publication-address": ' + address, '"publication-agent-id": ' + id,
+    '"content-digest": ' + digest, '"mentionable-agent": ' + address, '"mentionable-subject": ' + id,
     '"@signature-params": ' + params,
   ].join('\n');
-  const key = createPublicKey({ key: keys[0], format: 'jwk' });
   check(verify(null, Buffer.from(base), key, Buffer.from(signature[1], 'base64')));
   check(await consumeNonce(id, nonce, Number(expires) + 5));
   return { address, id };

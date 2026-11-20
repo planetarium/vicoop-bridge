@@ -1,4 +1,3 @@
-import { isPublicationLocal } from './outbound-signature.js';
 import { ApprovalDecision, OPERATION_APPROVAL_EXTENSION_URI } from '@vicoop-bridge/protocol';
 import { transferAgent } from './agent-transfer.js';
 import { authorizeRequesterApproval, RequesterDecisionBody, requesterApprovalResponse } from './requester-approvals.js';
@@ -656,8 +655,9 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       const rows = await opts.db<{ id: string; client_id: string; owner_revision: string }[]>`
         SELECT id, client_id, owner_revision::text FROM agents WHERE lower(id) = lower(${local}) LIMIT 2
       `;
-      if (rows.length !== 1 || !isPublicationLocal(rows[0].id)) return;
-      return { ...authority.identity(rows[0]), keys: authority.keys };
+      if (rows.length !== 1) return;
+      const identity = authority.identity(rows[0]);
+      if (identity) return { ...identity, keys: authority.keys };
     } : undefined,
     listAgents: () => opts.registry.listAgents(),
     getAgentCard: (conn) => getAgentForConn(conn).getAgentCard() as AgentCardV03,

@@ -2060,16 +2060,16 @@ test('private signing socket negotiates the daemon connection and correlates res
   wss.on('connection', ws => ws.on('message', data => {
     const frame = parseUpFrame(data.toString());
     if (frame.type === 'hello') {
-      assert.ok(frame.protocolCapabilities?.includes('agent-publication-v1'));
-      ws.send(encodeFrame({ type: 'hello.ack', protocolCapabilities: ['agent-publication-v1'],
+      assert.ok(frame.protocolCapabilities?.includes('mentionable-publication-v1'));
+      ws.send(encodeFrame({ type: 'hello.ack', protocolCapabilities: ['mentionable-publication-v1'],
         disconnectGraceMs: 0, maxFrameBytes: 8192 }));
     }
     if (frame.type === 'outbound.sign') {
       assert.deepEqual(frame.request, input);
       ws.send(encodeFrame({ type: 'outbound.result', requestId: crypto.randomUUID(), headers: null }));
       ws.send(encodeFrame({ type: 'outbound.result', requestId: frame.requestId, headers: {
-        'content-type': 'application/json', 'content-digest': 'digest', 'publication-agent-id': 'ops',
-        'publication-address': 'subject', signature: 'proof', 'signature-input': 'params',
+        'content-type': 'application/json', 'content-digest': 'digest', 'mentionable-subject': 'ops',
+        'mentionable-agent': 'subject', signature: 'proof', 'signature-input': 'params',
       } }));
       completed = true;
     }

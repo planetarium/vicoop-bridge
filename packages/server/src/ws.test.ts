@@ -1519,8 +1519,8 @@ test('outbound signing uses the live token registration without a Task and stops
   attachWsServer(server, { registry, db, outboundSigner(request, row) {
     assert.equal(row.id, 'agent-1');
     issued++;
-    return { 'content-type': 'application/json', 'content-digest': request.digest, 'publication-address': row.id,
-      'publication-agent-id': 'https://agents.example/id', 'signature-input': 'test', signature: 'test' };
+    return { 'content-type': 'application/json', 'content-digest': request.digest, 'mentionable-agent': row.id,
+      'mentionable-subject': 'https://agents.example/id', 'signature-input': 'test', signature: 'test' };
   } });
   const ws = new WebSocket('ws://127.0.0.1:' + await listen(server) + '/connect');
   async function exchange(frame: unknown) {
@@ -1531,12 +1531,12 @@ test('outbound signing uses the live token registration without a Task and stops
   try {
     await once(ws, 'open');
     const hello = JSON.parse(helloFrame());
-    hello.protocolCapabilities.push('agent-publication-v1');
-    assert.ok((await exchange(hello)).protocolCapabilities.includes('agent-publication-v1'));
+    hello.protocolCapabilities.push('mentionable-publication-v1');
+    assert.ok((await exchange(hello)).protocolCapabilities.includes('mentionable-publication-v1'));
     const frame = { type: 'outbound.sign', requestId: crypto.randomUUID(), request: {
       target: 'https://receiver.example/a2a', digest: Buffer.alloc(32).toString('base64'),
     } };
-    assert.equal((await exchange(frame)).headers['publication-address'], 'agent-1');
+    assert.equal((await exchange(frame)).headers['mentionable-agent'], 'agent-1');
     valid = false;
     assert.equal((await exchange(frame)).headers, null);
     assert.equal(issued, 1);

@@ -246,7 +246,7 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
       );
     }
     if (identity) links.push({ rel: PUBLICATION_IDENTITY_REL, type: 'application/json', href: identity.id });
-    const subject = identity?.address ?? `acct:${resolved!.local}@${deps.domain.toLowerCase()}`;
+    const subject = identity ? 'acct:' + identity.address.slice(1) : `acct:${resolved!.local}@${deps.domain.toLowerCase()}`;
     const jrd = { subject, aliases, links };
     // Cache-Control: no-store is applied uniformly by the route-scoped
     // middleware above, so every status (including the 400/404 errors)

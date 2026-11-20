@@ -57,8 +57,8 @@ test('receiver resolves bridge authorization through WebFinger and the current r
   await assert.rejects(check({}, { now: Math.floor(Date.now() / 1000) + 70 }));
   await assert.rejects(check({ body: Buffer.from(body.toString().replace('parent', 'other')) }));
   for (const [field, value] of [
-    ['publication-address', 'acct:other@agents.example'],
-    ['publication-agent-id', origin + '/id/other'],
+    ['mentionable-agent', '@other@agents.example'],
+    ['mentionable-subject', origin + '/id/other'],
     ['signature-input', msg.headers.get('signature-input')!.replace('publication-v1', 'another-v1')],
   ]) {
     const headers = new Headers(msg.headers);
@@ -69,6 +69,7 @@ test('receiver resolves bridge authorization through WebFinger and the current r
   assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
   const grant = await verifyPublication(signed(), policy);
   assert.deepEqual(grant, authority.identity(registration));
+  assert.ok(grant);
 
   const beforeRotation = signed();
   authority = loadOutboundSigner(next.path, origin, overlap);
@@ -94,31 +95,29 @@ test('direct signer uses the same receiver, scoped to the discovered key for its
   const { signDirect } = await import(direct.href);
   const data = JSON.parse(readFileSync(new URL('../../../examples/outbound/fixture.json', import.meta.url), 'utf8'));
   const pair = generateKeyPairSync('ed25519');
-  const endpoint = data.requests[0].url;
-  const subject = { address: data.discovery.subject, id: data.identityDocument.id };
+  const endpoint = data.audience;
+  const subject = { address: '@ops@agents.example', id: data.subject };
   const body = Buffer.from('{"messageId":"direct"}');
-  const headers = signDirect({ ...subject, endpoint, body, privateKey: pair.privateKey, kid: 'direct' });
+  const headers = signDirect({ ...subject, endpoint, body, privateKey: pair.privateKey });
   const msg = { method: 'POST', url: endpoint, body, headers };
   const policy = { endpoint, allowedOrigins: new Set([origin]), consumeNonce: () => true,
-    loadJson: (url: string) => url === subject.id ? data.identityDocument : data.discovery };
+    loadJson: (url: string) => url === subject.id ? data.discovery.identity.document : data.discovery.webfinger.document };
   await assert.rejects(verifyPublication(msg, policy));
-  data.identityDocument.keys = [{ ...pair.publicKey.export({ format: 'jwk' }), kid: 'direct' }];
+  data.discovery.identity.document.keys = [{ ...pair.publicKey.export({ format: 'jwk' }) }];
   assert.deepEqual(await verifyPublication(msg, policy), subject);
 });
 
-test('direct, delegated and rotated public vectors verify under one discovery contract', async () => {
+test('Mentionable #670 conformance vectors verify under the published discovery contract', async () => {
   const { verifyPublication } = await import(verifier.href);
   const data = JSON.parse(readFileSync(new URL('../../../examples/outbound/fixture.json', import.meta.url), 'utf8'));
-  for (const request of data.requests) {
+  const { webfinger, identity } = data.discovery;
+  const records = new Map([[webfinger.url, webfinger.document], [identity.url, identity.document]]);
+  const policy = { endpoint: data.audience, now: data.now, allowedOrigins: new Set([origin]),
+    loadJson: (url: string) => records.get(url), consumeNonce: () => true };
+  for (const { request, expected } of [...data.valid, ...data.invalid]) {
     const msg = { ...request, headers: new Headers(request.headers), body: Buffer.from(request.body) };
-    const records = new Map([
-      [origin + '/.well-known/webfinger?resource=' + encodeURIComponent(data.discovery.subject), data.discovery],
-      [data.identityDocument.id, data.identityDocument],
-    ]);
-    const policy = { endpoint: request.url, now: data.now, allowedOrigins: new Set([origin]),
-      loadJson: (url: string) => records.get(url), consumeNonce: () => true };
-    assert.deepEqual(await verifyPublication(msg, policy), { id: data.identityDocument.id, address: data.discovery.subject });
-    records.set(data.identityDocument.id, { ...data.identityDocument, keys: [] });
-    await assert.rejects(verifyPublication(msg, policy));
+    const verified = verifyPublication(msg, policy);
+    if (expected) assert.deepEqual(await verified, { id: expected.subject, address: expected.sender });
+    else await assert.rejects(verified);
   }
 });
