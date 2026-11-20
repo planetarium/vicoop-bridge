@@ -1,3 +1,4 @@
+import { PUBLICATION_IDENTITY_REL } from './outbound-signature.js';
 import { isIP } from 'node:net';
 import type { Hono, MiddlewareHandler } from 'hono';
 import type { AgentCardV03 } from '@a2x/sdk';
@@ -13,6 +14,7 @@ import {
 } from './mentionable.js';
 
 export interface WellKnownDeps {
+  publicationIdentity?: (local: string) => Promise<{ address: string; id: string; keys: unknown[] } | undefined>;
   // Snapshot of currently connected client agents. Called per-request so
   // connect/disconnect changes are reflected immediately (no caching here —
   // the registry is already in-memory).
@@ -211,7 +213,7 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
   app.use('/.well-known/agent-card/:local', noStoreOnAllResponses);
   app.use('/.well-known/mentionable-agents.json', noStoreOnAllResponses);
 
-  app.get('/.well-known/webfinger', (c) => {
+  app.get('/.well-known/webfinger', async (c) => {
     if (!isMentionableEligible(deps)) {
       return c.json({ error: 'webfinger not available (PUBLIC_URL must be HTTPS with a multi-label hostname)' }, 404);
     }
@@ -228,30 +230,24 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
       return c.json({ error: 'not found' }, 404);
     }
     const resolved = resolveLocal(deps, parsed.local);
-    if (!resolved) return c.json({ error: 'not found' }, 404);
+    const identity = parsed.local.toLowerCase() === MENTIONABLE_ADMIN_LOCAL
+      ? undefined : await deps.publicationIdentity?.(parsed.local);
+    if (!resolved && !identity) return c.json({ error: 'not found' }, 404);
 
-    // Admin lives at the bridge root; clients live under /agents/<id>.
-    const isAdmin = resolved.local === MENTIONABLE_ADMIN_LOCAL;
-    const aliasUrl = isAdmin
-      ? `${deps.publicUrl}/`
-      : `${deps.publicUrl}/agents/${resolved.local}`;
-    const subject = `acct:${resolved.local}@${deps.domain.toLowerCase()}`;
-    const jrd = {
-      subject,
-      aliases: [aliasUrl],
-      links: [
-        {
-          rel: MENTIONABLE_AGENT_CARD_REL,
-          type: 'application/json',
-          href: `${deps.publicUrl}/.well-known/agent-card/${resolved.local}`,
-        },
-        {
-          rel: 'http://webfinger.net/rel/profile-page',
-          type: 'text/html',
-          href: `${deps.publicUrl}/`,
-        },
-      ],
-    };
+    const aliases: string[] = [];
+    const links: { rel: string; type: string; href: string }[] = [];
+    if (resolved) {
+      aliases.push(resolved.local === MENTIONABLE_ADMIN_LOCAL
+        ? `${deps.publicUrl}/`
+        : `${deps.publicUrl}/agents/${resolved.local}`);
+      links.push(
+        { rel: MENTIONABLE_AGENT_CARD_REL, type: 'application/json', href: `${deps.publicUrl}/.well-known/agent-card/${resolved.local}` },
+        { rel: 'http://webfinger.net/rel/profile-page', type: 'text/html', href: `${deps.publicUrl}/` },
+      );
+    }
+    if (identity) links.push({ rel: PUBLICATION_IDENTITY_REL, type: 'application/json', href: identity.id });
+    const subject = identity?.address ?? `acct:${resolved!.local}@${deps.domain.toLowerCase()}`;
+    const jrd = { subject, aliases, links };
     // Cache-Control: no-store is applied uniformly by the route-scoped
     // middleware above, so every status (including the 400/404 errors)
     // carries it.
@@ -260,6 +256,17 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
         'Content-Type': 'application/jrd+json; charset=utf-8',
       },
     });
+  });
+
+  app.use('/publication-identities/:local/:epoch', noStoreOnAllResponses);
+  app.get('/publication-identities/:local/:epoch', async c => {
+    const local = c.req.param('local');
+    if (!isMentionableEligible(deps) || !isValidMentionableLocal(local) ||
+        local.toLowerCase() === MENTIONABLE_ADMIN_LOCAL) return c.notFound();
+    const identity = await deps.publicationIdentity?.(local);
+    const expected = new URL(deps.publicUrl).origin + '/publication-identities/' + local + '/' + c.req.param('epoch');
+    if (!identity || identity.id !== expected) return c.notFound();
+    return c.json({ id: identity.id, keys: identity.keys });
   });
 
   app.get('/.well-known/agent-card/:local', (c) => {

@@ -1,21 +1,83 @@
 {
-  "publicKey": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAMxmeDId490sYm+QxGtJBzhE9TeDdtoQodV4m6qIcU7Q=\n-----END PUBLIC KEY-----\n",
-  "now": 1795169410,
-  "method": "POST",
-  "url": "https://receiver.example/a2a?profile=publication",
-  "recipient": "reports",
-  "body": "{\"messageId\":\"notice-42\",\"destination\":\"operations\",\"replyTo\":\"parent-7\",\"text\":\"점검 완료\"}",
-  "headers": {
-    "content-type": "application/json",
-    "content-digest": "sha-256=:jLlkc1STNplDNRLhFCdV1DvWuPanpXRPajyNr7VQfr0=:",
-    "vicoop-sender": "WyJvcGVyYXRpb25zIiwicmVnaXN0cmF0aW9uLTEiLCIwIl0",
-    "vicoop-recipient": "reports",
-    "signature-input": "sig1=(\"@method\" \"@target-uri\" \"content-type\" \"content-digest\" \"vicoop-recipient\" \"vicoop-sender\");created=1795169410;expires=1795169470;nonce=\"13b87f08-8de8-490e-b9dd-5eb76ec2b9f5\";keyid=\"P0S18pe8Fa4DSa75SgWnCYVrx_jqYZPOK9Gu-I40WOY\";alg=\"ed25519\";tag=\"vicoop-publish-v1\"",
-    "signature": "sig1=:362D3Tt4Ozgy6tymmPcrl771l8hGaEvGbDKAXJ++htZQfkgMQzuQdh7yuYoHB64R4QShnaGehWjIAi4Qy0EvBg==:"
+  "now": 1800000030,
+  "discovery": {
+    "subject": "acct:ops@agents.example",
+    "links": [
+      {
+        "rel": "https://mentionable.dev/ns/publication/identity",
+        "href": "https://agents.example/agents/id/2948c4c3-440d-4bc4-8497-4b971992533b",
+        "type": "application/json"
+      }
+    ]
   },
-  "expected": {
-    "agentId": "operations",
-    "clientId": "registration-1",
-    "ownerRevision": "0"
-  }
+  "identityDocument": {
+    "id": "https://agents.example/agents/id/2948c4c3-440d-4bc4-8497-4b971992533b",
+    "keys": [
+      {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": "jBUVZFVehnKmu1bEmS-DhIRiQ9jR2ta0jk82ANkhgwk",
+        "kid": "direct"
+      },
+      {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": "b5zcgyhxP0raoqKH-m76uCTfNVBc4jyCDrzRW_Jxx2A",
+        "kid": "delegated"
+      },
+      {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": "xspHe_u2DPinhCBfqHFsw8EEHZQqUYAssYyYyAbN2e0",
+        "kid": "rotated"
+      }
+    ]
+  },
+  "requests": [
+    {
+      "method": "POST",
+      "url": "https://connector.example/api/publications",
+      "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"SendMessage\",\"params\":{\"message\":{\"role\":\"ROLE_USER\",\"messageId\":\"notice-1\",\"parts\":[{\"text\":\"Session expired\"}],\"extensions\":[\"https://mentionable.dev/ns/publication/v0.1\"],\"metadata\":{\"https://mentionable.dev/ns/publication/v0.1\":{\"destinationId\":\"ops\"}}}}",
+      "headers": {
+        "content-type": "application/json",
+        "content-digest": "sha-256=:F5nHyuJclMGGHpGdp5zIrj5xeAu6BT8r3xfkZe9IafM=:",
+        "publication-address": "acct:ops@agents.example",
+        "publication-agent-id": "https://agents.example/agents/id/2948c4c3-440d-4bc4-8497-4b971992533b",
+        "a2a-version": "1.0",
+        "a2a-extensions": "https://mentionable.dev/ns/publication/v0.1",
+        "signature-input": "sig1=(\"@method\" \"@target-uri\" \"content-type\" \"content-digest\" \"publication-address\" \"publication-agent-id\");created=1800000000;expires=1800000060;nonce=\"AQEBAQEBAQEBAQEBAQEBAQ\";keyid=\"direct\";alg=\"ed25519\";tag=\"agent-publication-v1\"",
+        "signature": "sig1=:vcCCnnZtJKtof5MmIVUnj+czsmD8U+R0Bc+0wpob5VIG6TNzmBs75HFy7yGRDmubBbevovE8GHyINzWmFoChAA==:"
+      }
+    },
+    {
+      "method": "POST",
+      "url": "https://connector.example/api/publications",
+      "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"SendMessage\",\"params\":{\"message\":{\"role\":\"ROLE_USER\",\"messageId\":\"notice-1\",\"parts\":[{\"text\":\"Session expired\"}],\"extensions\":[\"https://mentionable.dev/ns/publication/v0.1\"],\"metadata\":{\"https://mentionable.dev/ns/publication/v0.1\":{\"destinationId\":\"ops\"}}}}",
+      "headers": {
+        "content-type": "application/json",
+        "content-digest": "sha-256=:F5nHyuJclMGGHpGdp5zIrj5xeAu6BT8r3xfkZe9IafM=:",
+        "publication-address": "acct:ops@agents.example",
+        "publication-agent-id": "https://agents.example/agents/id/2948c4c3-440d-4bc4-8497-4b971992533b",
+        "a2a-version": "1.0",
+        "a2a-extensions": "https://mentionable.dev/ns/publication/v0.1",
+        "signature-input": "sig1=(\"@method\" \"@target-uri\" \"content-type\" \"content-digest\" \"publication-address\" \"publication-agent-id\");created=1800000000;expires=1800000060;nonce=\"AgICAgICAgICAgICAgICAg\";keyid=\"delegated\";alg=\"ed25519\";tag=\"agent-publication-v1\"",
+        "signature": "sig1=:KdAF5QtB0Z69CcmsNt60Ehlp2dCNx58a6SlIzbcs0Ania75AWsBVwt/CHfQuls86Ru1u3uszoY1B/Z8lPEffDw==:"
+      }
+    },
+    {
+      "method": "POST",
+      "url": "https://connector.example/api/publications",
+      "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"SendMessage\",\"params\":{\"message\":{\"role\":\"ROLE_USER\",\"messageId\":\"notice-1\",\"parts\":[{\"text\":\"Session expired\"}],\"extensions\":[\"https://mentionable.dev/ns/publication/v0.1\"],\"metadata\":{\"https://mentionable.dev/ns/publication/v0.1\":{\"destinationId\":\"ops\"}}}}",
+      "headers": {
+        "content-type": "application/json",
+        "content-digest": "sha-256=:F5nHyuJclMGGHpGdp5zIrj5xeAu6BT8r3xfkZe9IafM=:",
+        "publication-address": "acct:ops@agents.example",
+        "publication-agent-id": "https://agents.example/agents/id/2948c4c3-440d-4bc4-8497-4b971992533b",
+        "a2a-version": "1.0",
+        "a2a-extensions": "https://mentionable.dev/ns/publication/v0.1",
+        "signature-input": "sig1=(\"@method\" \"@target-uri\" \"content-type\" \"content-digest\" \"publication-address\" \"publication-agent-id\");created=1800000000;expires=1800000060;nonce=\"AwMDAwMDAwMDAwMDAwMDAw\";keyid=\"rotated\";alg=\"ed25519\";tag=\"agent-publication-v1\"",
+        "signature": "sig1=:kQJsMovc+AcywOBUhK9q/YlmP/5Dm4KLuv2g6NLl6vlgtuFfNKhAojVs7dKMaqkT9LR2HlNYinFKhTYYq3+vDg==:"
+      }
+    }
+  ]
 }
