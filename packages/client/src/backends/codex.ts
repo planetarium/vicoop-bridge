@@ -1,3 +1,5 @@
+import { MAX_HOST_HISTORY_TURNS, readHostConversation, type HostTurn } from './codex-host-history.js';
+import { hostProposalTool, proposalToolDefinition } from '../operation-proposals.js';
 import { currentApprovalRequester, type RequestApproval } from '../remote-approval.js';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
@@ -13,6 +15,7 @@ import type { Backend } from '../backend.js';
 import {
   appendCallerContextInstruction,
   callerContextSessionKey,
+  normalizeCallerContext,
   neutralizeCallerContextMarkers,
   wrapUserMessageWithCallerContext,
 } from '../caller-context.js';
@@ -62,6 +65,7 @@ export type CodexSandboxMode = SandboxMode;
 export type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline' | 'remote';
 
 export interface CodexBackendOptions {
+  hostOperations?: string[];
   functionFileDelivery?: {
     description: string;
     filesEnabled?: boolean;
@@ -150,6 +154,8 @@ interface SessionEntry {
   // safe only while both caller attribution and composed instructions match.
   callerKey: string;
   instructionsKey: string;
+  toolsKey: string;
+  hostTurns?: HostTurn[] | null;
 }
 
 const DEFAULT_HEARTBEAT_MS = HEARTBEAT_INTERVAL_MS;
@@ -982,19 +988,26 @@ export function createCodexFileToolHandler(
   signal: AbortSignal,
   currentTurn: () => string | null,
   allowedTools: readonly string[] = ['send_file'],
+  waitForTurn?: () => Promise<string | null>,
 ): (call: DynamicToolCallParams) => Promise<DynamicToolCallResponse> {
   let requests = 0;
   let pending = 0;
   return async call => {
-    const turnId = currentTurn();
-    if (!allowedTools.includes(call.tool) || call.namespace != null || signal.aborted ||
-        (turnId !== null && call.turnId !== turnId))
+    if (!allowedTools.includes(call.tool) || call.namespace != null || signal.aborted)
       return { success: false, contentItems: [] };
     if (pending >= MAX_PENDING_FILE_REQUESTS || requests >= MAX_FILE_REQUESTS_PER_EXECUTION)
       return { success: false, contentItems: [{ type: 'inputText', text: 'Attachment request limit reached' }] };
     pending++;
     requests++;
     try {
+      let turnId = currentTurn();
+      if (!turnId) {
+        // Server requests and the turn/start reply can arrive in either order.
+        // Bound both outstanding requests (above) and a peer that never replies.
+        turnId = waitForTurn ? await withTimeout(waitForTurn(), 5_000, 'Turn confirmation timed out') : null;
+        if (!turnId || turnId !== currentTurn()) return { success: false, contentItems: [] };
+      }
+      if (signal.aborted || (turnId !== null && turnId !== call.turnId)) return { success: false, contentItems: [] };
       const receipt = await send(call.arguments, signal, call.tool);
       return { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(receipt) }] };
     } catch {
@@ -1231,6 +1244,7 @@ export function createCodexBackend(
 
   return {
     name: 'codex',
+    hostOperations: opts.hostOperations,
     remoteApprovals: approvalDecision === 'remote',
 
     // Advertise the underlying model(s) on the openai-compat/v1 extension's
@@ -1477,13 +1491,10 @@ export function createCodexBackend(
           envelopeModel = undefined;
         }
         const fileDelivery = envelope === null ? opts.functionFileDelivery : undefined;
-        const hostTools = fileDelivery ? [
+        const hostProposal = envelope === null ? hostProposalTool(opts.hostOperations, task, emit, signal) : undefined;
+        const hostTools = hostProposal ? [hostProposal.definition] : fileDelivery ? [
           ...(fileDelivery.filesEnabled !== false ? [{ name: 'send_file', description: fileDelivery.description, inputSchema: callerFileToolSchema }] : []),
-          ...(fileDelivery.operations?.length ? [{ name: 'propose_operation',
-            description: 'Propose an operation for operator review and host execution.',
-            inputSchema: { type: 'object', properties: { operation: { type: 'string', enum: fileDelivery.operations }, arguments: { type: 'object' } },
-              required: ['operation', 'arguments'], additionalProperties: false },
-          }] : []),
+          ...(fileDelivery.operations?.length ? [proposalToolDefinition(fileDelivery.operations)] : []),
         ] : undefined;
         const dynamicTools =
           envelopeTools && callerToolDispatchActive(envelopeTools, envelopeToolChoice)
@@ -1627,24 +1638,49 @@ export function createCodexBackend(
           const sessionReuseEligible = envelope === null && sessionTtlMs > 0;
           const tNow = now();
           if (sessionReuseEligible) evictExpired(tNow - sessionTtlMs);
-          const callerKey = callerContextSessionKey(task.caller);
+          const callerIdentity = callerContextSessionKey(task.caller);
+          const callerKey = opts.hostOperations?.length ? JSON.stringify([callerIdentity, task.executionScope?.id]) : callerIdentity;
           // Codex persists dynamic tools at thread/start. A change in negotiated
           // host tools needs a fresh thread so its tool list matches this turn.
           const instructionsKey = createHash('sha256')
-            .update(JSON.stringify([systemPrompt ?? '', hostTools]))
-            .digest('hex');
+            .update(systemPrompt ?? '').digest('hex');
+          const toolsKey = JSON.stringify(hostTools ?? []);
           const stored = sessionReuseEligible ? sessions.get(task.contextId) : undefined;
-          const existing = stored?.callerKey === callerKey && stored.instructionsKey === instructionsKey ? stored : undefined;
+          const sameCaller = stored?.callerKey === callerKey && stored.instructionsKey === instructionsKey ? stored : undefined;
+          const existing = sameCaller?.toolsKey === toolsKey ? sameCaller : undefined;
+          const trackHostHistory = Boolean(opts.hostOperations?.length && task.executionScope && normalizeCallerContext(task.caller)?.principal);
+          const transferError = { code: 'context_transfer_failed',
+            message: 'Codex could not carry this conversation to the new operation tool set. Retry with the previous tool set, or start a new context and supply the relevant details.' };
+          const migrate = trackHostHistory && sameCaller && !existing ? sameCaller : undefined;
+          // A canceled or stalled history RPC must release the A2A context lock.
+          // Use one deadline across reads, replacement thread startup and injection.
+          const transferSignal = migrate
+            ? AbortSignal.any([signal, AbortSignal.timeout(turnTimeoutMs > 0 ? Math.min(10_000, turnTimeoutMs) : 10_000)])
+            : signal;
+          const reportTransferFailure = () => {
+            if (signal.aborted) {
+              emit({ type: 'task.complete', taskId: task.taskId, status: { state: 'canceled', timestamp: new Date().toISOString() } });
+            } else {
+              emit({ type: 'task.fail', taskId: task.taskId, error: transferError });
+            }
+          };
+          let transferred: ResponsesApiItem[] | undefined;
+          if (migrate) {
+            try {
+              if (!migrate.hostTurns) throw new Error('History unavailable');
+              transferred = await readHostConversation(migrate.hostTurns, threadId =>
+                client.request('thread/read', { threadId, includeTurns: true }, transferSignal));
+            } catch {
+              reportTransferFailure();
+              return;
+            }
+          }
           let writeId = 0;
           if (sessionReuseEligible) {
             writeId = ++writeCounter;
             if (existing) {
               sessions.set(task.contextId, {
-                threadId: existing.threadId,
-                lastUsedAt: tNow,
-                writeId,
-                callerKey,
-                instructionsKey,
+                ...existing, lastUsedAt: tNow, writeId,
               });
             }
           }
@@ -1656,11 +1692,7 @@ export function createCodexBackend(
             const cur = sessions.get(task.contextId);
             if (cur?.threadId === existing.threadId && cur.writeId === writeId) {
               sessions.set(task.contextId, {
-                threadId: existing.threadId,
-                lastUsedAt: existing.lastUsedAt,
-                writeId: ++writeCounter,
-                callerKey,
-                instructionsKey,
+                ...existing, writeId: ++writeCounter,
               });
             }
           };
@@ -1668,7 +1700,8 @@ export function createCodexBackend(
             if (isResume || !sessionReuseEligible || !observedThreadId) return;
             const cur = sessions.get(task.contextId);
             if (cur?.threadId === observedThreadId && cur.writeId === writeId) {
-              sessions.delete(task.contextId);
+              if (migrate) sessions.set(task.contextId, migrate);
+              else sessions.delete(task.contextId);
             }
           };
 
@@ -1804,7 +1837,7 @@ export function createCodexBackend(
                   sandbox: sandboxMode,
                   ...(approvalDecision === 'remote' ? { approvalPolicy: 'untrusted' } : {}),
                   ...(threadConfig ? { config: threadConfig } : {}),
-                },
+                }, transferSignal,
               );
               threadId = resumeResult.thread.id;
               if (typeof resumeResult.model === 'string') threadModel = resumeResult.model;
@@ -1823,7 +1856,7 @@ export function createCodexBackend(
                   // re-hydrates them on `thread/resume`, so we only send
                   // them on the initial start.
                   ...(hostTools ? { dynamicTools: hostTools } : dynamicTools ? { dynamicTools } : {}),
-                },
+                }, transferSignal,
               );
               threadId = startResult.thread.id;
               if (typeof startResult.model === 'string') threadModel = startResult.model;
@@ -1834,13 +1867,9 @@ export function createCodexBackend(
                   lastUsedAt: now(),
                   writeId,
                   callerKey,
-                  instructionsKey,
+                  instructionsKey, toolsKey, hostTurns: migrate?.hostTurns ?? (trackHostHistory ? [] : undefined),
                 });
               }
-            }
-            if (approvalDecision === 'remote') {
-              approvalThreadId = threadId;
-              approvalHandlers.set(threadId, { request: requestApproval, signal: turnLifetime.signal });
             }
             // Append prior conversation (if any) as native Responses API
             // items so codex's session builder includes them in the model
@@ -1849,15 +1878,22 @@ export function createCodexBackend(
             // `chat_history` blob in user text and may re-emit the same
             // envelope when the user prompt contains a "use a tool"
             // imperative (#176). Skip when there are no items to inject.
-            if (historyInjectItems && historyInjectItems.length > 0) {
+            const inject = transferred ?? historyInjectItems;
+            if (inject?.length) {
               await client.request('thread/inject_items', {
                 threadId,
-                items: historyInjectItems,
-              });
+                items: inject,
+              }, transferSignal);
             }
+            transferSignal.throwIfAborted();
             recorder.mark('threadReady');
           } catch (err) {
+            rollbackFreshThread();
             rollbackResumeRefresh();
+            if (migrate || signal.aborted) {
+              reportTransferFailure();
+              return;
+            }
             // Transport closed mid-handshake: report as crash so operator
             // sees the same code as a startup-time failure; the next task
             // will re-spawn the client.
@@ -1885,9 +1921,33 @@ export function createCodexBackend(
 
           // Subscribe to notifications scoped to our turn. The turnId is
           // not known until `turn/start` returns; we capture it then
-          // filter incoming notifications by it. Prior to capture we
-          // ignore turn-level events (no turn of ours is yet on the wire).
+          // replay only its buffered notifications, in their original order.
           let activeTurnId: string | null = null;
+          let turnOpen = false;
+          let currentTurnReady = Promise.resolve<string | null>(null);
+          let waitingRequests = 0;
+          const matchesTurn = async (turnId: unknown): Promise<boolean> => {
+            if (!turnOpen || signal.aborted || typeof turnId !== 'string') return false;
+            if (activeTurnId) return turnId === activeTurnId;
+            if (waitingRequests >= MAX_PENDING_FILE_REQUESTS) return false;
+            waitingRequests++;
+            try {
+              const confirmed = await withTimeout(currentTurnReady, 5_000, 'Turn confirmation timed out');
+              return turnOpen && !signal.aborted && confirmed === turnId && activeTurnId === confirmed;
+            } catch {
+              return false;
+            } finally {
+              waitingRequests--;
+            }
+          };
+          if (approvalDecision === 'remote') {
+            approvalThreadId = threadId;
+            approvalHandlers.set(threadId, {
+              request: async (toolName, input, approvalSignal) =>
+                await matchesTurn(input.turnId) ? requestApproval(toolName, input, approvalSignal) : 'deny',
+              signal: AbortSignal.any([signal, turnLifetime.signal]),
+            });
+          }
           let finalText: string | null = null;
           // Explicit widening type — without this TS infers a too-narrow type
           // through the `if (parsed) finalUsage = parsed;` assignment when
@@ -1972,14 +2032,15 @@ export function createCodexBackend(
           // dynamicTools with SessionMeta and the resumed thread can still
           // invoke them. The handler is unregistered in the `finally` of
           // the outer try that wraps the turn loop below.
-          if (fileDelivery) {
-            const send = fileDelivery.bind();
+          if (hostProposal || fileDelivery) {
+            const send = hostProposal ? async (input: unknown) => hostProposal.propose(input) : fileDelivery!.bind();
             const executionSignal = AbortSignal.any([signal, turnLifetime.signal]);
             registeredThreadId = threadId;
-            toolCallHandlers.set(threadId, createCodexFileToolHandler(send, executionSignal, () => activeTurnId, hostTools?.map(tool => tool.name)));
+            toolCallHandlers.set(threadId, createCodexFileToolHandler(send, executionSignal, () => turnOpen ? activeTurnId : null, hostTools?.map(tool => tool.name), () => currentTurnReady));
           } else if (envelope) {
             registeredThreadId = threadId;
             toolCallHandlers.set(threadId, async (p) => {
+              if (!await matchesTurn(p.turnId)) return { success: false, contentItems: [] };
               capturedToolCall = true;
               // OpenAI Chat Completions requires `arguments` as a JSON-encoded
               // string; codex hands us a parsed JSON value, so we stringify
@@ -2096,6 +2157,9 @@ export function createCodexBackend(
             // The previous turn's id would filter out this turn's
             // notifications until `turn/start` answers.
             activeTurnId = null;
+            turnOpen = true;
+            let confirmTurn!: (id: string | null) => void;
+            currentTurnReady = new Promise(resolveId => { confirmTurn = resolveId; });
             finalText = null;
             finalUsage = null;
             priorTurnUsageMark = lastUsageMark;
@@ -2103,10 +2167,16 @@ export function createCodexBackend(
             turnHostToolItems = 0;
             turnHostToolFailures = 0;
             turnHostToolKinds.clear();
+            const earlyEvents: Array<{ turnId: string; method: string; params: unknown }> = [];
+            let earlyBytes = 0;
             let settled = false;
             const finish = (o: TurnRunOutcome): void => {
               if (settled) return;
               settled = true;
+              turnOpen = false;
+              confirmTurn(null);
+              currentTurnReady = Promise.resolve(null);
+              earlyEvents.length = 0;
               cleanupNotifications();
               // Disarm a pending deferred interrupt — the turn already
               // reached a terminal state, so firing it later would only
@@ -2120,16 +2190,8 @@ export function createCodexBackend(
               resolve(o);
             };
 
-            const cleanupNotifications = client.onNotification((method, params) => {
-              // Notifications are per app-server client, and tasks on other
-              // contexts share it. The `turnId` checks below only work once
-              // `turn/start` has answered; until then another thread's usage,
-              // items, text or even `turn/completed` would be taken for ours.
-              // Every turn-scoped notification carries `threadId`, so drop the
-              // foreign ones here. A notification without one falls through to
-              // the `turnId` checks as before.
-              const notifiedThreadId = (params as { threadId?: unknown } | undefined)?.threadId;
-              if (typeof notifiedThreadId === 'string' && notifiedThreadId !== threadId) return;
+            const applyNotification = (method: string, params: unknown): void => {
+              if (settled || (signal.aborted && method !== 'turn/completed')) return;
               if (method === 'thread/tokenUsage/updated') {
                 const p = params as
                   | {
@@ -2138,7 +2200,6 @@ export function createCodexBackend(
                       tokenUsage?: unknown;
                     }
                   | undefined;
-                if (activeTurnId && p?.turnId !== activeTurnId) return;
                 // Not this turn's accounting but a repeat of the previous
                 // turn's: not usage, not a model round, and not the signal the
                 // deferred tool-call interrupt is waiting for.
@@ -2161,7 +2222,6 @@ export function createCodexBackend(
               }
               if (method === 'item/completed') {
                 const p = params as { item?: ThreadItem; turnId?: string } | undefined;
-                if (activeTurnId && p?.turnId !== activeTurnId) return;
                 const item = p?.item;
                 if (!item) return;
                 if (item.type === 'agentMessage' && typeof item.text === 'string') {
@@ -2189,8 +2249,6 @@ export function createCodexBackend(
                 return;
               }
               if (method === 'item/agentMessage/delta') {
-                const p = params as { turnId?: string } | undefined;
-                if (activeTurnId && p?.turnId !== activeTurnId) return;
                 recorder.mark('firstDelta');
                 const delta = extractAgentMessageDelta(params);
                 if (delta) {
@@ -2210,7 +2268,6 @@ export function createCodexBackend(
                     }
                   | undefined;
                 const t = p?.turn;
-                if (activeTurnId && t?.id !== activeTurnId) return;
                 if (t?.status === 'completed') {
                   finish({ status: 'completed', finalText });
                 } else if (t?.status === 'interrupted') {
@@ -2223,9 +2280,29 @@ export function createCodexBackend(
                   });
                 }
               }
+            };
+            const cleanupNotifications = client.onNotification((method, params) => {
+              if (!['item/completed', 'item/agentMessage/delta', 'turn/completed', 'thread/tokenUsage/updated'].includes(method)) return;
+              const event = params as { threadId?: string; turnId?: string; turn?: { id?: string } } | undefined;
+              if (event?.threadId !== undefined && event.threadId !== threadId) return;
+              const turnId = method === 'turn/completed' ? event?.turn?.id : event?.turnId;
+              if (typeof turnId !== 'string') return;
+              if (activeTurnId) {
+                if (activeTurnId === turnId) applyNotification(method, params);
+                return;
+              }
+              if (signal.aborted && method !== 'turn/completed') return;
+              earlyBytes += Buffer.byteLength(JSON.stringify(params));
+              if (earlyEvents.length >= 512 || earlyBytes > 2 * 1024 * 1024) {
+                finish({ status: 'failed', finalText, error: { message: 'Too many Codex notifications before turn confirmation' } });
+                return;
+              }
+              earlyEvents.push({ turnId, method, params });
             });
 
             const onAbort = (): void => {
+              turnOpen = false;
+              confirmTurn(null);
               // Best-effort `turn/interrupt`; the resolution will land on
               // turn/completed status:'interrupted'. If the rpc client is
               // dead we still resolve as aborted.
@@ -2251,7 +2328,6 @@ export function createCodexBackend(
               }, 2_000);
             };
             signal.addEventListener('abort', onAbort);
-            if (signal.aborted) onAbort();
 
             // Shared liveness heartbeat — see heartbeat.ts. Routes through the
             // wrapped `emit` so a heartbeat refreshes the silence window;
@@ -2267,6 +2343,11 @@ export function createCodexBackend(
               clearIntervalFn: clearIntervalImpl,
               intervalMs: heartbeatMs,
             });
+
+            if (signal.aborted) {
+              finish({ status: 'aborted', finalText });
+              return;
+            }
 
             // Wire client-side timeout if configured. The default 0 means
             // wait for the server.
@@ -2304,8 +2385,19 @@ export function createCodexBackend(
               })
               .then(
                 (res) => {
+                  // Even after cancellation, timeout, or buffer overflow, stop
+                  // exactly the native turn created by this start request.
+                  if (settled || signal.aborted) {
+                    void client.request('turn/interrupt', { threadId, turnId: res.turn.id }).catch(() => {});
+                    if (settled) return;
+                  }
                   activeTurnId = res.turn.id;
+                  confirmTurn(signal.aborted ? null : activeTurnId);
                   recorder.mark('turnStarted');
+                  for (const event of earlyEvents) {
+                    if (event.turnId === activeTurnId) applyNotification(event.method, event.params);
+                  }
+                  earlyEvents.length = 0;
                 },
                 (err) => {
                   finish({
@@ -2471,7 +2563,7 @@ export function createCodexBackend(
           }
 
           // Map turn outcome to A2A lifecycle.
-          if (outcome.status === 'interrupted' || outcome.status === 'aborted') {
+          if (signal.aborted || outcome.status === 'interrupted' || outcome.status === 'aborted') {
             // Caller-side abort (`signal.aborted`) takes precedence: surface
             // as `canceled` regardless of whether we also captured a tool
             // call, because the caller asked for cancelation.
@@ -2484,6 +2576,7 @@ export function createCodexBackend(
               // caller side (the next A2A turn ships the result via
               // `chat_history`).
             } else {
+              if (existing?.hostTurns) existing.hostTurns = null;
               rollbackFreshThread();
               rollbackResumeRefresh();
               emit({
@@ -2496,6 +2589,7 @@ export function createCodexBackend(
           }
 
           if (outcome.status === 'failed') {
+            if (existing?.hostTurns) existing.hostTurns = null;
             rollbackFreshThread();
             rollbackResumeRefresh();
             emit({
@@ -2514,15 +2608,17 @@ export function createCodexBackend(
             const cur = sessions.get(task.contextId);
             if (cur?.threadId === existing.threadId && cur.writeId === writeId) {
               sessions.set(task.contextId, {
-                threadId: existing.threadId,
-                lastUsedAt: now(),
-                writeId,
-                callerKey,
-                instructionsKey,
+                ...existing, lastUsedAt: now(), writeId,
               });
             }
           }
 
+          const completedSession = sessions.get(task.contextId);
+          if (trackHostHistory && completedSession?.writeId === writeId && completedSession.threadId === threadId) {
+            const turns = completedSession.hostTurns;
+            completedSession.hostTurns = turns && activeTurnId && turns.length < MAX_HOST_HISTORY_TURNS
+              ? [...turns, { threadId, turnId: activeTurnId }] : null;
+          }
           const completeText = outcome.finalText ?? '';
           // When the model invoked a caller tool, the assistant text codex
           // streamed before the function_call is best treated as reasoning

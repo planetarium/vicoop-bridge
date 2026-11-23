@@ -30,6 +30,8 @@ export const CALLER_CONTEXT_V2_CAPABILITY = 'caller-context-v2';
 // advertise this capability. Federated admission additionally requires the
 // separately negotiated FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY.
 export const CALLER_RUNTIME_V1_CAPABILITY = 'caller-runtime-v1';
+// A host backend can consume scoped proposal assignments without isolating its workspace per caller.
+export const HOST_OPERATIONS_V1_CAPABILITY = 'host-operations-v1';
 
 export const EXECUTION_SCOPE_V1_CAPABILITY = 'execution-scope-v1';
 export const FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY = 'federated-execution-scope-v1';

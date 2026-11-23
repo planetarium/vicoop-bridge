@@ -404,7 +404,8 @@ export class AppServerRpcClient {
   // Send a JSON-RPC request and resolve with the `result` field. Rejects
   // with `AppServerRpcError` on protocol error or `Error("transport_closed")`
   // if the child exits before responding.
-  request<T = unknown>(method: string, params?: unknown): Promise<T> {
+  request<T = unknown>(method: string, params?: unknown, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted) return Promise.reject(signal.reason);
     if (this.closed) {
       return Promise.reject(new Error(TRANSPORT_CLOSED));
     }
@@ -415,7 +416,12 @@ export class AppServerRpcClient {
     const msg: Record<string, unknown> = { method, id };
     if (params !== undefined) msg.params = params;
     const line = JSON.stringify(msg) + '\n';
-    return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      this.pending.get(id)?.reject(signal?.reason);
+      this.pending.delete(id);
+    };
+    const response = new Promise<T>((resolve, reject) => {
+      signal?.addEventListener('abort', onAbort, { once: true });
       this.pending.set(id, {
         resolve: resolve as (v: unknown) => void,
         reject,
@@ -428,6 +434,9 @@ export class AppServerRpcClient {
         reject(err);
       }
     });
+    return signal
+      ? response.finally(() => signal.removeEventListener('abort', onAbort))
+      : response;
   }
 
   // Fire-and-forget notification (no `id`). Used for `initialized` and

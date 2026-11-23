@@ -1,13 +1,13 @@
 # Operator-approved external operations
 
-A caller-isolated Claude or Codex agent proposes named work. The connector registers the proposal from its A2A artifact, presents the stored arguments, and submits an explicitly authenticated operator decision. An independent host claims the approved work after the agent has exited. The operator time window is configured per operation, from one hour to seven days. Existing native tool approvals continue to use their own policy.
+An opted-in Claude or Codex agent proposes named work. The connector registers the proposal from its A2A artifact, presents the stored arguments, and submits an explicitly authenticated operator decision. An independent host claims the approved work after the agent has exited. The operator time window is configured per operation, from one hour to seven days. Existing native tool approvals continue to use their own policy.
 
 ## Register a host operation
 
 1. On the **bridge server**, set `VICOOP_OPERATIONS` to a JSON array of deployment-managed definitions. An empty registry disables proposals, decisions and host access. An authorized originating requester can still read the status of its requests. All replicas must use identical definitions. For a policy change, drain and stop the old replicas before starting the new ones. Startup cancels pending and approved requests whose definitions changed or were removed. On upgrade from a registry with method-unbound federated operators, obtain a new proposal and approval for any outstanding unclaimed work governed by those definitions. Restoring a definition does not revive cancelled work. Use `SELECT id, owner_principal, owner_revision FROM agents WHERE id = ...` to obtain the current ownership binding. The revision changes on ownership transfer. Keep the previous revision's definition while its executor reconciles any claimed work. Register the new revision with a different executor credential. Only the current revision can claim work; the previous executor can list unresolved claims and finalize outcomes for its own revision. Removing the old definition disables even that recovery access. Deleting the agent removes its ledger, so finish reconciliation before deletion.
 2. Give each designated executor a random high-entropy bearer secret (e.g. 32 random bytes encoded as hex). Set `executorTokenSha256` to the lowercase SHA-256 hex digest of the literal bearer string without a trailing newline. Keep the secret on the executor. A credential rotation with the same named executor preserves the request. Update the operation version when changing the handler's semantics. A definition change invalidates outstanding unclaimed approvals. Have the agent submit a new proposal using the updated definition.
 3. Register each operator by verified identity. For a federated operator, supply the platform subject, connector DID and authentication method URI. Omitting `method` selects the Mentionable Slack workspace proof (`urn:mentionable:auth:slack-workspace-member:v0.1`). For any other proof, supply its exact `method`. For direct Google or SIWE, supply only the individual principal: `google:<verified-sub>` or `eth:0x<40 lowercase hex digits>`. The agent's caller policy must also admit the operator. A listed operator can approve or deny their own proposal using the same decision credential required for any other proposal. Any authorized requester can cancel their own proposal before execution. Removing the requester's grant or transferring ownership cancels outstanding work. Removing an operator's grant cancels their unconsumed decisions.
-4. On the **bridge client**, add `"operations":["merge-pr"]` under the Claude or Codex backend's `caller_runtime`. These names control which operations its `propose_operation` MCP tool offers. Include argument names and formats in `operatorInstructions`. The proposal tool works with file delivery disabled. Keep all side-effect credentials on the executor host, outside the agent's environment, mounts and available credential proxies.
+4. On a **caller-isolated bridge client**, add `"operations":["merge-pr"]` under the Claude or Codex backend's `caller_runtime`. These names control which operations its `propose_operation` MCP tool offers. Include argument names and formats in `operatorInstructions`. The proposal tool works with file delivery disabled. Keep all side-effect credentials on the executor host, outside the agent's environment, mounts and available credential proxies.
 
 Example server definition (replace the placeholders with deployment values):
 
@@ -37,9 +37,49 @@ Example server definition (replace the placeholders with deployment values):
 
 Fields are required; extra fields are rejected. Supported values are strings, safe integers and booleans. Use the optional `allowedValues` to pin target identifiers. The host adapter also enforces service-specific constraints and uses upstream preconditions. The model supplies only arguments and a registered operation name. It has no channel to specify a command, executable path, approver, destination URL, executor, credentials, or TTL.
 
+## Host-mode agent configuration
+
+A host-mode Claude or Codex agent can propose work through the same approval flow.
+In the client configuration, list the operations that this backend may propose:
+
+```json
+{
+  "backend": "claude",
+  "backends": {
+    "claude": { "runtime": "host", "host_operations": ["merge-pr"] }
+  }
+}
+```
+
+For Codex, set the backend and configuration key to `codex`. Restart the daemon.
+Authorize the intended callers on the bridge and register the matching operation
+and operators for this agent. The agent card advertises the extension when the
+local and registered names overlap for an available caller scheme. The client
+offers the tool on authenticated A2A turns that activate the extension.
+Ordinary host tasks can still use the existing host tools and workspace.
+
+When the negotiated operation set changes within a verified A2A conversation,
+Codex starts a thread with the new tools and carries forward the same caller’s
+text messages, assistant replies and operation proposals. Transfer supports up to
+128 completed turns and 512 KiB of replay data. For conversations with other
+native tool activity, attachments, or incomplete history, the bridge returns
+`context_transfer_failed`. Resume with the previous tool set, or start a new
+A2A context and supply the relevant details.
+
+Run the agent daemon and model under a dedicated unprivileged OS account.
+Run the executor under a separate account or on a separate host. Only that
+executor should be able to read its claim credential and upstream service
+secrets, write the privileged queue, or access its sockets. Check file and
+directory ownership, inherited environment, group memberships, sudo rights and
+container-engine access when provisioning those accounts. Host mode shares the
+agent’s account and workspace across its callers; choose trusted callers when
+a deployment requires this mode. Once approved, the executor can forward the
+stored operation to its existing queue, correlate its ID, and report the result
+using the executor contract below.
+
 ## v1
 
-The optional A2A extension URI is `https://github.com/planetarium/vicoop-bridge/blob/main/docs/operation-approvals.md#v1`. Discover it in `capabilities.extensions` on either Agent Card version. The bridge advertises it when a supported caller runtime and its current ownership-bound server policy share an operation for an available authentication scheme. Its `params.registrationUrl` identifies the registration endpoint. Resolve a relative URL against the card origin and verify the trusted bridge origin before sending credentials.
+The optional A2A extension URI is `https://github.com/planetarium/vicoop-bridge/blob/main/docs/operation-approvals.md#v1`. Discover it in `capabilities.extensions` on either Agent Card version. The bridge advertises it when a supported agent runtime and its current ownership-bound server policy share an operation for an available authentication scheme. Its `params.registrationUrl` identifies the registration endpoint. Resolve a relative URL against the card origin and verify the trusted bridge origin before sending credentials.
 
 Request the URI on each proposal-capable turn using `X-A2A-Extensions` (0.3) or `A2A-Extensions` (1.0). An authenticated Google, SIWE or federated turn can propose the operation names enabled by both the runtime and the current server policy. The proposal artifact carries the same URI in `extensions`. First-time registration requires this marker. For an unregistered artifact from a pre-extension deployment, request a new proposal; existing registered requests retain their IDs and lifecycle. For direct callers, a continued task must still hold the grant recorded when the task was created. Start a new task if the original predates direct operation support or its grant was removed. Ordinary chat works without activation. Activation permits proposal output only. Registration, operator review and host execution use the separate credentials below.
 

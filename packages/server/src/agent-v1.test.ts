@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import type { WebSocket } from 'ws';
 import {
   OPERATION_APPROVAL_EXTENSION_URI,
+  HOST_OPERATIONS_V1_CAPABILITY,
   CALLER_CONTEXT_V2_CAPABILITY,
   CALLER_RUNTIME_V1_CAPABILITY,
   EXECUTION_SCOPE_V1_CAPABILITY,
@@ -310,7 +311,10 @@ test('CORS preflight allows the A2A-Version request header', async () => {
   assert.match(response.headers.get('Access-Control-Allow-Headers') ?? '', /A2A-Version/i);
 });
 
-for (const { callerRuntime, federated, apiKeyOnly = false, direct, otherMethod = false } of [
+for (const { callerRuntime, hostOperations = false, federated, apiKeyOnly = false, direct, otherMethod = false } of [
+  { callerRuntime: false, hostOperations: true, federated: true },
+  { callerRuntime: false, hostOperations: true, federated: false, direct: 'google' },
+  { callerRuntime: false, hostOperations: true, federated: false, apiKeyOnly: true },
   { callerRuntime: false, federated: true },
   { callerRuntime: false, federated: false },
   { callerRuntime: true, federated: true },
@@ -322,12 +326,12 @@ for (const { callerRuntime, federated, apiKeyOnly = false, direct, otherMethod =
   { callerRuntime: true, federated: false, direct: 'siwe' },
   { callerRuntime: true, federated: false, direct: 'google-with-slack-operator' },
 ]) {
-test(`${direct ?? (otherMethod ? 'federated with a mismatched proof method' : federated ? 'federated' : apiKeyOnly ? 'API-key-only' : 'mixed-policy API-key')} message tokens bind tasks on all three A2A ingress paths (${callerRuntime ? 'caller runtime' : 'host runtime'})`, async () => {
+test(`${direct ?? (otherMethod ? 'federated with a mismatched proof method' : federated ? 'federated' : apiKeyOnly ? 'API-key-only' : 'mixed-policy API-key')} message tokens bind tasks on all three A2A ingress paths (${callerRuntime ? 'caller runtime' : hostOperations ? 'host operations' : 'host runtime'})`, async () => {
   const profileId = 'https://mentionable.dev/ns/oauth-federation/v0.1';
   const principalId = federated ? 'slack:T123/U456' : direct === 'siwe' ? 'eth:0x0000000000000000000000000000000000000003'
     : direct ? 'google:abc-XYZ_123' : 'apikey:direct-caller-554';
   const directGrant = direct?.startsWith('google') ? 'google:sub:abc-XYZ_123' : principalId;
-  const canPropose = callerRuntime && (federated || direct !== undefined);
+  const canPropose = (callerRuntime || hostOperations) && (federated || direct !== undefined);
   const actorId = 'did:web:connector.example';
   const slackGrant = formatFederatedPrincipal({ issuer: actorId, subject: 'slack:T123/U456',
     method: 'urn:mentionable:auth:slack-workspace-member:v0.1' })!;
@@ -418,7 +422,10 @@ test(`${direct ?? (otherMethod ? 'federated with a mismatched proof method' : fe
     ownerRevision: 0,
     agentCard,
     allowedCallers: apiKeyOnly ? [principalId] : [authorizationKey, ...(otherMethod ? [slackGrant] : []), ...(!federated ? [directGrant] : [])],
-    protocolCapabilities: callerRuntime ? callerRuntimeCapabilities : [CALLER_CONTEXT_V2_CAPABILITY],
+    backendKind: 'claude',
+    protocolCapabilities: hostOperations
+      ? callerRuntimeCapabilities.map(cap => cap === CALLER_RUNTIME_V1_CAPABILITY ? HOST_OPERATIONS_V1_CAPABILITY : cap)
+      : callerRuntime ? callerRuntimeCapabilities : [CALLER_CONTEXT_V2_CAPABILITY],
     ws,
     connectedAt: Date.now(),
   }), { ok: true });
@@ -483,7 +490,7 @@ test(`${direct ?? (otherMethod ? 'federated with a mismatched proof method' : fe
     assert.deepEqual(assignment.caller, {
       principal: { id: principalId }, ...(federated ? { actor: { id: actorId } } : {}),
     });
-    if (callerRuntime) {
+    if (callerRuntime || hostOperations) {
       assert.equal(assignment.executionScope?.policy, federated ? 'federated-principal-v1' : 'direct-principal-v1');
       assert.equal(assignment.executionScope?.principalId, federated ? authorizationKey : principalId);
       assert.equal(assignment.executionScope?.agentId, 'v1-test-agent');

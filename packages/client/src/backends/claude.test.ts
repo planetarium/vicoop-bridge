@@ -6973,3 +6973,46 @@ test('send_file capability is redacted from debug argv and spawn failure message
   assert.ok(!JSON.stringify(frames).includes(token));
   assert.equal(frames.at(-1)?.type, 'task.fail');
 });
+
+test('host Claude binds its proposal MCP to this turn and its allowed operations', async () => {
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+  const { OPERATION_APPROVAL_EXTENSION_URI } = await import('@vicoop-bridge/protocol');
+  const checked: Promise<void>[] = [];
+  let stagedConfig = '';
+  const fake = makeFakeSpawn(child => {
+    checked.push((async () => {
+      stagedConfig = child.args[child.args.indexOf('--mcp-config') + 1]!;
+      assert.equal(statSync(stagedConfig).mode & 0o777, 0o600);
+      const config = JSON.parse(readFileSync(stagedConfig, 'utf8')).mcpServers['_vb-operations'];
+      assert.ok(!child.args.join(' ').includes(config.headers.Authorization));
+      assert.equal((await fetch(config.url)).status, 401);
+      const mcp = new Client({ name: 'test-model', version: '1' });
+      try {
+        await mcp.connect(new StreamableHTTPClientTransport(new URL(config.url), { requestInit: { headers: config.headers } }));
+        const { tools } = await mcp.listTools();
+        assert.deepEqual(tools.map(t => t.name), ['propose_operation']);
+        assert.equal((await mcp.callTool({ name: 'propose_operation', arguments: { operation: 'sync', arguments: {} } })).isError, true);
+        const receipt = await mcp.callTool({ name: 'propose_operation', arguments: { operation: 'merge-pr', arguments: { pull: 42 } } });
+        assert.ok(!receipt.isError);
+      } finally { await mcp.close(); }
+    })().finally(() => {
+      child.emitStdout(JSON.stringify({ type: 'result', subtype: 'success', result: 'Proposed' }) + '\n');
+      child.finish(0);
+    }));
+  });
+  const { frames, emit } = collect();
+  const task = assign('propose the merge');
+  await createClaudeBackend({ spawn: fake.spawn, hostOperations: ['merge-pr', 'sync'] }).handle({
+    ...task, executionId: 'execution', requestedExtensions: [OPERATION_APPROVAL_EXTENSION_URI],
+    executionScope: { policy: 'direct-principal-v1', id: 'a'.repeat(64), agentId: 'agent', principalId: 'google:123' },
+    operationNames: ['merge-pr', 'server-only'],
+  }, emit, NEVER);
+  await Promise.all(checked);
+  const proposals = frames.filter(f => f.type === 'task.artifact' && f.artifact.extensions?.includes(OPERATION_APPROVAL_EXTENSION_URI));
+  assert.equal(proposals.length, 1);
+  assert.deepEqual(proposals[0]?.type === 'task.artifact' && proposals[0].artifact.parts, [
+    { kind: 'data', data: { type: 'vicoop.operation-proposal.v1', operation: 'merge-pr', arguments: { pull: 42 } } },
+  ]);
+  await assert.rejects(fs.access(stagedConfig));
+});

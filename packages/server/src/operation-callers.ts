@@ -1,5 +1,6 @@
 import {
   CALLER_RUNTIME_V1_CAPABILITY,
+  HOST_OPERATIONS_V1_CAPABILITY,
   FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY,
   OPERATION_APPROVAL_EXTENSION_URI,
   supportsExecutionScopeV1,
@@ -37,7 +38,10 @@ export function matchingOperationNames(
   scheme: OperationCallerScheme,
 ): string[] {
   const capabilities = conn.protocolCapabilities;
-  if (!capabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) || !supportsExecutionScopeV1(capabilities) ||
+  const hostOperations = capabilities?.includes(HOST_OPERATIONS_V1_CAPABILITY) &&
+    (conn.backendKind === 'claude' || conn.backendKind === 'codex');
+  if (!capabilities || !(hostOperations || capabilities.includes(CALLER_RUNTIME_V1_CAPABILITY)) ||
+      !supportsExecutionScopeV1(capabilities) ||
       (scheme === 'federated' && !capabilities.includes(FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY))) return [];
   const declared = conn.agentCard.capabilities?.extensions
     ?.find(e => e.uri === OPERATION_APPROVAL_EXTENSION_URI)?.params?.operations;
