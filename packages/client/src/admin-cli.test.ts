@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import {
   runAddCaller,
   runAgentCallersIssue,
+  runAgentOperations,
   runAgentCallersAdd,
   runAgentCallersAddFederated,
   runAgentCallersList,
@@ -152,7 +153,7 @@ function installFetch(t: { after: (fn: () => void) => void }, response: {
     });
     const status = response.status ?? 200;
     const body = response.body ?? {};
-    return new Response(JSON.stringify(body), {
+    return new Response(status === 204 ? null : JSON.stringify(body), {
       status,
       headers: { 'content-type': 'application/json' },
     });
@@ -195,7 +196,8 @@ function captureStdout(t: { after: (fn: () => void) => void }): { read: () => st
   let captured = '';
   const original = process.stdout.write.bind(process.stdout);
   process.stdout.write = ((chunk: string | Uint8Array, ...rest: unknown[]): boolean => {
-    captured += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
+    // CLI output is text. Forward the test runner's binary protocol frames separately.
+    if (typeof chunk === 'string') captured += chunk;
     return (original as (...args: unknown[]) => boolean)(chunk, ...rest);
   }) as typeof process.stdout.write;
   t.after(() => {
@@ -1218,4 +1220,79 @@ test('callers list presents subject-omitted grants in the existing federated tab
   assert.match(stdout.read(), /\(all subjects\)/);
   assert.match(stdout.read(), /Restricted:/);
   assert.doesNotMatch(stdout.read(), /FEDERATED DELEGATIONS/);
+});
+
+const mergeInput = {
+  version: '1', executorId: 'pt4', executorTokenSha256: 'a'.repeat(64), ttlSeconds: 3600,
+  operators: [{ principalId: 'google:123' }], fields: { pull: { type: 'integer' } },
+};
+const mergeRecord = {
+  agentId: 'agent one', operation: 'merge-pr', ownerPrincipal: 'google:123', ownerRevision: 0, ...mergeInput,
+};
+
+function parseOperations(...argv: string[]) {
+  const parsed = parse(agentCmd, ['agent', 'operations', ...argv]);
+  if (!parsed.success || parsed.value.action !== 'agent-operations') assert.fail('Expected operations command');
+  return parsed.value;
+}
+
+test('agent operations list uses the owner session and the agent-scoped registry', async t => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const { calls } = installFetch(t, { body: { operations: [mergeRecord] } });
+  const stdout = captureStdout(t);
+  assert.equal(await runAgentOperations(parseOperations('list', 'agent one')), 0);
+  assert.equal(calls[0].url, BRIDGE + '/admin-api/agents/agent%20one/operations');
+  assert.equal(calls[0].headers.authorization, 'Bearer ' + TOKEN);
+  assert.match(stdout.read(), /merge-pr\s+1\s+pt4/);
+});
+
+test('agent operations get exports an editable definition that apply sends unchanged', async t => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const { calls } = installFetch(t, { body: mergeRecord });
+  const stdout = captureStdout(t);
+  assert.equal(await runAgentOperations(parseOperations('get', 'agent one', 'merge-pr')), 0);
+  const exported = stdout.read();
+  assert.deepEqual(JSON.parse(exported), mergeInput);
+  const dir = mkdtempSync(join(tmpdir(), 'operation-cli-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, 'merge.json');
+  writeFileSync(file, exported);
+  assert.equal(await runAgentOperations(parseOperations('apply', 'agent one', 'merge-pr', '--file', file)), 0);
+  const item = BRIDGE + '/admin-api/agents/agent%20one/operations/merge-pr';
+  assert.deepEqual(calls.map(c => [c.method, c.url]), [['GET', item], ['PUT', item]]);
+  assert.deepEqual(JSON.parse(calls[1].body!), mergeInput);
+});
+
+test('agent operations get --json retains the server ownership binding', async t => {
+  installFetch(t, { body: mergeRecord });
+  const stdout = captureStdout(t);
+  const args = parseOperations('get', 'agent one', 'merge-pr', '--json', '--server', BRIDGE, '--token', TOKEN);
+  assert.equal(await runAgentOperations(args), 0);
+  assert.deepEqual(JSON.parse(stdout.read()), mergeRecord);
+});
+
+test('agent operations remove --json handles a bodyless 204', async t => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const { calls } = installFetch(t, { status: 204 });
+  const stdout = captureStdout(t);
+  assert.equal(await runAgentOperations(parseOperations('remove', 'agent one', 'merge-pr', '--json')), 0);
+  assert.equal(calls[0].method, 'DELETE');
+  assert.equal(calls[0].url, BRIDGE + '/admin-api/agents/agent%20one/operations/merge-pr');
+  assert.equal(JSON.parse(stdout.read()), null);
+});
+
+test('agent operations preserves API errors and requires a file before applying', async t => {
+  withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
+  const { calls } = installFetch(t, { status: 403, body: { error: 'Not authorized' } });
+  const stderr = captureStderr(t);
+  assert.equal(await runAgentOperations(parseOperations('remove', 'foo', 'merge')), 1);
+  assert.match(stderr.read(), /403.*Not authorized/);
+  assert.equal(parse(agentCmd, ['agent', 'operations', 'apply', 'foo', 'merge']).success, false);
+  const dir = mkdtempSync(join(tmpdir(), 'operation-cli-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, 'invalid.json');
+  writeFileSync(file, 'invalid JSON');
+  assert.equal(await runAgentOperations(parseOperations('apply', 'foo', 'merge', '--file', file)), 1);
+  assert.match(stderr.read(), /invalid JSON/);
+  assert.equal(calls.length, 1);
 });

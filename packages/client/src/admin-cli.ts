@@ -244,6 +244,35 @@ const agentCallersSubCmd = command(
   },
 );
 
+const operationAgentArgs = {
+  action: constant('agent-operations' as const),
+  ...sharedFlags,
+  // Dot segments normalize to the parent resource even after URI encoding.
+  agentId: argument(string({ metavar: 'AGENT_ID', pattern: /^(?!\.{1,2}$).+$/ })),
+};
+const operationItemArgs = {
+  ...operationAgentArgs,
+  operation: argument(string({ metavar: 'OPERATION', pattern: /^[a-z][a-z0-9_-]{0,62}$/ })),
+};
+const agentOperationsCmd = command('operations', longestMatch(
+  command('list', object({ ...operationAgentArgs, verb: constant('list' as const) }), {
+    brief: message`List active operation definitions for an agent.`,
+  }),
+  command('get', object({ ...operationItemArgs, verb: constant('get' as const) }), {
+    brief: message`Print editable definition JSON. Use --json for the complete server record.`,
+  }),
+  command('apply', object({
+    ...operationItemArgs,
+    verb: constant('apply' as const),
+    file: option('--file', string({ metavar: 'PATH' }), {
+      description: message`Read the operation definition as JSON from PATH, or from stdin with --file -.`,
+    }),
+  }), { brief: message`Create or replace an operation definition.` }),
+  command('remove', object({ ...operationItemArgs, verb: constant('remove' as const) }), {
+    brief: message`Retire an operation and cancel its unclaimed requests.`,
+  }),
+), { brief: message`Manage the agent's operator-approved host operations.` });
+
 // ----- agent x402 (pricing) ---------------------------------------------------
 //
 // Pricing is server-side state, not client config: `payTo` names the wallet
@@ -352,12 +381,13 @@ export const agentCmd = command(
     agentTransferSubCmd,
     agentCallersSubCmd,
     agentX402SubCmd,
+    agentOperationsCmd,
     agentListSubCmd,
     agentRemoveSubCmd,
   ),
   {
-    brief: message`Manage agent registrations, their callers, and their pricing.`,
-    description: message`Operator-facing umbrella for agent state. Subcommands: \`transfer\`, \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, add-federated, remove-federated, issue-api-key}\`, \`x402 {show, set, clear}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
+    brief: message`Manage agent registrations, callers, pricing, and operation definitions.`,
+    description: message`Operator-facing umbrella for agent state. Subcommands: \`transfer\`, \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, add-federated, remove-federated, issue-api-key}\`, \`x402 {show, set, clear}\`, \`operations {list, get, apply, remove}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
     hidden: 'usage',
   },
 );
@@ -929,6 +959,50 @@ export async function runAgentCallersRemoveFederated(
   return execFederatedCaller(args, 'DELETE');
 }
 
+function renderOperationList(body: unknown): string {
+  const { operations } = body as { operations: { operation: string; version: string; executorId: string }[] };
+  if (!operations.length) return '(no active operations)';
+  return renderTable(['OPERATION', 'VERSION', 'EXECUTOR'], operations.map(op => [op.operation, op.version, op.executorId]));
+}
+
+function renderEditableDefinition(body: unknown): string {
+  // These four fields are bound by the bridge and its PUT endpoint rejects them.
+  const { agentId, operation, ownerPrincipal, ownerRevision, ...input } = body as Record<string, unknown>;
+  return JSON.stringify(input, null, 2);
+}
+
+export async function runAgentOperations(args: InferValue<typeof agentOperationsCmd>): Promise<number> {
+  const session = resolveSession(args);
+  if ('error' in session) {
+    process.stderr.write(`${session.error}\n`);
+    return 1;
+  }
+  const base = `/admin-api/agents/${encodeURIComponent(args.agentId)}/operations`;
+  if (args.verb === 'list') {
+    return emit(await callApi({ session, method: 'GET', path: base }), args.json, renderOperationList);
+  }
+  const path = `${base}/${encodeURIComponent(args.operation)}`;
+  if (args.verb === 'get') {
+    return emit(await callApi({ session, method: 'GET', path }), args.json, renderEditableDefinition);
+  }
+  if (args.verb === 'remove') {
+    const result = await callApi({ session, method: 'DELETE', path });
+    if (result.status === 204) result.body = null;
+    return emit(result, args.json, () => `Retired ${args.operation} for ${args.agentId}.`);
+  }
+  let body: unknown;
+  try {
+    body = await readJsonFile(args.file);
+  } catch (err) {
+    // A JSON parser error can include a fragment of the input file.
+    const detail = err instanceof SyntaxError ? 'invalid JSON' : (err as Error).message;
+    process.stderr.write(`Could not read operation definition: ${detail}\n`);
+    return 1;
+  }
+  const result = await callApi({ session, method: 'PUT', path, body });
+  return emit(result, args.json, () => `Applied ${args.operation} to ${args.agentId}.`);
+}
+
 // ----- agent x402 (pricing) ---------------------------------------------------
 
 /**
@@ -964,7 +1038,7 @@ function buildPricingFromFlags(args: AgentX402SetArgs): Record<string, unknown> 
   return Object.keys(out).length > 0 ? out : null;
 }
 
-async function readPricingFile(path: string): Promise<unknown> {
+async function readJsonFile(path: string): Promise<unknown> {
   const raw =
     path === '-'
       ? await new Promise<string>((resolve, reject) => {
@@ -1041,7 +1115,7 @@ export async function runAgentX402Set(args: AgentX402SetArgs): Promise<number> {
   let pricing: unknown;
   if (args.file !== undefined) {
     try {
-      pricing = await readPricingFile(args.file);
+      pricing = await readJsonFile(args.file);
     } catch (err) {
       process.stderr.write(`could not read pricing JSON: ${(err as Error).message}\n`);
       return 1;
