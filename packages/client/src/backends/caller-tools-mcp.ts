@@ -90,6 +90,8 @@ export interface StartCallerToolsMcpOptions {
   ) => Promise<CallerToolInvocationAck> | CallerToolInvocationAck;
   /** TCP port; default 0 (OS-picked). */
   port?: number;
+  /** Require the execution-specific bearer for host operation proposals. */
+  bearerToken?: string;
   /** Bind host; default 127.0.0.1. */
   host?: string;
   /**
@@ -249,6 +251,10 @@ export async function startCallerToolsMcpServer(
       if (pathname !== '/mcp') {
         res.statusCode = 404;
         res.end('not found');
+        return;
+      }
+      if (opts.bearerToken && req.headers.authorization !== `Bearer ${opts.bearerToken}`) {
+        res.writeHead(401).end();
         return;
       }
       transport.handleRequest(req, res).catch((err) => {

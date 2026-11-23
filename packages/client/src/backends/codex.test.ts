@@ -4550,3 +4550,70 @@ test('native host functions follow operation negotiation on reused caller contex
     assert.deepEqual(starts.map(f => f.params.dynamicTools.map(tool => tool.name)), [[], ['propose_operation'], []]);
   } finally { await backend.close(); }
 });
+
+test('host Codex offers only negotiated operations and emits a task-bound proposal', async () => {
+  const { OPERATION_APPROVAL_EXTENSION_URI } = await import('@vicoop-bridge/protocol');
+  const args = { operation: 'merge-pr', arguments: { pull: 42 } };
+  const script = scriptedTurnsScenario([{ toolCall: { tool: 'propose_operation', arguments: args } }]);
+  const fake = makeFakeSpawn(() => ({
+    onLine(frame, child, index) {
+      script.onLine?.(frame, child, index);
+      if ((frame as { id?: string }).id === 'srv-1') {
+        child.emitStdout({ method: 'turn/completed', params: { threadId: 'thr-1',
+          turn: { id: 'turn-1', status: 'completed', items: [], error: null } } });
+      }
+    },
+  }));
+  const backend = createCodexBackend({ spawn: fake.spawn, hostOperations: ['merge-pr', 'sync'] });
+  const { frames, emit } = collect();
+  const task = assign('review');
+  try {
+    await backend.handle({ ...task, executionId: 'execution', requestedExtensions: [OPERATION_APPROVAL_EXTENSION_URI],
+      executionScope: { policy: 'direct-principal-v1', id: 'a'.repeat(64), agentId: 'agent', principalId: 'google:123' },
+      operationNames: ['merge-pr', 'server-only'],
+    }, emit, NEVER);
+    const proposal = frames.find(f => f.type === 'task.artifact' && f.artifact.extensions?.includes(OPERATION_APPROVAL_EXTENSION_URI));
+    assert.ok(proposal?.type === 'task.artifact');
+    assert.equal(proposal.taskId, task.taskId);
+    assert.deepEqual(proposal.artifact.parts, [{ kind: 'data', data: { type: 'vicoop.operation-proposal.v1', ...args } }]);
+    const start = fake.lastChild().stdinFrames().find(f => (f as { method?: string }).method === 'thread/start') as {
+      params: { dynamicTools: { name: string; inputSchema: { properties: { operation: { enum: string[] } } } }[] }
+    };
+    assert.deepEqual(start.params.dynamicTools.map(t => [t.name, t.inputSchema.properties.operation.enum]), [['propose_operation', ['merge-pr']]]);
+  } finally { await backend.close(); }
+});
+
+test('host Codex resumes matching operation turns and drops the tool when authorization changes', async () => {
+  const { OPERATION_APPROVAL_EXTENSION_URI } = await import('@vicoop-bridge/protocol');
+  const fake = makeFakeSpawn(() => happyPath());
+  const backend = createCodexBackend({ spawn: fake.spawn, hostOperations: ['merge-pr'] });
+  const authorized = {
+    executionId: 'execution', requestedExtensions: [OPERATION_APPROVAL_EXTENSION_URI], operationNames: ['merge-pr'],
+    executionScope: { policy: 'direct-principal-v1' as const, id: 'a'.repeat(64), agentId: 'agent', principalId: 'google:123' },
+  };
+  try {
+    const turns = [authorized, authorized, { ...authorized, requestedExtensions: [] },
+      { ...authorized, operationNames: ['unregistered'] }, { ...authorized, executionScope: undefined }];
+    for (const eligibility of turns) {
+      await backend.handle({ ...assign('review', 'same-context'), ...eligibility }, collect().emit, NEVER);
+    }
+    const requests = fake.lastChild().stdinFrames() as { method?: string; params?: { dynamicTools?: { name: string }[] } }[];
+    assert.deepEqual(requests.filter(f => f.method === 'thread/start' || f.method === 'thread/resume')
+      .map(f => [f.method, f.params?.dynamicTools?.map(t => t.name)]), [
+      ['thread/start', ['propose_operation']], ['thread/resume', undefined],
+      ['thread/start', undefined], ['thread/resume', undefined], ['thread/resume', undefined],
+    ]);
+  } finally { await backend.close(); }
+});
+
+test('a proposal requires the current app-server turn ID, including during resume', async () => {
+  let turn: string | null = null;
+  let emitted = 0;
+  const handle = createCodexFileToolHandler(async () => ({ emitted: ++emitted }), NEVER, () => turn, ['propose_operation']);
+  const call = { threadId: 'thread', turnId: 'previous', callId: 'call', namespace: null, tool: 'propose_operation', arguments: {} };
+  assert.equal((await handle(call)).success, false);
+  turn = 'current';
+  assert.equal((await handle(call)).success, false);
+  assert.equal((await handle({ ...call, turnId: turn })).success, true);
+  assert.equal(emitted, 1);
+});

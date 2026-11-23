@@ -1,3 +1,4 @@
+import { hostProposalTool } from '../operation-proposals.js';
 import { currentApprovalRequester } from '../remote-approval.js';
 import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -90,6 +91,7 @@ export type ClaudeSpawnFn = (
 ) => ClaudeChildHandle;
 
 export interface ClaudeBackendOptions {
+  hostOperations?: string[];
   remoteApprovals?: boolean;
   command?: string;
   cwd?: string;
@@ -1917,6 +1919,7 @@ export function createClaudeBackend(
 
   return {
     name: 'claude',
+    hostOperations: opts.hostOperations,
     remoteApprovals: opts.remoteApprovals === true,
 
     getSendFileMcpServer: () => sendFileMcp,
@@ -2368,14 +2371,25 @@ export function createClaudeBackend(
           );
         }
       };
-      if (callerToolDefs) {
+      const hostProposal = envelope === null ? hostProposalTool(opts.hostOperations, task, emit, signal) : undefined;
+      const proposalToken = hostProposal ? randomUUID() : undefined;
+      if (callerToolDefs || hostProposal) {
         try {
           callerToolsMcp = await startCallerToolsMcpServer({
             // Tests drive this listener-free via `invokeForTest`; production
             // leaves `skipHttp` unset so claude can connect over HTTP.
             skipHttp: opts.onCallerToolsMcpReady !== undefined,
-            tools: callerToolDefs,
+            tools: hostProposal ? [hostProposal.definition] : callerToolDefs!,
+            bearerToken: proposalToken,
             onInvoke: (invocation: CallerToolInvocation) => {
+              if (hostProposal) {
+                if (invocation.toolName !== hostProposal.definition.name) return { isError: true, text: 'Unknown tool' };
+                try {
+                  return { text: JSON.stringify(hostProposal.propose(invocation.arguments)) };
+                } catch {
+                  return { isError: true, text: 'Proposal rejected' };
+                }
+              }
               // Envelope contract (oai2a2a#80): tool_calls flow exclusively
               // through the terminal `chat_completion` envelope metadata —
               // NOT as a data-part artifact. Accumulate here; the terminal
@@ -2488,31 +2502,31 @@ export function createClaudeBackend(
       // authenticated subjects and future presented profile fields. Both the
       // openai-compat replacement and the plain-A2A caller append therefore
       // share this owner-only, per-task staging lifecycle.
-      let stagedSystemPromptDir: string | null = null;
-      const cleanupStagedSystemPromptFile = (): void => {
-        if (stagedSystemPromptDir === null) return;
-        const dir = stagedSystemPromptDir;
-        stagedSystemPromptDir = null;
+      let privateFilesDir: string | null = null;
+      const cleanupPrivateFiles = (): void => {
+        if (privateFilesDir === null) return;
+        const dir = privateFilesDir;
+        privateFilesDir = null;
         try {
           rmSync(dir, { recursive: true, force: true });
         } catch {
           // Best effort — the OS tmpdir reaper is the backstop.
         }
       };
-      const stageSystemPrompt = (
-        flag: '--system-prompt-file' | '--append-system-prompt-file',
+      const stagePrivateFile = (
+        flag: '--system-prompt-file' | '--append-system-prompt-file' | '--mcp-config',
         filename: string,
         content: string,
       ): readonly string[] => {
-        stagedSystemPromptDir = mkdtempSync(join(tmpdir(), 'vicoop-claude-sp-'));
-        const promptFile = join(stagedSystemPromptDir, filename);
+        privateFilesDir ??= mkdtempSync(join(tmpdir(), 'vicoop-claude-sp-'));
+        const promptFile = join(privateFilesDir, filename);
         writeFileSync(promptFile, content, { mode: 0o600 });
         return [flag, promptFile];
       };
       let openaiCompatArgs: readonly string[] = [];
       if (envelope) {
         try {
-          openaiCompatArgs = stageSystemPrompt(
+          openaiCompatArgs = stagePrivateFile(
             '--system-prompt-file',
             'system-prompt.txt',
             appendCallerContextInstruction(
@@ -2525,7 +2539,7 @@ export function createClaudeBackend(
             ) ?? '',
           );
         } catch (err) {
-          cleanupStagedSystemPromptFile();
+          cleanupPrivateFiles();
           rollbackFreshSession();
           await closeCallerToolsMcp();
           emit({
@@ -2596,7 +2610,7 @@ export function createClaudeBackend(
       if (!envelope && callerPrompt) {
         try {
           const bridgePrompt = appendCallerContextInstruction(identityPrompt, task.caller) ?? '';
-          callerArgs = stageSystemPrompt(
+          callerArgs = stagePrivateFile(
             '--append-system-prompt-file',
             'bridge-append-prompt.txt',
             [bridgePrompt, ...extraInlineAppendPrompts].join('\n\n'),
@@ -2604,7 +2618,7 @@ export function createClaudeBackend(
           identityArgsForTask = [];
           extraArgsForTask = extraArgsWithoutInlineAppend;
         } catch (err) {
-          cleanupStagedSystemPromptFile();
+          cleanupPrivateFiles();
           rollbackFreshSession();
           await closeCallerToolsMcp();
           emit({
@@ -2682,14 +2696,26 @@ export function createClaudeBackend(
       if (mcpServerForTask) {
         mcpServers['_vb-send-file'] = { type: 'http', url: mcpServerForTask.url, headers: { Authorization: `Bearer ${sendFileToken}` } };
       }
-      if (callerToolsMcp) {
+      if (callerToolsMcp && proposalToken) {
+        mcpServers['_vb-operations'] = { type: 'http', url: callerToolsMcp.url, headers: { Authorization: `Bearer ${proposalToken}` } };
+      } else if (callerToolsMcp) {
         mcpServers[CALLER_TOOLS_MCP_SERVER] = { type: 'http', url: callerToolsMcp.url };
       }
       const mcpServerNames = Object.keys(mcpServers);
-      const mcpConfigArgs: readonly string[] =
-        mcpServerNames.length === 0
-          ? []
-          : ['--mcp-config', JSON.stringify({ mcpServers })];
+      let mcpConfigArgs: readonly string[] = [];
+      if (mcpServerNames.length) {
+        const config = JSON.stringify({ mcpServers });
+        try {
+          // Keep the execution bearer out of process arguments on shared hosts.
+          mcpConfigArgs = proposalToken ? stagePrivateFile('--mcp-config', 'mcp.json', config) : ['--mcp-config', config];
+        } catch {
+          cleanupPrivateFiles();
+          rollbackFreshSession();
+          await closeCallerToolsMcp();
+          emit({ type: 'task.fail', taskId: task.taskId, error: { code: 'spawn_failed', message: 'Could not stage operation MCP configuration' } });
+          return;
+        }
+      }
       // Pre-approve the MCP servers we register. claude's permission system
       // runs even in `-p` mode, and with the built-in `defaultMode: "default"`
       // there's no TTY to answer a permission prompt — the request silently
@@ -2792,7 +2818,7 @@ export function createClaudeBackend(
         child = spawnFn(command, args, { cwd: effectiveCwd, env: effectiveEnv });
         recorder.mark('spawn');
       } catch (err) {
-        cleanupStagedSystemPromptFile();
+        cleanupPrivateFiles();
         rollbackFreshSession();
         await closeCallerToolsMcp();
         timingLogger.debug(
@@ -2814,7 +2840,7 @@ export function createClaudeBackend(
       const retainStagedSystemPromptForPossibleRetry =
         retryNarratedToolCall && nativeDispatchActive;
       const cleanupAfterInitialChild = (): void => {
-        if (!retainStagedSystemPromptForPossibleRetry) cleanupStagedSystemPromptFile();
+        if (!retainStagedSystemPromptForPossibleRetry) cleanupPrivateFiles();
       };
       child.on('close', cleanupAfterInitialChild);
       child.on('error', cleanupAfterInitialChild);
@@ -2836,7 +2862,7 @@ export function createClaudeBackend(
         // but this branch exists precisely because the custom spawn is
         // misbehaving — don't trust it to emit close either. Idempotent, so
         // a later close double-fire is harmless.
-        cleanupStagedSystemPromptFile();
+        cleanupPrivateFiles();
         // The freshly-minted sessionId never reached claude, so a follow-up
         // task on the same contextId must mint a new id rather than --resume.
         rollbackFreshSession();
@@ -3330,7 +3356,9 @@ export function createClaudeBackend(
                 activeTaskRuns.set(tu.toolUseId, description);
                 emitSubagentEventArtifact('subagent-started', tu.toolUseId, description);
               }
-              if (emitTraceArtifacts) emitToolCallArtifact(tu);
+              if (emitTraceArtifacts && !(hostProposal && tu.toolName === 'mcp___vb-operations__propose_operation')) {
+                emitToolCallArtifact(tu);
+              }
             }
           }
           return;
@@ -3717,7 +3745,7 @@ export function createClaudeBackend(
       // Either no retry was needed, or the corrective child has now settled
       // (including its caught spawn failure). The original file must remain
       // readable until this point because retryArgs intentionally reuse it.
-      cleanupStagedSystemPromptFile();
+      cleanupPrivateFiles();
 
       signal.removeEventListener('abort', onAbort);
 
@@ -3790,7 +3818,7 @@ export function createClaudeBackend(
         // stdout is the raw stream-json (tool_use and can_use_tool inputs) and
         // stderr can echo commands or paths: with remote approvals keep both in
         // the operator's local log, never in the public failure message.
-        const privateDiagnostics = opts.remoteApprovals === true;
+        const privateDiagnostics = opts.remoteApprovals === true || Boolean(hostProposal);
         if (privateDiagnostics && (stderrTail.trim() || stdoutTail.trim())) {
           console.error(`[claude] exit diagnostics taskId=${safeToken(task.taskId)} ` +
             `stderr=${JSON.stringify(redactFileCapability(stderrTail.trim()).slice(-500))} stdout=${JSON.stringify(redactFileCapability(stdoutTail.trim()).slice(-500))}`);

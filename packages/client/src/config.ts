@@ -1,3 +1,4 @@
+import { OperationNames } from './operation-proposals.js';
 import { ClaudeSendFileConfig } from './send-file-config.js';
 import { CallerRuntimeConfig, assertCallerRuntimeBackend } from './caller-runtime-config.js';
 import type { z } from 'zod';
@@ -161,6 +162,7 @@ export interface ClaudeBackendConfig {
   runtime?: BackendRuntime;
   /** Legacy shared-container selector, retained to report migration errors. */
   runtime_name?: string;
+  host_operations?: string[];
   caller_runtime?: z.input<typeof CallerRuntimeConfig>;
 }
 
@@ -183,6 +185,7 @@ export interface CodexBackendConfig {
   runtime?: BackendRuntime;
   /** Legacy shared-container selector, retained to report migration errors. */
   runtime_name?: string;
+  host_operations?: string[];
   caller_runtime?: z.input<typeof CallerRuntimeConfig>;
 }
 
@@ -360,10 +363,12 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
       const model = asString(claudeRaw.model);
       const models = asStringArray(claudeRaw.supported_models);
       const runtime = pickBackendRuntime(claudeRaw.runtime);
+      const hostOperations = claudeRaw.host_operations === undefined ? undefined : OperationNames.parse(claudeRaw.host_operations);
       const callerRuntime = claudeRaw.caller_runtime === undefined ? undefined : CallerRuntimeConfig.parse(claudeRaw.caller_runtime);
       const runtimeName = asString(claudeRaw.runtime_name);
-      if (sendFile || cwd || settings || model || models || runtime || runtimeName || callerRuntime || claudeRaw.remote_approvals === true) {
+      if (sendFile || cwd || settings || model || models || runtime || runtimeName || callerRuntime || hostOperations || claudeRaw.remote_approvals === true) {
         out.claude = {};
+        if (hostOperations) out.claude.host_operations = hostOperations;
         if (sendFile) out.claude.send_file = sendFile;
         if (claudeRaw.remote_approvals === true) out.claude.remote_approvals = true;
         if (cwd) out.claude.cwd = cwd;
@@ -387,12 +392,14 @@ function normalizeConfig(raw: Record<string, unknown>): ClientConfig {
           ? (approvalRaw as 'accept' | 'acceptForSession' | 'decline' | 'remote')
           : undefined;
       const runtime = pickBackendRuntime(codexRaw.runtime);
+      const hostOperations = codexRaw.host_operations === undefined ? undefined : OperationNames.parse(codexRaw.host_operations);
       const callerRuntime = codexRaw.caller_runtime === undefined ? undefined : CallerRuntimeConfig.parse(codexRaw.caller_runtime);
       if (callerRuntime) assertCallerRuntimeBackend('codex', callerRuntime);
       const runtimeName = asString(codexRaw.runtime_name);
       const retryStalled = asBoolean(codexRaw.retry_stalled_tool_call);
-      if (cwd || validSandbox || validApproval || runtime || runtimeName || callerRuntime || retryStalled !== undefined) {
+      if (cwd || validSandbox || validApproval || runtime || runtimeName || callerRuntime || hostOperations || retryStalled !== undefined) {
         out.codex = {};
+        if (hostOperations) out.codex.host_operations = hostOperations;
         if (cwd) out.codex.cwd = cwd;
         if (validSandbox) out.codex.sandbox_mode = validSandbox;
         if (validApproval) out.codex.approval_decision = validApproval;

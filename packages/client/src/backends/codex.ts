@@ -1,3 +1,4 @@
+import { hostProposalTool, proposalToolDefinition } from '../operation-proposals.js';
 import { currentApprovalRequester, type RequestApproval } from '../remote-approval.js';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
@@ -62,6 +63,7 @@ export type CodexSandboxMode = SandboxMode;
 export type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline' | 'remote';
 
 export interface CodexBackendOptions {
+  hostOperations?: string[];
   functionFileDelivery?: {
     description: string;
     filesEnabled?: boolean;
@@ -988,7 +990,7 @@ export function createCodexFileToolHandler(
   return async call => {
     const turnId = currentTurn();
     if (!allowedTools.includes(call.tool) || call.namespace != null || signal.aborted ||
-        (turnId !== null && call.turnId !== turnId))
+        (call.tool === 'propose_operation' && !turnId) || (turnId !== null && call.turnId !== turnId))
       return { success: false, contentItems: [] };
     if (pending >= MAX_PENDING_FILE_REQUESTS || requests >= MAX_FILE_REQUESTS_PER_EXECUTION)
       return { success: false, contentItems: [{ type: 'inputText', text: 'Attachment request limit reached' }] };
@@ -1231,6 +1233,7 @@ export function createCodexBackend(
 
   return {
     name: 'codex',
+    hostOperations: opts.hostOperations,
     remoteApprovals: approvalDecision === 'remote',
 
     // Advertise the underlying model(s) on the openai-compat/v1 extension's
@@ -1477,13 +1480,10 @@ export function createCodexBackend(
           envelopeModel = undefined;
         }
         const fileDelivery = envelope === null ? opts.functionFileDelivery : undefined;
-        const hostTools = fileDelivery ? [
+        const hostProposal = envelope === null ? hostProposalTool(opts.hostOperations, task, emit, signal) : undefined;
+        const hostTools = hostProposal ? [hostProposal.definition] : fileDelivery ? [
           ...(fileDelivery.filesEnabled !== false ? [{ name: 'send_file', description: fileDelivery.description, inputSchema: callerFileToolSchema }] : []),
-          ...(fileDelivery.operations?.length ? [{ name: 'propose_operation',
-            description: 'Propose an operation for operator review and host execution.',
-            inputSchema: { type: 'object', properties: { operation: { type: 'string', enum: fileDelivery.operations }, arguments: { type: 'object' } },
-              required: ['operation', 'arguments'], additionalProperties: false },
-          }] : []),
+          ...(fileDelivery.operations?.length ? [proposalToolDefinition(fileDelivery.operations)] : []),
         ] : undefined;
         const dynamicTools =
           envelopeTools && callerToolDispatchActive(envelopeTools, envelopeToolChoice)
@@ -1972,8 +1972,8 @@ export function createCodexBackend(
           // dynamicTools with SessionMeta and the resumed thread can still
           // invoke them. The handler is unregistered in the `finally` of
           // the outer try that wraps the turn loop below.
-          if (fileDelivery) {
-            const send = fileDelivery.bind();
+          if (hostProposal || fileDelivery) {
+            const send = hostProposal ? async (input: unknown) => hostProposal.propose(input) : fileDelivery!.bind();
             const executionSignal = AbortSignal.any([signal, turnLifetime.signal]);
             registeredThreadId = threadId;
             toolCallHandlers.set(threadId, createCodexFileToolHandler(send, executionSignal, () => activeTurnId, hostTools?.map(tool => tool.name)));

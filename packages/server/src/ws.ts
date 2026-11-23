@@ -16,6 +16,7 @@ import {
   EXECUTION_SCOPE_V1_CAPABILITY,
   FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY,
   CALLER_RUNTIME_V1_CAPABILITY,
+  HOST_OPERATIONS_V1_CAPABILITY,
   CALLER_CONTEXT_V2_CAPABILITY,
   supportsExecutionScopeV1,
   type TaskStatus as WireTaskStatus,
@@ -369,6 +370,16 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
         }
         clearTimeout(helloTimeout);
         if (frame.protocolCapabilities?.includes(TASK_REPLAY_CAPABILITY)) {
+          const scopes = supportsExecutionScopeV1(frame.protocolCapabilities)
+            ? [EXECUTION_SCOPE_V1_CAPABILITY] : [];
+          if (scopes.length) {
+            const runtimes = [CALLER_RUNTIME_V1_CAPABILITY, HOST_OPERATIONS_V1_CAPABILITY]
+              .filter(cap => frame.protocolCapabilities?.includes(cap));
+            scopes.push(...runtimes);
+            if (runtimes.length && frame.protocolCapabilities.includes(FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY)) {
+              scopes.push(FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY);
+            }
+          }
           ws.send(
             encodeFrame({
               type: 'hello.ack',
@@ -377,8 +388,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
                 ...(outboundTokenHash ? [OUTBOUND_CAPABILITY] : []),
                 ...(frame.protocolCapabilities?.includes(REMOTE_APPROVAL_CAPABILITY) ? [REMOTE_APPROVAL_CAPABILITY] : []),
                 ...(frame.protocolCapabilities?.includes(CALLER_CONTEXT_V2_CAPABILITY) ? [CALLER_CONTEXT_V2_CAPABILITY] : []),
-                ...(supportsExecutionScopeV1(frame.protocolCapabilities) ? [EXECUTION_SCOPE_V1_CAPABILITY,
-                  ...(frame.protocolCapabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) ? [CALLER_RUNTIME_V1_CAPABILITY, ...(frame.protocolCapabilities.includes(FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY) ? [FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY] : [])] : [])] : []),
+                ...scopes,
               ],
               disconnectGraceMs: opts.registry.getDisconnectGraceMs(),
               maxFrameBytes: MAX_INGRESS_BYTES,

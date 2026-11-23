@@ -12,6 +12,7 @@ import {
   EXECUTION_SCOPE_V1_CAPABILITY,
   FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY,
   CALLER_RUNTIME_V1_CAPABILITY,
+  HOST_OPERATIONS_V1_CAPABILITY,
   encodeFrame,
   parseDownFrame,
   withOpenAICompatModelsAdvertise,
@@ -405,7 +406,10 @@ export class Client {
               CALLER_CONTEXT_V1_CAPABILITY,
               TASK_REPLAY_CAPABILITY,
               ...(this.opts.backend.remoteApprovals ? [REMOTE_APPROVAL_CAPABILITY] : []),
-              ...(this.opts.backend.requiresCallerScope ? [EXECUTION_SCOPE_V1_CAPABILITY, CALLER_RUNTIME_V1_CAPABILITY, FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY] : []),
+              ...(this.opts.backend.requiresCallerScope || this.opts.backend.hostOperations?.length
+                ? [EXECUTION_SCOPE_V1_CAPABILITY, FEDERATED_EXECUTION_SCOPE_V1_CAPABILITY,
+                    this.opts.backend.requiresCallerScope ? CALLER_RUNTIME_V1_CAPABILITY : HOST_OPERATIONS_V1_CAPABILITY]
+                : []),
             ],
             ...(this.opts.trustedIdentityIssuers !== undefined
               ? {

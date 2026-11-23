@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { closeSync, existsSync, openSync, readFileSync } from 'node:fs';
 import { spawn as spawnProcess, type ChildProcess } from 'node:child_process';
 import { AgentCard } from '@vicoop-bridge/protocol';
+import { hostOperationCard } from './operation-proposals.js';
 import { callerRuntimeCard } from './caller-runtime-card.js';
 import { resolveBundledCard } from './bundled-cards.js';
 import { group, longestMatch, object } from '@optique/core/constructs';
@@ -422,6 +423,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
       const isolated = isInsideContainer();
       const settings = isolated ? disableClaudeSandboxGuard(baseSettings) : baseSettings;
       const backend = createClaudeBackend({
+        hostOperations: backends.claude?.host_operations,
         remoteApprovals: backends.claude?.remote_approvals,
         cwd: args.cwd,
         identity: deriveIdentity(args.agentId, args.server) ?? undefined,
@@ -460,6 +462,7 @@ async function pickBackend(name: string, args: Args): Promise<PickedBackend> {
         ? (explicitSandbox ?? 'danger-full-access')
         : explicitSandbox;
       const backend = createCodexBackend({
+        hostOperations: backends.codex?.host_operations,
         cwd: args.cwd,
         sandboxMode,
         approvalDecision: backends.codex?.approval_decision as ApprovalDecision | undefined,
@@ -568,10 +571,11 @@ async function runDaemon(parsed: Extract<CliArgs, { action: 'daemon' }>): Promis
     ? JSON.parse(readFileSync(args.card, 'utf8'))
     : resolveBundledCard(args.backend);
   const parsedCard = raw ? AgentCard.parse(raw) : undefined;
-  const cardRuntime = args.backends?.[args.backend as 'claude' | 'codex']?.caller_runtime;
+  const codingBackend = args.backend === 'claude' || args.backend === 'codex' ? args.backends?.[args.backend] : undefined;
+  const cardRuntime = codingBackend?.caller_runtime;
   const agentCard = parsedCard && args.runtime === 'container'
     ? callerRuntimeCard(parsedCard, args.backend, Boolean(args.card), Boolean(cardRuntime?.fileDelivery),
-      cardRuntime?.operations) : parsedCard;
+      cardRuntime?.operations) : parsedCard && hostOperationCard(parsedCard, codingBackend?.host_operations);
 
   // Emit the resolved backend at startup so operators can verify which
   // backend the precedence chain picked (flag vs. config vs. default

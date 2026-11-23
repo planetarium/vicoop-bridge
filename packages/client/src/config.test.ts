@@ -670,3 +670,15 @@ test('operator instructions and legacy alias are accepted for both caller backen
     operatorInstructions:'same',systemPrompt:'same'})), 'same');
   assert.throws(()=>CallerRuntimeConfig.parse({...base,operatorInstructions:'new',systemPrompt:'old'}), /must match/);
 });
+
+test('Claude and Codex accept named host operations in backend configuration', t => {
+  const dir = mkdtempSync(join(tmpdir(), 'host-ops-config-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'config.json');
+  for (const kind of ['claude', 'codex'] as const) {
+    writeFileSync(path, JSON.stringify({ backends: { [kind]: { host_operations: ['merge-pr'] } } }));
+    assert.deepEqual(readConfig(path)?.backends?.[kind]?.host_operations, ['merge-pr']);
+    writeFileSync(path, JSON.stringify({ backends: { [kind]: { host_operations: ['bad name'] } } }));
+    assert.throws(() => readConfig(path));
+  }
+});
