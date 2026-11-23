@@ -1,5 +1,11 @@
 # @vicoop-bridge/client
 
+## 0.54.0
+
+### Minor Changes
+
+- 5e52158: Manage an agent’s operation definitions with `agent operations list|get|apply|remove` using the saved owner session.
+
 ## 0.53.0
 
 ### Minor Changes
