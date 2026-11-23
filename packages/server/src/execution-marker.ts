@@ -69,7 +69,9 @@ export interface ExecutionMarkingStore {
   // and bind the current request's writes to it. With an `executionId` it also
   // drops prior artifacts (history is kept) and uses `artifacts` as the
   // execution's output snapshot; a legacy dispatch keeps accumulated artifacts.
-  markExecution(taskId: string, executionId: string | undefined, artifacts: Artifact[]): Promise<void>;
+  // The store may return a conditional undo for an authorization change
+  // during persistence, before the assignment is sent.
+  markExecution(taskId: string, executionId: string | undefined, artifacts: Artifact[]): Promise<void | (() => Promise<void>)>;
 }
 
 export function supportsExecutionMarking(store: unknown): store is ExecutionMarkingStore {

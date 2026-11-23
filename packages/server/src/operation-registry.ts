@@ -7,8 +7,10 @@ import { MAX_OPERATION_FIELDS } from '@vicoop-bridge/protocol';
 import { isOAuthFederationMethodUri } from '@mentionable/connector-kit';
 import { operationCallerScheme, operationOperatorMethod } from './operation-callers.js';
 import type postgres from 'postgres';
+import { hashCallerToken } from './auth/caller-token.js';
 import type { Sql, SqlExecutor } from './db.js';
 
+const maxActiveDefinitions = 256;
 export const operationName = z.string().regex(/^[a-z][a-z0-9_-]{0,62}$/);
 export const operationScalar = z.union([z.string().max(2048), z.number().int().safe(), z.boolean()]);
 const definition = z
@@ -50,7 +52,7 @@ export type OperationDefinition = z.infer<typeof definition>;
 
 export function readOperationRegistry(raw: string | undefined): OperationDefinition[] {
   if (!raw) return [];
-  const entries = z.array(definition).max(256).parse(JSON.parse(raw));
+  const entries = z.array(definition).max(maxActiveDefinitions).parse(JSON.parse(raw));
   const epochs = new Set<string>();
   const credentials = new Set<string>();
   for (const entry of entries) {
@@ -171,7 +173,7 @@ export async function migrateOperationRegistry(tx: postgres.TransactionSql, lega
   await tx`INSERT INTO infra.operation_registry_migration VALUES (true)`;
 }
 
-type OwnerSession = { ok: true; principalId: string } | { ok: false; message: string };
+type OwnerSession = { ok: true; principalId: string; bearerToken: string } | { ok: false; message: string };
 
 export function mountOperationRegistry(app: Hono, db: Sql, authenticate: (c: Context) => Promise<OwnerSession>) {
   const base = '/admin-api/agents/:agent/operations';
@@ -192,9 +194,24 @@ export function mountOperationRegistry(app: Hono, db: Sql, authenticate: (c: Con
         WHERE id=${agent} AND owner_principal=${auth.principalId}
         ${c.req.method === 'GET' ? tx`FOR SHARE` : tx`FOR UPDATE`}`;
       if (!owner) return c.json({ error: 'Agent not found' }, 404);
+      // The HTTP session cache may outlive a revocation. Validate the locked
+      // credential after waiting for the agent lock, using time at acquisition.
+      const [session] = await tx`WITH locked AS MATERIALIZED (
+        SELECT principal_id, audience, revoked, expires_at FROM callers
+        WHERE token_hash=${hashCallerToken(auth.bearerToken)} FOR SHARE
+      ) SELECT 1 FROM locked WHERE principal_id=${auth.principalId} AND audience='owner_session'
+        AND NOT revoked AND expires_at>clock_timestamp()`;
+      if (!session) return c.json({ error: 'Owner session is no longer valid' }, 401);
       const policies = await activeDefinitions(tx, agent, operation);
       if (!operation) return c.json({ operations: policies });
       if (input?.success) {
+        if (!policies.length) {
+          const [row] = await tx<{ count: number }[]>`SELECT count(*)::int AS count FROM infra.operation_definitions
+            WHERE agent_id=${agent} AND owner_revision=${owner.owner_revision} AND active`;
+          if (row.count >= maxActiveDefinitions) {
+            return c.json({ error: `An agent can have up to ${maxActiveDefinitions} active operations` }, 409);
+          }
+        }
         const policy = { ...input.data, agentId: agent, ownerPrincipal: auth.principalId,
           ownerRevision: Number(owner.owner_revision), operation };
         await storeDefinition(tx, policy, true);

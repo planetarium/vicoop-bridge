@@ -233,8 +233,10 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   // Only the names and ownership epoch affect discovery. Reload on discovery
   // and negotiation, so separate replicas don't rely on cache notifications.
   async function refreshPolicies(conn: ClientConnection) {
+    const { ownerPrincipal, ownerRevision, allowedCallers } = conn;
     const policies = await loadPolicies(conn);
-    if (opts.registry.getAgent(conn.agentId) !== conn) {
+    if (opts.registry.getAgent(conn.agentId) !== conn || conn.ownerPrincipal !== ownerPrincipal ||
+        conn.ownerRevision !== ownerRevision || conn.allowedCallers !== allowedCallers) {
       throw new HTTPException(503, { message: 'Agent connection changed; retry the request' });
     }
     if (JSON.stringify(cardPolicies.get(conn.agentId) ?? []) !== JSON.stringify(policies)) {

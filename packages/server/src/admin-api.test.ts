@@ -1440,6 +1440,30 @@ test('agent owners manage durable operation definitions across replicas and owne
   assert.deepEqual(await list.json(), { operations: [policy] });
   assert.deepEqual(await (await request(target, 'GET', state.ownerToken)).json(), policy);
 
+  // Warm the normal HTTP verifier cache, then invalidate the underlying
+  // credential directly as another replica or the session expiry clock would.
+  for (const invalid of ['revoked', 'expired']) {
+    const session = await issueSessionToken(db, { principalId: owner, provider: 'google', audience: 'owner_session' });
+    assert.equal((await request(target, 'GET', session.rawToken)).status, 200);
+    if (invalid === 'revoked') await db`UPDATE callers SET revoked=true WHERE id=${session.callerId}`;
+    else await db`UPDATE callers SET expires_at=clock_timestamp() WHERE id=${session.callerId}`;
+    assert.equal((await request(target, 'PUT', session.rawToken, input)).status, 401);
+    assert.equal((await request(target, 'DELETE', session.rawToken)).status, 401);
+  }
+
+  // Fill the remaining slots using real private table rows. At capacity,
+  // replacement still works and concurrent creators compete for one freed slot.
+  await db`INSERT INTO infra.operation_definitions
+    SELECT agent_id, 'fixture-' || n, owner_revision, executor_id, token_digest,
+      jsonb_set(definition,'{operation}',to_jsonb('fixture-' || n)), true, true
+    FROM infra.operation_definitions CROSS JOIN generate_series(1,255) n
+    WHERE agent_id=${agentId} AND operation='merge'`;
+  assert.equal((await request(base + '/new', 'PUT', state.ownerToken, input)).status, 409);
+  assert.equal((await request(target, 'PUT', state.ownerToken, input)).status, 200);
+  assert.equal((await request(base + '/fixture-1', 'DELETE', state.ownerToken)).status, 204);
+  const adds = await Promise.all(['new-a', 'new-b'].map(op => request(base + '/' + op, 'PUT', state.ownerToken, input)));
+  assert.deepEqual(adds.map(res => res.status).sort(), [201, 409]);
+
   const executing = await seed('approved');
   const claim = await request(executor + '/claim', 'POST', workerToken);
   assert.equal((await claim.json() as { operation: { id: string } }).operation.id, executing);

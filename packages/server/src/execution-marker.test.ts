@@ -505,6 +505,35 @@ test('task store write rules: holderless and fresh-task writes persist; dispatch
   assert.deepEqual(stored?.artifacts?.map(a => a.artifactId), ['a']);
   assert.equal(executionMarker(stored?.metadata as Record<string, unknown>), 'exec-1');
   assert.equal((stored?.metadata as Record<string, unknown>).keep, 1);
+  // A change during durable marking can reject a dispatch before assignment.
+  // Undo restores the prior execution and never erases a newer dispatch.
+  const rejected: ExecutionWriter = { message: true };
+  const undo = await executionWriter.run(rejected, () => store.markExecution(task.id, 'unassigned', []));
+  assert.ok(undo);
+  await undo();
+  assert.deepEqual(await store.getTask(task.id), stored);
+  assert.equal(rejected.marked, undefined);
+  assert.equal(rejected.message, true);
+  for (const state of [TaskState.WORKING, TaskState.CANCELED]) {
+    const stale = await store.createTask({ contextId: randomUUID() });
+    const writer: ExecutionWriter = {};
+    const undoProgress = await executionWriter.run(writer, () => store.markExecution(stale.id, 'unassigned', []));
+    assert.ok(undoProgress);
+    const progress = { state, timestamp: '2026-01-01T00:00:00.000Z' };
+    const artifact = { artifactId: 'new-output', parts: [{ text: 'new' }] };
+    await store.updateTask(stale.id, { status: progress, artifacts: [artifact], metadata: { latest: true } });
+    await undoProgress();
+    const after = await store.getTask(stale.id);
+    assert.deepEqual(after?.status, progress);
+    assert.deepEqual(after?.artifacts, [artifact]);
+    assert.deepEqual(after?.metadata, { latest: true });
+    assert.equal(writer.message, undefined);
+    const staleUndo = await store.markExecution(stale.id, 'superseded-mark', []);
+    assert.ok(staleUndo);
+    await store.markExecution(stale.id, 'later-mark', []);
+    await staleUndo();
+    assert.equal(executionMarker((await store.getTask(stale.id))?.metadata), 'later-mark');
+  }
   // A legacy (non-replay) dispatch keeps accumulated artifacts and still
   // takes the private dispatch slot: the replay writer above is now stale.
   const legacy: ExecutionWriter = {};
