@@ -4,7 +4,7 @@ import {
   OPERATION_APPROVAL_EXTENSION_URI,
   supportsExecutionScopeV1,
 } from '@vicoop-bridge/protocol';
-import type { OperationDefinition } from './operations.js';
+import type { OperationPolicyRef } from './operation-registry.js';
 import type { ClientConnection } from './registry.js';
 
 export type OperationCallerScheme = 'google' | 'siwe' | 'federated';
@@ -33,7 +33,7 @@ export function operationOperatorMethod(operator: { actorId?: string; method?: s
 
 export function matchingOperationNames(
   conn: ClientConnection,
-  policies: readonly OperationDefinition[],
+  policies: readonly OperationPolicyRef[],
   scheme: OperationCallerScheme,
 ): string[] {
   const capabilities = conn.protocolCapabilities;

@@ -239,7 +239,7 @@ export class WSForwardingExecutor extends AgentExecutor {
     // Absent in tests and on deployments without a DB-backed payment path;
     // the gate is then never installed and every agent is free.
     private readonly x402: X402ExecutorOptions | undefined = undefined,
-    private readonly operationNamesFor?: (conn: ClientConnection, scheme: OperationCallerScheme) => string[],
+    private readonly operationNamesFor?: (conn: ClientConnection, scheme: OperationCallerScheme) => string[] | Promise<string[]>,
   ) {
     super({
       runner: NOOP_RUNNER,
@@ -437,7 +437,10 @@ export class WSForwardingExecutor extends AgentExecutor {
     const forwardMetadata = stripInternalMetadata(rawMetadata);
     const requestedExtensions = message.extensions;
 
-    const capabilities = this.registry.getAgent(this.agentId)?.protocolCapabilities;
+    const admittedConnection = this.registry.getAgent(this.agentId);
+    const admittedOwner = admittedConnection?.ownerPrincipal;
+    const admittedRevision = admittedConnection?.ownerRevision;
+    const capabilities = admittedConnection?.protocolCapabilities;
     if (capabilities?.includes(CALLER_RUNTIME_V1_CAPABILITY) && !resolveExecutionScope({
       agentId: this.agentId, principalId, actorId, authorizationKey, authorizationProfile, capabilities,
     })) {
@@ -505,9 +508,7 @@ export class WSForwardingExecutor extends AgentExecutor {
     // `_principalId` / `_bearerToken` convention). `_principalId` flows into
     // the binding so accept-path logs in ws.ts can correlate caller →
     // completed task without exposing it to the client agent over the wire.
-    const callerContextVersion = selectCallerContextVersion(
-      this.registry.getAgent(this.agentId)?.protocolCapabilities,
-    );
+    const callerContextVersion = selectCallerContextVersion(capabilities);
     const hasPresented = Array.isArray(presented) && presented.length > 0;
     const hasCallerInput = principalId !== undefined || actorId !== undefined || hasPresented;
     const canonicalCaller =
@@ -523,7 +524,7 @@ export class WSForwardingExecutor extends AgentExecutor {
     const caller = serializeCallerContext(canonicalCaller, callerContextVersion);
     const executionScope = caller === undefined ? undefined : resolveExecutionScope({
       agentId: this.agentId, principalId, actorId, authorizationKey, authorizationProfile,
-      capabilities: this.registry.getAgent(this.agentId)?.protocolCapabilities,
+      capabilities,
     });
     if (callerContextVersion !== undefined && hasCallerInput && caller === undefined) {
       // Do not put the raw principal or schema details in logs. An invalid
@@ -535,10 +536,7 @@ export class WSForwardingExecutor extends AgentExecutor {
         reason: 'invalid_transport_owned_context',
       });
     }
-    const replayCapable =
-      this.registry
-        .getAgent(this.agentId)
-        ?.protocolCapabilities?.includes(TASK_REPLAY_CAPABILITY) === true;
+    const replayCapable = capabilities?.includes(TASK_REPLAY_CAPABILITY) === true;
     const executionId = replayCapable ? randomUUID() : undefined;
     const binding: TaskBinding = {
       agentId: this.agentId,
@@ -569,20 +567,45 @@ export class WSForwardingExecutor extends AgentExecutor {
     let interrupted: Task | undefined;
     let sent = false;
     let history = appendHistoryMessage(task.history ?? [], message);
-    const dispatch = (): boolean => {
-      if (!this.registry.bindTask(binding)) return false;
+    const scheme = executionScope && principalId ? operationCallerScheme({ principalId, actorId }) : undefined;
+    const grantKey = scheme === 'federated' ? authorizationKey : directOperationGrant;
+    const lookup = scheme && grantKey && admittedRevision !== undefined &&
+      requestedExtensions?.includes(OPERATION_APPROVAL_EXTENSION_URI) ? this.operationNamesFor : undefined;
+    const stillAdmitted = () => !lookup || (!!admittedConnection && !!grantKey &&
+      admittedConnection === this.registry.getAgent(this.agentId) && admittedConnection.ownerPrincipal === admittedOwner &&
+      admittedConnection.ownerRevision === admittedRevision && operationGrantIsActive(grantKey, admittedConnection.allowedCallers));
+    const dispatch = async (mark: boolean): Promise<boolean> => {
+      if (!stillAdmitted()) return false;
+      const operationNames = lookup && scheme && admittedConnection ? await lookup(admittedConnection, scheme) : undefined;
+      // Do not displace an existing marker while policy is loading. A transfer
+      // updates the same connection object, so its ownership epoch matters too.
+      if (!stillAdmitted()) return false;
+      const store = this.taskStore;
+      const previous = this.registry.getBinding(taskId);
+      if (previous && previous.agentId !== this.agentId) return false;
+      const marker = mark && supportsExecutionMarking(store)
+        ? await store.markExecution(taskId, executionId, accumulatedArtifacts) : undefined;
+      if (marker && 'terminal' in marker) {
+        interrupted = marker.terminal;
+        return false;
+      }
+      if (!stillAdmitted() || !this.registry.bindTask(binding)) {
+        if (marker) {
+          if (previous) this.registry.supersedeBinding(previous);
+          interrupted = await marker.failUnsent({
+            state: TaskState.FAILED, timestamp: new Date().toISOString(),
+            message: { messageId: `${taskId}-dispatch-rejected`, role: 'agent', taskId, contextId,
+              parts: [{ text: 'Agent authorization changed before dispatch' }] },
+          });
+        }
+        return false;
+      }
       task.metadata = withExecutionMarker(task.metadata as Record<string, unknown> | undefined, executionId);
       if (executionId !== undefined) delete task.artifacts;
       this.abortControllers.set(taskId, ac);
       task.history = history;
-      const connection = this.registry.getAgent(this.agentId);
-      const scheme = executionScope && principalId ? operationCallerScheme({ principalId, actorId }) : undefined;
-      const grantKey = scheme === 'federated' ? authorizationKey : directOperationGrant;
-      const operationNames = connection?.ownerRevision !== undefined && scheme && grantKey &&
-        operationGrantIsActive(grantKey, connection.allowedCallers) && requestedExtensions?.includes(OPERATION_APPROVAL_EXTENSION_URI)
-        ? this.operationNamesFor?.(connection, scheme) : undefined;
-      if (operationNames?.length && connection?.ownerRevision !== undefined && grantKey) {
-        binding.operationGrant = { names: operationNames, ownerRevision: connection.ownerRevision, grantKey };
+      if (operationNames?.length && admittedRevision !== undefined && grantKey) {
+        binding.operationGrant = { names: operationNames, ownerRevision: admittedRevision, grantKey };
       }
       sent = this.registry.sendToAgent(this.agentId, {
         type: 'task.assign', taskId,
@@ -613,10 +636,9 @@ export class WSForwardingExecutor extends AgentExecutor {
           }
           const holder = this.registry.getBinding(taskId);
           if (holder && holder.agentId !== this.agentId) return false;
-          if (supportsExecutionMarking(store)) await store.markExecution(taskId, executionId, accumulatedArtifacts);
-          return dispatch();
+          return dispatch(true);
         })
-        : dispatch();
+        : await dispatch(false);
       if (!bound && !interrupted) {
         rejection = { code: 'task_owner_mismatch', message: 'task ownership validation failed', suffix: 'owner-mismatch' };
       }

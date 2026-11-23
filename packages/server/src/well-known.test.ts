@@ -241,7 +241,7 @@ test('mentionable-agents.json: drops case-insensitive collisions to match resolv
   assert.deepEqual(emails, ['admin@bridge.example.com', 'bar@bridge.example.com']);
 });
 
-test('mentionable-agents.json: avoids card synthesis for invalid and colliding locals', () => {
+test('mentionable-agents.json: avoids card synthesis for invalid and colliding locals', async () => {
   const calls: string[] = [];
   const deps: WellKnownDeps = {
     listAgents: () => [
@@ -261,7 +261,7 @@ test('mentionable-agents.json: avoids card synthesis for invalid and colliding l
     organizationName: 'Vicoop Bridge',
   };
 
-  const directory = buildLandingDirectory(deps);
+  const directory = await buildLandingDirectory(deps);
   assert.ok(directory);
   assert.deepEqual(calls, ['bar']);
   assert.deepEqual(

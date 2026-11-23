@@ -19,6 +19,7 @@ import {
   EXECUTION_SCOPE_V1_CAPABILITY,
   CALLER_CONTEXT_V2_CAPABILITY,
   OPENAI_COMPAT_EXTENSION_URI,
+  OPERATION_APPROVAL_EXTENSION_URI,
   parseDownFrame,
   TASK_REPLAY_CAPABILITY,
   type AgentCard,
@@ -1380,5 +1381,49 @@ test('transient unary progress persistence failures do not orphan native work', 
     await waitFor(async () => (await store.getTask(id))?.status.state === TaskState.COMPLETED);
     assert.equal((await store.getTask(id))?.artifacts?.[0]?.artifactId, 'partial');
     assert.equal(sent.map(parseDownFrame).filter(frame => frame.type === 'task.assign').length, 1);
+  }
+});
+
+test('a deferred operation lookup cannot dispatch after reconnect, transfer or caller revocation', async () => {
+  for (const change of ['reconnect', 'transfer', 'revoke', 'transfer-during-mark']) {
+    const registry = new Registry();
+    const oldSocket = makeWsCapture(), newSocket = makeWsCapture();
+    const conn = { agentId: 'ops', clientId: 'worker', ownerPrincipal: 'google:owner', ownerRevision: 0,
+      protocolCapabilities: [CALLER_CONTEXT_V2_CAPABILITY, EXECUTION_SCOPE_V1_CAPABILITY, TASK_REPLAY_CAPABILITY],
+      agentCard: makeAgentCard(), allowedCallers: ['google:sub:42'], ws: oldSocket.ws, connectedAt: 0 };
+    registry.registerAgent(conn);
+    let entered!: () => void, release!: () => void;
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const delay = async () => { entered(); await released; };
+    let marks = 0, failures = 0;
+    const store = new InMemoryTaskStore();
+    Object.assign(store, { markExecution: async () => {
+      marks++;
+      if (change === 'transfer-during-mark') await delay();
+      return { failUnsent: async () => { failures++; } };
+    } });
+    const executor = new WSForwardingExecutor('ops', registry, store, undefined, undefined, async () => {
+      if (change !== 'transfer-during-mark') await delay();
+      return ['merge'];
+    });
+    const task = await store.createTask({ contextId: 'test' });
+    const message: Message = { messageId: 'request', role: 'user', parts: [{ text: 'review' }],
+      extensions: [OPERATION_APPROVAL_EXTENSION_URI],
+      metadata: { _principalId: 'google:42', _operationGrantKey: 'google:sub:42' } };
+    const stream = executor.executeStream(task, message);
+    const first = stream.next();
+    await waiting;
+    if (change === 'reconnect') registry.registerAgent({ ...conn, ws: newSocket.ws });
+    else if (change === 'revoke') registry.updateAllowedCallers('ops', []);
+    else registry.updateOwner('ops', 'google:new', 1, null);
+    release();
+    const event = (await first).value as TaskStatusUpdateEvent;
+    assert.equal(event.status.state, TaskState.FAILED, change);
+    assert.equal(registry.getBinding(task.id), undefined, change);
+    assert.equal([...oldSocket.sent, ...newSocket.sent].map(parseDownFrame).some(frame => frame.type === 'task.assign'), false);
+    assert.equal(marks, change === 'transfer-during-mark' ? 1 : 0);
+    assert.equal(failures, marks);
+    for await (const _ of stream) void _;
   }
 });

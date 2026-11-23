@@ -1372,3 +1372,121 @@ test('operator drain count across callers after admissions are paused', { skip: 
     assert.deepEqual(await unavailable.json(), { error: 'Internal error' });
   });
 });
+
+test('agent owners manage durable operation definitions across replicas and ownership transfers', { skip: !hasDb }, async t => {
+  const { createHash, randomUUID } = await import('node:crypto');
+  const { OPERATION_APPROVAL_EXTENSION_URI: uri } = await import('@vicoop-bridge/protocol');
+  const { policyDigest } = await import('./operation-registry.js');
+  const db = postgres(process.env.DATABASE_URL!);
+  const runtime = postgres(process.env.DATABASE_URL!, { connection: { role: 'app_postgraphile' } });
+  const owner = 'google:owner-' + randomUUID(), nextOwner = 'google:next-' + randomUUID();
+  const state = await setupOwner(db, owner);
+  const { agentId } = state;
+  const next = (await issueSessionToken(db, { principalId: nextOwner, provider: 'google', audience: 'owner_session' })).rawToken;
+  const caller = (await issueSessionToken(db, { principalId: owner, provider: 'google', audience: 'caller' })).rawToken;
+  t.after(async () => {
+    await teardown(db, owner, state.clientId);
+    await db`DELETE FROM callers WHERE principal_id=${nextOwner}`;
+    await runtime.end();
+    await db.end();
+  });
+  const replica = () => {
+    const registry = new Registry();
+    const conn = fakeConnection(state);
+    conn.ownerRevision = 0;
+    conn.agentCard.description = 'Operation registry test';
+    conn.protocolCapabilities = ['caller-runtime-v1', 'caller-context-v2', 'execution-scope-v1', 'task-replay-v1'];
+    conn.agentCard.capabilities = { extensions: [{ uri, params: { operations: ['merge'] } }] };
+    registry.registerAgent(conn);
+    return createHttpApp({ db: runtime, registry, publicUrl: 'https://bridge.test' });
+  };
+  const a = replica(), b = replica();
+  const card = async () => {
+    const res = await b.request('/.well-known/agent-card/' + agentId);
+    assert.equal(res.status, 200);
+    return (await res.json() as { a2a: AgentCard }).a2a.capabilities?.extensions?.some(e => e.uri === uri) ?? false;
+  };
+  const base = '/admin-api/agents/' + agentId + '/operations';
+  const target = base + '/merge';
+  const executor = '/operation-executors/' + agentId + '/merge';
+  const request = (url: string, method: string, bearer: string, body?: unknown) => a.request(url, {
+    method, headers: { Authorization: 'Bearer ' + bearer, 'Content-Type': 'application/json' },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const workerToken = randomUUID();
+  const digest = (token: string) => createHash('sha256').update(token).digest('hex');
+  const input = { version: '1', executorId: 'pt4', executorTokenSha256: digest(workerToken),
+    ttlSeconds: 3600, fields: {}, operators: [{ principalId: owner }] };
+  const policy = { ...input, agentId, ownerPrincipal: owner, ownerRevision: 0, operation: 'merge' };
+  const seed = async (jobState: 'approved' | 'pending') => {
+    const id = randomUUID();
+    await db`INSERT INTO infra.operation_requests
+      (id,agent_id,agent_owner,owner_revision,task_id,artifact_id,requester,profile,grant_key,
+       operation,version,executor_id,policy_digest,arguments,digest,expires_at,state,decided_by,history)
+      VALUES (${id},${agentId},${owner},0,${id},${id},${owner},'google','public',
+       'merge','1','pt4',${policyDigest(policy)},'{}',${digest(id)},now()+interval '1 hour',${jobState},'public','[]')`;
+    return id;
+  };
+
+  assert.equal(await card(), false);
+  assert.equal((await request(target, 'PUT', caller, input)).status, 401);
+  for (const [route, method] of [[base, 'GET'], [target, 'GET'], [target, 'PUT'], [target, 'DELETE']]) {
+    assert.equal((await request(route, method, next, method === 'PUT' ? input : undefined)).status, 404);
+  }
+  assert.equal((await request(target, 'PUT', state.ownerToken, { ...input, ownerRevision: 99 })).status, 400);
+  assert.equal((await request(target, 'PUT', state.ownerToken, input)).status, 201);
+  assert.equal(await card(), true);
+  const list = await b.request(base, { headers: authHeaders(state.ownerToken) });
+  assert.deepEqual(await list.json(), { operations: [policy] });
+  assert.deepEqual(await (await request(target, 'GET', state.ownerToken)).json(), policy);
+
+  // Warm the normal HTTP verifier cache, then invalidate the underlying
+  // credential directly as another replica or the session expiry clock would.
+  for (const invalid of ['revoked', 'expired']) {
+    const session = await issueSessionToken(db, { principalId: owner, provider: 'google', audience: 'owner_session' });
+    assert.equal((await request(target, 'GET', session.rawToken)).status, 200);
+    if (invalid === 'revoked') await db`UPDATE callers SET revoked=true WHERE id=${session.callerId}`;
+    else await db`UPDATE callers SET expires_at=clock_timestamp() WHERE id=${session.callerId}`;
+    assert.equal((await request(target, 'PUT', session.rawToken, input)).status, 401);
+    assert.equal((await request(target, 'DELETE', session.rawToken)).status, 401);
+  }
+
+  // Fill the remaining slots using real private table rows. At capacity,
+  // replacement still works and concurrent creators compete for one freed slot.
+  await db`INSERT INTO infra.operation_definitions
+    SELECT agent_id, 'fixture-' || n, owner_revision, executor_id, token_digest,
+      jsonb_set(definition,'{operation}',to_jsonb('fixture-' || n)), true, true
+    FROM infra.operation_definitions CROSS JOIN generate_series(1,255) n
+    WHERE agent_id=${agentId} AND operation='merge'`;
+  assert.equal((await request(base + '/new', 'PUT', state.ownerToken, input)).status, 409);
+  assert.equal((await request(target, 'PUT', state.ownerToken, input)).status, 200);
+  assert.equal((await request(base + '/fixture-1', 'DELETE', state.ownerToken)).status, 204);
+  const adds = await Promise.all(['new-a', 'new-b'].map(op => request(base + '/' + op, 'PUT', state.ownerToken, input)));
+  assert.deepEqual(adds.map(res => res.status).sort(), [201, 409]);
+
+  const executing = await seed('approved');
+  const claim = await request(executor + '/claim', 'POST', workerToken);
+  assert.equal((await claim.json() as { operation: { id: string } }).operation.id, executing);
+  const pending = await seed('pending'), approved = await seed('approved');
+  const changed = { ...input, operators: [{ principalId: nextOwner }] };
+  assert.equal((await request(target, 'PUT', state.ownerToken, changed)).status, 200);
+  assert.equal((await request(target, 'PUT', state.ownerToken, input)).status, 200);
+  const cancelled = await db`SELECT state FROM infra.operation_requests WHERE id IN (${pending},${approved})`;
+  assert.deepEqual(cancelled.map(r => r.state), ['cancelled', 'cancelled']);
+  const retirePending = await seed('approved');
+  assert.equal((await request(target, 'DELETE', state.ownerToken)).status, 204);
+  assert.equal((await db`SELECT state FROM infra.operation_requests WHERE id=${retirePending}`)[0].state, 'cancelled');
+  assert.equal(await card(), false);
+  assert.equal((await request(executor + '/claim', 'POST', workerToken)).status, 404);
+  const recovery = await request(executor + '/unresolved', 'GET', workerToken);
+  assert.deepEqual((await recovery.json() as { operations: { id: string }[] }).operations.map(row => row.id), [executing]);
+
+  await db`UPDATE agents SET owner_principal=${nextOwner} WHERE id=${agentId}`;
+  assert.equal((await request(target, 'PUT', state.ownerToken, input)).status, 404);
+  assert.equal((await request(target, 'PUT', next, input)).status, 409, 'successor must use a fresh credential');
+  const freshToken = randomUUID();
+  assert.equal((await request(target, 'PUT', next, { ...input, executorTokenSha256: digest(freshToken) })).status, 201);
+  const result = { state: 'succeeded', result: 'done' };
+  assert.equal((await request(executor + '/' + executing + '/result', 'POST', freshToken, result)).status, 404);
+  assert.equal((await request(executor + '/' + executing + '/result', 'POST', workerToken, result)).status, 200);
+});

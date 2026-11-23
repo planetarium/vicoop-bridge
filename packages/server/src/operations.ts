@@ -1,7 +1,6 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { Context, Hono } from 'hono';
-import { isOAuthFederationMethodUri } from '@mentionable/connector-kit';
 import { MAX_OPERATION_FIELDS, MAX_OPERATION_REGISTRATION_BYTES, OPERATION_APPROVAL_EXTENSION_URI, OPERATION_PROPOSAL_TYPE } from '@vicoop-bridge/protocol';
 import { HTTPException } from 'hono/http-exception';
 import { bodyLimit } from 'hono/body-limit';
@@ -18,69 +17,14 @@ import {
   type TokenExchangeAccessToken,
 } from './oauth/token-exchange/store.js';
 
-const name = z.string().regex(/^[a-z][a-z0-9_-]{0,62}$/);
-const scalar = z.union([z.string().max(2048), z.number().int().safe(), z.boolean()]);
-const args = z.record(name, scalar).refine((a) => Object.keys(a).length <= MAX_OPERATION_FIELDS);
-const definition = z
-  .object({
-    agentId: z.string().min(1),
-    ownerPrincipal: z.string().min(1),
-    operation: name,
-    version: z.string().min(1).max(128),
-    executorId: name,
-    ownerRevision: z.number().int().nonnegative().safe(),
-    ttlSeconds: z.number().int().min(3600).max(604800),
-    executorTokenSha256: z.string().regex(/^[a-f0-9]{64}$/),
-    operators: z
-      .array(
-        z
-          .object({
-            principalId: z.string().min(1),
-            actorId: z.string().min(1).optional(),
-            method: z.string().max(256).refine(isOAuthFederationMethodUri).optional(),
-          })
-          .strict().refine(operator => operationCallerScheme(operator) !== undefined,
-            { message: 'Direct operators require a canonical Google or SIWE principal' })
-          .refine(operator => operator.method === undefined || operator.actorId !== undefined,
-            { message: 'Only federated operators have an authentication method' }),
-      )
-      .min(1),
-    fields: z.record(
-      name,
-      z
-        .object({
-          type: z.enum(['string', 'integer', 'boolean']),
-          allowedValues: z.array(scalar).min(1).optional(),
-        })
-        .strict(),
-    ).refine(fields => Object.keys(fields).length <= MAX_OPERATION_FIELDS),
-  })
-  .strict();
-export type OperationDefinition = z.infer<typeof definition>;
-
-export function readOperationRegistry(raw: string | undefined): OperationDefinition[] {
-  if (!raw) return [];
-  const entries = z.array(definition).max(256).parse(JSON.parse(raw));
-  const epochs = new Set<string>();
-  const credentials = new Set<string>();
-  for (const entry of entries) {
-    const key = [entry.agentId, entry.operation];
-    const epoch = JSON.stringify([...key, entry.ownerRevision]);
-    const credential = JSON.stringify([...key, entry.executorTokenSha256]);
-    if (epochs.has(epoch)) throw new Error('Duplicate registered operation for ownership revision');
-    if (credentials.has(credential))
-      throw new Error('Ownership revisions require distinct executor credentials');
-    epochs.add(epoch);
-    credentials.add(credential);
-  }
-  return entries;
-}
-
+import { activeDefinitions, canonicalOperationJson, executorDefinition, operationName, operationScalar, policyDigest, type OperationDefinition } from './operation-registry.js';
+export { readOperationRegistry, reconcileOperationPolicies, type OperationDefinition } from './operation-registry.js';
+const args = z.record(operationName, operationScalar).refine((a) => Object.keys(a).length <= MAX_OPERATION_FIELDS);
 const registration = z
   .object({
     taskId: z.string().min(1).max(200),
     proposalKey: z.string().min(1).max(200),
-    operation: name,
+    operation: operationName,
     arguments: args,
   })
   .strict();
@@ -96,16 +40,6 @@ const outcome = z
     result: z.string().max(1024),
   })
   .strict();
-function policyDigest(policy: OperationDefinition) {
-  // Credential rotation preserves the identity of this named executor.
-  const { executorTokenSha256: _credential, ...definition } = policy;
-  // Materialize the method even for policies passed directly to mountOperations.
-  // A previously method-unbound federation policy must get a new digest.
-  const operators = policy.operators.map(operator => ({
-    ...operator, method: operationOperatorMethod(operator),
-  }));
-  return hash(canonical({ ...definition, operators }));
-}
 // Methods belong to the grant, not the OAuth profile. A connector can attest
 // several distinct types of identity under the same profile and actor DID.
 function federatedMethod(grant: string, principal: string, actor: string): string | undefined {
@@ -115,22 +49,7 @@ function federatedMethod(grant: string, principal: string, actor: string): strin
   return delegation?.issuer === actor ? delegation.method : undefined;
 }
 
-// Run before serving connections with the new immutable registry.
-export async function reconcileOperationPolicies(db: Sql, policies: OperationDefinition[]) {
-  const hashes = policies.map(policyDigest);
-  await db`UPDATE infra.operation_requests SET state='cancelled', result='Operation policy changed',
-    history=history||jsonb_build_object('event', 'policy_changed', 'at',clock_timestamp())
-    WHERE state IN ('pending','approved') AND expires_at > clock_timestamp()
-    AND NOT (policy_digest = ANY(${hashes}::text[]))`;
-}
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
-const canonical = (value: unknown): string =>
-  JSON.stringify(value, (_key, v: unknown) =>
-    v && typeof v === 'object' && !Array.isArray(v)
-      ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
-      : v,
-  );
-
 function error(status: 400 | 401 | 404 | 409, message: string): never {
   throw new HTTPException(status, { message });
 }
@@ -251,7 +170,7 @@ function eligibleOperator(policy: OperationDefinition, user: OperationUser) {
 export function mountOperations(
   app: Hono,
   db: Sql,
-  policies = readOperationRegistry(process.env.VICOOP_OPERATIONS),
+  policies?: readonly OperationDefinition[],
   siweDomain?: string,
 ) {
   const path = '/agents/:agent/operations';
@@ -327,15 +246,15 @@ export function mountOperations(
   async function ownerFor(tx: SqlExecutor, agent: string) {
     const [owner] = await tx<{ owner_principal: string; owner_revision: string }[]>`
       SELECT owner_principal, owner_revision::text FROM agents WHERE id=${agent} FOR SHARE`;
-    if (!owner) missing();
     return owner;
   }
-  function policyFor(
+  async function policyFor(
+    tx: SqlExecutor,
     agent: string,
     operation: string,
-    owner: Awaited<ReturnType<typeof ownerFor>>,
+    owner: NonNullable<Awaited<ReturnType<typeof ownerFor>>>,
   ) {
-    return policies.find(
+    return (policies ?? await activeDefinitions(tx, agent, operation)).find(
       (p) =>
         p.agentId === agent &&
         p.operation === operation &&
@@ -357,7 +276,8 @@ export function mountOperations(
       await db.begin(async (tx) => {
         const identity = await user(tx, c, agent);
         if (identity.taskId && identity.taskId !== input.taskId) missing();
-        const policy = policyFor(agent, input.operation, await ownerFor(tx, agent)) ?? missing();
+        const owner = await ownerFor(tx, agent) ?? missing();
+        const policy = await policyFor(tx, agent, input.operation, owner) ?? missing();
         const data = {
           type: OPERATION_PROPOSAL_TYPE,
           operation: input.operation,
@@ -375,7 +295,7 @@ export function mountOperations(
         if (!g || !identity.grants.includes(g)) missing();
         const policyHash = policyDigest(policy);
         const digest = hash(
-          canonical({
+          canonicalOperationJson({
             agent,
             task: input.taskId,
             artifact: input.proposalKey,
@@ -456,8 +376,8 @@ export function mountOperations(
     return db.begin(async (tx) => {
       const identity = await user(tx, c, agent, allowRetainedOperationRead);
       const row = await record(tx, agent, c.req.param('id')!, c.req.method !== 'GET');
-      const owner = await ownerFor(tx, agent);
-      const policy = policyFor(agent, row.operation, owner);
+      const owner = await ownerFor(tx, agent) ?? missing();
+      const policy = await policyFor(tx, agent, row.operation, owner);
       if (identity.taskId && identity.taskId !== row.task_id) missing();
       if (
         identity.operationReadRevision !== undefined &&
@@ -538,9 +458,18 @@ export function mountOperations(
     ),
   );
 
-  function worker(c: Context) {
+  async function worker(tx: SqlExecutor, c: Context) {
     const raw = token(c);
     if (!raw) error(401, 'Invalid executor credential');
+    const agent = c.req.param('agent')!;
+    const operation = c.req.param('operation')!;
+    const owner = await ownerFor(tx, agent) ?? error(401, 'Invalid executor credential');
+    if (!policies) {
+      const entry = await executorDefinition(tx, agent, operation, hash(raw));
+      if (!entry) error(401, 'Invalid executor credential');
+      return { policy: entry.definition, current: entry.active &&
+        entry.definition.ownerRevision === Number(owner.owner_revision) && entry.definition.ownerPrincipal === owner.owner_principal };
+    }
     const digest = Buffer.from(hash(raw), 'hex');
     const policy = policies.find(
       (p) =>
@@ -548,15 +477,16 @@ export function mountOperations(
         p.operation === c.req.param('operation') &&
         timingSafeEqual(digest, Buffer.from(p.executorTokenSha256, 'hex')),
     );
-    return policy ?? error(401, 'Invalid executor credential');
+    if (!policy) error(401, 'Invalid executor credential');
+    return { policy, current: policy === await policyFor(tx, agent, operation, owner) };
   }
   app.post(workerPath + '/claim', async (c) =>
     c.json(
       await db.begin(async (tx) => {
-        const p = worker(c);
+        const { policy: p, current } = await worker(tx, c);
         // A credential from a previous ownership revision can reconcile its
         // existing effects, but has no authority to acquire new work.
-        if (p !== policyFor(p.agentId, p.operation, await ownerFor(tx, p.agentId))) missing();
+        if (!current) missing();
         // One irrevocable claim; a lost HTTP response can require reconciliation,
         // but cannot cause a second dispatch. Removed grants invalidate queued jobs.
         const [row] = await tx<RequestRow[]>`WITH candidate AS (
@@ -576,7 +506,7 @@ export function mountOperations(
   app.get(workerPath + '/unresolved', async (c) =>
     c.json(
       await db.begin(async (tx) => {
-        const p = worker(c);
+        const { policy: p } = await worker(tx, c);
         const after = c.req.query('after') ?? null;
         if (after && !z.string().uuid().safeParse(after).success) error(400, 'Invalid cursor');
         const rows = await tx<RequestRow[]>`SELECT *, false AS expired FROM infra.operation_requests
@@ -595,7 +525,7 @@ export function mountOperations(
     const input = await body(c, outcome);
     return c.json(
       await db.begin(async (tx) => {
-        const p = worker(c);
+        const { policy: p } = await worker(tx, c);
         const row = await record(tx, p.agentId, c.req.param('id')!, true);
         if (
           row.operation !== p.operation ||

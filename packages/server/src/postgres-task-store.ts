@@ -17,7 +17,7 @@ import type { Sql, SqlExecutor } from './db.js';
 import { PUBLIC_TASK_PROFILE, type TaskListAccess } from './task-access.js';
 import { logEvent, truncate } from './log.js';
 import { IDENTITY_VC_PRESENTED_METADATA_KEY } from './identity-vc/types.js';
-import { executionMarker, executionWriter, withExecutionMarker } from './execution-marker.js';
+import { executionMarker, executionWriter, withExecutionMarker, type ExecutionMark } from './execution-marker.js';
 
 const MAX_CONTEXT_TASKS = 10;
 
@@ -513,11 +513,12 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
 
   // See ExecutionMarkingStore. Called before the execution is bound, so the
   // execution it supersedes is already stale when bindTask fails it.
-  async markExecution(taskId: string, executionId: string | undefined, artifacts: Artifact[]): Promise<void> {
+  async markExecution(taskId: string, executionId: string | undefined, artifacts: Artifact[]): Promise<void | ExecutionMark> {
     const dispatchId = executionId ?? randomUUID();
-    await this.sql.begin(async (sql) => {
+    const terminal = await this.sql.begin(async (sql) => {
       const locked = await this.lockTask(sql, taskId);
       if (!locked) throw new Error(`Task not found: ${taskId}`);
+      if (TERMINAL_STATES.has(locked.task.status.state)) return locked.task;
       // Only a replay-capable dispatch (one with a public marker) starts with
       // clean artifacts; a legacy dispatch keeps the task's accumulated ones.
       const { artifacts: prior, ...rest } = locked.task;
@@ -528,10 +529,34 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
         metadata: withExecutionMarker(locked.task.metadata as Record<string, unknown> | undefined, executionId),
       }, sql);
       await sql`UPDATE infra.a2a_tasks SET dispatch_id = ${dispatchId} WHERE task_id = ${taskId}`;
+      return undefined;
     });
+    if (terminal) return { terminal };
     const writer = executionWriter.getStore();
     if (writer) Object.assign(writer, { message: true, marked: true, dispatchId, executionId,
       artifacts: executionId === undefined ? undefined : artifacts });
+    return { failUnsent: async status => {
+      // The previous writer can already have observed its dispatch as stale.
+      // Keep the new private generation fenced and give it a durable terminal
+      // outcome, even if no further SDK or WebSocket write ever arrives.
+      const result = await this.sql.begin(async sql => {
+        const current = await this.lockTask(sql, taskId);
+        if (!current || current.dispatchId !== dispatchId) return undefined;
+        const failed = {
+          ...current.task,
+          status: TERMINAL_STATES.has(current.task.status.state) ? current.task.status : status,
+          metadata: withExecutionMarker(current.task.metadata, undefined),
+        };
+        await this.writeTask(failed, sql);
+        return failed;
+      });
+      // If finalization throws, leave the writer bound to its own generation
+      // so normal dispatch-failure handling can still persist a terminal state.
+      if (writer?.dispatchId === dispatchId) Object.assign(writer, {
+        message: true, marked: false, dispatchId: undefined, executionId: undefined, artifacts: undefined,
+      });
+      return result;
+    } };
   }
 
   private async lockTask(sql: SqlExecutor, taskId: string): Promise<{ task: Task; dispatchId: string | null } | null> {

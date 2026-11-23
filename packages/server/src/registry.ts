@@ -693,15 +693,21 @@ export class Registry {
       // was under is decided — drop the timer before the new binding takes over
       // the taskId. (The timer is identity-guarded too, so this is belt and
       // braces, but leaving live timers around for dead bindings is a trap.)
-      this.clearGraceHold(binding.taskId, existing);
-      this.failBinding(existing, {
-        code: 'task_superseded',
-        message: 'task superseded by a newer request for the same task id',
-        messageIdSuffix: 'superseded',
-      });
+      this.supersedeBinding(existing);
     }
     this.bindings.set(binding.taskId, binding);
     return true;
+  }
+
+  supersedeBinding(binding: TaskBinding): void {
+    if (this.bindings.get(binding.taskId) !== binding) return;
+    this.clearGraceHold(binding.taskId, binding);
+    this.bindings.delete(binding.taskId);
+    this.failBinding(binding, {
+      code: 'task_superseded',
+      message: 'task superseded by a newer request for the same task id',
+      messageIdSuffix: 'superseded',
+    });
   }
 
   // Run `fn` after any earlier dispatch for the same task ID has finished its
