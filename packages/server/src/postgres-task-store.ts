@@ -1,6 +1,5 @@
 import { operationGrantIsActive } from './operation-callers.js';
 import { randomUUID } from 'node:crypto';
-import { isDeepStrictEqual } from 'node:util';
 import type {
   Artifact,
   Task,
@@ -18,7 +17,7 @@ import type { Sql, SqlExecutor } from './db.js';
 import { PUBLIC_TASK_PROFILE, type TaskListAccess } from './task-access.js';
 import { logEvent, truncate } from './log.js';
 import { IDENTITY_VC_PRESENTED_METADATA_KEY } from './identity-vc/types.js';
-import { executionMarker, executionWriter, withExecutionMarker } from './execution-marker.js';
+import { executionMarker, executionWriter, withExecutionMarker, type ExecutionMark } from './execution-marker.js';
 
 const MAX_CONTEXT_TASKS = 10;
 
@@ -514,52 +513,50 @@ export class PostgresTaskStore implements ContextAwareTaskStore {
 
   // See ExecutionMarkingStore. Called before the execution is bound, so the
   // execution it supersedes is already stale when bindTask fails it.
-  async markExecution(taskId: string, executionId: string | undefined, artifacts: Artifact[]): Promise<void | (() => Promise<void>)> {
+  async markExecution(taskId: string, executionId: string | undefined, artifacts: Artifact[]): Promise<void | ExecutionMark> {
     const dispatchId = executionId ?? randomUUID();
-    const status = { state: TaskState.WORKING, timestamp: new Date().toISOString() };
-    const previous = await this.sql.begin(async (sql) => {
+    const terminal = await this.sql.begin(async (sql) => {
       const locked = await this.lockTask(sql, taskId);
       if (!locked) throw new Error(`Task not found: ${taskId}`);
+      if (TERMINAL_STATES.has(locked.task.status.state)) return locked.task;
       // Only a replay-capable dispatch (one with a public marker) starts with
       // clean artifacts; a legacy dispatch keeps the task's accumulated ones.
       const { artifacts: prior, ...rest } = locked.task;
       await this.writeTask({
         ...rest,
         ...(executionId === undefined && prior !== undefined ? { artifacts: prior } : {}),
-        status,
+        status: { state: TaskState.WORKING, timestamp: new Date().toISOString() },
         metadata: withExecutionMarker(locked.task.metadata as Record<string, unknown> | undefined, executionId),
       }, sql);
       await sql`UPDATE infra.a2a_tasks SET dispatch_id = ${dispatchId} WHERE task_id = ${taskId}`;
-      return locked;
+      return undefined;
     });
+    if (terminal) return { terminal };
     const writer = executionWriter.getStore();
-    const priorWriter = writer && { ...writer };
     if (writer) Object.assign(writer, { message: true, marked: true, dispatchId, executionId,
       artifacts: executionId === undefined ? undefined : artifacts });
-    return async () => {
-      // Disarm this writer even if the database becomes unavailable during
-      // cleanup. Subsequent failure writes must respect the previous dispatch.
-      if (writer?.dispatchId === dispatchId) Object.assign(writer, {
-        message: priorWriter?.message, marked: priorWriter?.marked, dispatchId: priorWriter?.dispatchId,
-        executionId: priorWriter?.executionId, artifacts: priorWriter?.artifacts,
-      });
-      await this.sql.begin(async sql => {
+    return { failUnsent: async status => {
+      // The previous writer can already have observed its dispatch as stale.
+      // Keep the new private generation fenced and give it a durable terminal
+      // outcome, even if no further SDK or WebSocket write ever arrives.
+      const result = await this.sql.begin(async sql => {
         const current = await this.lockTask(sql, taskId);
-        if (!current || current.dispatchId !== dispatchId) return;
-        // Roll back only fields this marker changed. A separate status, history
-        // or artifact write may have committed without replacing the dispatch.
-        const untouchedStatus = isDeepStrictEqual(current.task.status, status);
-        const restored = {
+        if (!current || current.dispatchId !== dispatchId) return undefined;
+        const failed = {
           ...current.task,
-          status: untouchedStatus ? previous.task.status : current.task.status,
-          ...(untouchedStatus && executionId && !current.task.artifacts && previous.task.artifacts
-            ? { artifacts: previous.task.artifacts } : {}),
-          metadata: withExecutionMarker(current.task.metadata, executionMarker(previous.task.metadata)),
+          status: TERMINAL_STATES.has(current.task.status.state) ? current.task.status : status,
+          metadata: withExecutionMarker(current.task.metadata, undefined),
         };
-        await this.writeTask(restored, sql);
-        await sql`UPDATE infra.a2a_tasks SET dispatch_id=${previous.dispatchId} WHERE task_id=${taskId}`;
+        await this.writeTask(failed, sql);
+        return failed;
       });
-    };
+      // If finalization throws, leave the writer bound to its own generation
+      // so normal dispatch-failure handling can still persist a terminal state.
+      if (writer?.dispatchId === dispatchId) Object.assign(writer, {
+        message: true, marked: false, dispatchId: undefined, executionId: undefined, artifacts: undefined,
+      });
+      return result;
+    } };
   }
 
   private async lockTask(sql: SqlExecutor, taskId: string): Promise<{ task: Task; dispatchId: string | null } | null> {

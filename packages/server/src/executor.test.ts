@@ -1396,12 +1396,12 @@ test('a deferred operation lookup cannot dispatch after reconnect, transfer or c
     const waiting = new Promise<void>(resolve => { entered = resolve; });
     const released = new Promise<void>(resolve => { release = resolve; });
     const delay = async () => { entered(); await released; };
-    let marks = 0, undos = 0;
+    let marks = 0, failures = 0;
     const store = new InMemoryTaskStore();
     Object.assign(store, { markExecution: async () => {
       marks++;
       if (change === 'transfer-during-mark') await delay();
-      return async () => { undos++; };
+      return { failUnsent: async () => { failures++; } };
     } });
     const executor = new WSForwardingExecutor('ops', registry, store, undefined, undefined, async () => {
       if (change !== 'transfer-during-mark') await delay();
@@ -1423,7 +1423,7 @@ test('a deferred operation lookup cannot dispatch after reconnect, transfer or c
     assert.equal(registry.getBinding(task.id), undefined, change);
     assert.equal([...oldSocket.sent, ...newSocket.sent].map(parseDownFrame).some(frame => frame.type === 'task.assign'), false);
     assert.equal(marks, change === 'transfer-during-mark' ? 1 : 0);
-    assert.equal(undos, marks);
+    assert.equal(failures, marks);
     for await (const _ of stream) void _;
   }
 });

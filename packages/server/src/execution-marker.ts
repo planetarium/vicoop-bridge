@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { APPROVAL_EXTENSION_URI } from '@vicoop-bridge/protocol';
-import type { Artifact } from '@a2x/sdk';
+import type { Artifact, Task, TaskStatus } from '@a2x/sdk';
 
 // Server-written dispatch marker (docs/tool-approval-v1.md): the public
 // Task.metadata entry keyed by the approval extension URI carries the
@@ -63,15 +63,19 @@ export function markMessageRequest(): void {
   if (writer) writer.message = true;
 }
 
+export type ExecutionMark =
+  | { terminal: Task }
+  | { failUnsent: (status: TaskStatus) => Promise<Task | undefined> };
+
 export interface ExecutionMarkingStore {
   // Atomically record a new dispatch for `taskId`: replace the public marker
   // (or clear it when `executionId` is undefined), reset status to working,
   // and bind the current request's writes to it. With an `executionId` it also
   // drops prior artifacts (history is kept) and uses `artifacts` as the
   // execution's output snapshot; a legacy dispatch keeps accumulated artifacts.
-  // The store may return a conditional undo for an authorization change
-  // during persistence, before the assignment is sent.
-  markExecution(taskId: string, executionId: string | undefined, artifacts: Artifact[]): Promise<void | (() => Promise<void>)>;
+  // A task already terminal when its row is locked wins over this dispatch.
+  // The new marker otherwise irrevocably supersedes the previous generation.
+  markExecution(taskId: string, executionId: string | undefined, artifacts: Artifact[]): Promise<void | ExecutionMark>;
 }
 
 export function supportsExecutionMarking(store: unknown): store is ExecutionMarkingStore {

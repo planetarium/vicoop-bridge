@@ -581,10 +581,23 @@ export class WSForwardingExecutor extends AgentExecutor {
       // updates the same connection object, so its ownership epoch matters too.
       if (!stillAdmitted()) return false;
       const store = this.taskStore;
-      const undo = mark && supportsExecutionMarking(store)
+      const previous = this.registry.getBinding(taskId);
+      if (previous && previous.agentId !== this.agentId) return false;
+      const marker = mark && supportsExecutionMarking(store)
         ? await store.markExecution(taskId, executionId, accumulatedArtifacts) : undefined;
+      if (marker && 'terminal' in marker) {
+        interrupted = marker.terminal;
+        return false;
+      }
       if (!stillAdmitted() || !this.registry.bindTask(binding)) {
-        if (undo) await undo();
+        if (marker) {
+          if (previous) this.registry.supersedeBinding(previous);
+          interrupted = await marker.failUnsent({
+            state: TaskState.FAILED, timestamp: new Date().toISOString(),
+            message: { messageId: `${taskId}-dispatch-rejected`, role: 'agent', taskId, contextId,
+              parts: [{ text: 'Agent authorization changed before dispatch' }] },
+          });
+        }
         return false;
       }
       task.metadata = withExecutionMarker(task.metadata as Record<string, unknown> | undefined, executionId);

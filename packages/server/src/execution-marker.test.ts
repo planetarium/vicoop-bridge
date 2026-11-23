@@ -6,10 +6,11 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import postgres from 'postgres';
 import type { WebSocket } from 'ws';
-import { TaskState, type Task } from '@a2x/sdk';
-import { APPROVAL_EXTENSION_URI, TASK_REPLAY_CAPABILITY, REMOTE_APPROVAL_CAPABILITY,
+import { TaskState, type Message, type Task } from '@a2x/sdk';
+import { APPROVAL_EXTENSION_URI, OPERATION_APPROVAL_EXTENSION_URI, CALLER_CONTEXT_V2_CAPABILITY, EXECUTION_SCOPE_V1_CAPABILITY, TASK_REPLAY_CAPABILITY, REMOTE_APPROVAL_CAPABILITY,
   type DownFrame, type TaskAssignFrame } from '@vicoop-bridge/protocol';
 import { createHttpApp } from './http.js';
+import { WSForwardingExecutor } from './executor.js';
 import { ensureSchema } from './db.js';
 import { Registry, type TaskBinding } from './registry.js';
 import { approvalStatus } from './tool-approvals.js';
@@ -505,35 +506,15 @@ test('task store write rules: holderless and fresh-task writes persist; dispatch
   assert.deepEqual(stored?.artifacts?.map(a => a.artifactId), ['a']);
   assert.equal(executionMarker(stored?.metadata as Record<string, unknown>), 'exec-1');
   assert.equal((stored?.metadata as Record<string, unknown>).keep, 1);
-  // A change during durable marking can reject a dispatch before assignment.
-  // Undo restores the prior execution and never erases a newer dispatch.
-  const rejected: ExecutionWriter = { message: true };
-  const undo = await executionWriter.run(rejected, () => store.markExecution(task.id, 'unassigned', []));
-  assert.ok(undo);
-  await undo();
-  assert.deepEqual(await store.getTask(task.id), stored);
-  assert.equal(rejected.marked, undefined);
-  assert.equal(rejected.message, true);
-  for (const state of [TaskState.WORKING, TaskState.CANCELED]) {
-    const stale = await store.createTask({ contextId: randomUUID() });
-    const writer: ExecutionWriter = {};
-    const undoProgress = await executionWriter.run(writer, () => store.markExecution(stale.id, 'unassigned', []));
-    assert.ok(undoProgress);
-    const progress = { state, timestamp: '2026-01-01T00:00:00.000Z' };
-    const artifact = { artifactId: 'new-output', parts: [{ text: 'new' }] };
-    await store.updateTask(stale.id, { status: progress, artifacts: [artifact], metadata: { latest: true } });
-    await undoProgress();
-    const after = await store.getTask(stale.id);
-    assert.deepEqual(after?.status, progress);
-    assert.deepEqual(after?.artifacts, [artifact]);
-    assert.deepEqual(after?.metadata, { latest: true });
-    assert.equal(writer.message, undefined);
-    const staleUndo = await store.markExecution(stale.id, 'superseded-mark', []);
-    assert.ok(staleUndo);
-    await store.markExecution(stale.id, 'later-mark', []);
-    await staleUndo();
-    assert.equal(executionMarker((await store.getTask(stale.id))?.metadata), 'later-mark');
-  }
+  // A completed task wins under the row lock, including a terminal status
+  // committed while an operation policy lookup was still pending.
+  const kept = await store.markExecution(task.id, 'unassigned', []);
+  assert.ok(kept && 'terminal' in kept);
+  assert.deepEqual(kept.terminal, stored);
+  // Continue an input-required task when exercising the legacy path below.
+  await executionWriter.run(owner, () => store.updateTask(task.id, {
+    status: { state: TaskState.INPUT_REQUIRED, timestamp: new Date().toISOString() },
+  }));
   // A legacy (non-replay) dispatch keeps accumulated artifacts and still
   // takes the private dispatch slot: the replay writer above is now stale.
   const legacy: ExecutionWriter = {};
@@ -551,4 +532,78 @@ test('task store write rules: holderless and fresh-task writes persist; dispatch
   await store.updateTask(task.id, { status: failed });
   assert.equal((await store.getTask(task.id))?.status.state, 'failed');
   assert.equal(executionMarker((await store.getTask(task.id))?.metadata as Record<string, unknown>), undefined);
+});
+
+test('a terminal prior execution and a follow-up operation dispatch have one durable winner', {
+  skip: !process.env.DATABASE_URL,
+}, async t => {
+  const sql = postgres(process.env.DATABASE_URL!, { onnotice() {} });
+  await ensureSchema(sql);
+  const agentId = 'dispatch-race-' + randomUUID();
+  const store = new PostgresTaskStore(sql, { ownerAgent: agentId });
+  t.after(async () => {
+    await sql`DELETE FROM infra.a2a_tasks WHERE owner_agent=${agentId}`;
+    await sql.end();
+  });
+  for (const phase of ['loading', 'marked', 'still-bound']) {
+    const registry = new Registry();
+    let assigned!: () => void, paused!: () => void, release!: () => void;
+    const firstAssigned = new Promise<void>(resolve => { assigned = resolve; });
+    const followupWaiting = new Promise<void>(resolve => { paused = resolve; });
+    const resume = new Promise<void>(resolve => { release = resolve; });
+    const pause = async () => { paused(); await resume; };
+    const frames: DownFrame[] = [];
+    registry.registerAgent({
+      agentId, clientId: 'pt4', ownerPrincipal: 'owner', ownerRevision: 0, connectedAt: Date.now(),
+      agentCard: { name: agentId, version: '1', protocolVersion: '0.3.0' }, allowedCallers: ['google:sub:42'],
+      protocolCapabilities: [CALLER_CONTEXT_V2_CAPABILITY, EXECUTION_SCOPE_V1_CAPABILITY, TASK_REPLAY_CAPABILITY],
+      ws: { readyState: 1, OPEN: 1, close() {}, send(raw: string) { frames.push(JSON.parse(raw)); assigned(); } } as unknown as WebSocket,
+    });
+    const executor = new WSForwardingExecutor(agentId, registry, store, 2000, undefined, async () => {
+      if (phase === 'loading') await pause();
+      return ['merge'];
+    });
+    const task = await store.createTask({ contextId: randomUUID() });
+    const run = (message: Message) => executionWriter.run({}, async () => {
+      let last;
+      for await (const event of executor.executeStream(structuredClone(task), message)) {
+        if ('status' in event) last = event.status.state;
+      }
+      return last;
+    });
+    const metadata = { _principalId: 'google:42', _operationGrantKey: 'google:sub:42' };
+    const first = run({ messageId: randomUUID(), role: 'user', parts: [{ text: 'first' }], metadata: { ...metadata } });
+    await firstAssigned;
+    const holder = registry.getBinding(task.id)!;
+    const original = store.markExecution.bind(store);
+    try {
+      store.markExecution = async (...args) => {
+        const marker = await original(...args);
+        if (phase !== 'loading') await pause();
+        return marker;
+      };
+      const second = run({ messageId: randomUUID(), role: 'user', parts: [{ text: 'next' }],
+        metadata: { ...metadata }, extensions: [OPERATION_APPROVAL_EXTENSION_URI] });
+      await followupWaiting;
+      if (phase !== 'still-bound') {
+        holder.sink.pushStatus({ taskId: task.id, contextId: task.contextId!, final: true,
+          status: { state: TaskState.COMPLETED, timestamp: new Date().toISOString() } });
+        holder.sink.finish();
+        assert.equal(await first, TaskState.COMPLETED);
+      }
+      if (phase !== 'loading') registry.updateAllowedCallers(agentId, []);
+      release();
+      const expected = phase === 'loading' ? TaskState.COMPLETED : TaskState.FAILED;
+      assert.equal(await second, expected);
+      if (phase === 'still-bound') assert.equal(await first, TaskState.FAILED);
+      const stored = await store.getTask(task.id);
+      assert.equal(stored?.status.state, expected);
+      assert.equal(executionMarker(stored?.metadata), phase === 'loading' ? holder.executionId : undefined);
+      assert.equal(frames.filter(frame => frame.type === 'task.assign').length, 1);
+      assert.equal(registry.getBinding(task.id), undefined);
+    } finally {
+      release();
+      store.markExecution = original;
+    }
+  }
 });
