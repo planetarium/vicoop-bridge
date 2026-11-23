@@ -1652,14 +1652,26 @@ export function createCodexBackend(
           const transferError = { code: 'context_transfer_failed',
             message: 'Codex could not carry this conversation to the new operation tool set. Retry with the previous tool set, or start a new context and supply the relevant details.' };
           const migrate = trackHostHistory && sameCaller && !existing ? sameCaller : undefined;
+          // A canceled or stalled history RPC must release the A2A context lock.
+          // Use one deadline across reads, replacement thread startup and injection.
+          const transferSignal = migrate
+            ? AbortSignal.any([signal, AbortSignal.timeout(turnTimeoutMs > 0 ? Math.min(10_000, turnTimeoutMs) : 10_000)])
+            : signal;
+          const reportTransferFailure = () => {
+            if (signal.aborted) {
+              emit({ type: 'task.complete', taskId: task.taskId, status: { state: 'canceled', timestamp: new Date().toISOString() } });
+            } else {
+              emit({ type: 'task.fail', taskId: task.taskId, error: transferError });
+            }
+          };
           let transferred: ResponsesApiItem[] | undefined;
           if (migrate) {
             try {
               if (!migrate.hostTurns) throw new Error('History unavailable');
               transferred = await readHostConversation(migrate.hostTurns, threadId =>
-                client.request('thread/read', { threadId, includeTurns: true }));
+                client.request('thread/read', { threadId, includeTurns: true }, transferSignal));
             } catch {
-              emit({ type: 'task.fail', taskId: task.taskId, error: transferError });
+              reportTransferFailure();
               return;
             }
           }
@@ -1825,7 +1837,7 @@ export function createCodexBackend(
                   sandbox: sandboxMode,
                   ...(approvalDecision === 'remote' ? { approvalPolicy: 'untrusted' } : {}),
                   ...(threadConfig ? { config: threadConfig } : {}),
-                },
+                }, transferSignal,
               );
               threadId = resumeResult.thread.id;
               if (typeof resumeResult.model === 'string') threadModel = resumeResult.model;
@@ -1844,7 +1856,7 @@ export function createCodexBackend(
                   // re-hydrates them on `thread/resume`, so we only send
                   // them on the initial start.
                   ...(hostTools ? { dynamicTools: hostTools } : dynamicTools ? { dynamicTools } : {}),
-                },
+                }, transferSignal,
               );
               threadId = startResult.thread.id;
               if (typeof startResult.model === 'string') threadModel = startResult.model;
@@ -1861,7 +1873,7 @@ export function createCodexBackend(
             }
             if (approvalDecision === 'remote') {
               approvalThreadId = threadId;
-              approvalHandlers.set(threadId, { request: requestApproval, signal: turnLifetime.signal });
+              approvalHandlers.set(threadId, { request: requestApproval, signal: AbortSignal.any([signal, turnLifetime.signal]) });
             }
             // Append prior conversation (if any) as native Responses API
             // items so codex's session builder includes them in the model
@@ -1875,14 +1887,15 @@ export function createCodexBackend(
               await client.request('thread/inject_items', {
                 threadId,
                 items: inject,
-              });
+              }, transferSignal);
             }
+            transferSignal.throwIfAborted();
             recorder.mark('threadReady');
           } catch (err) {
             rollbackFreshThread();
             rollbackResumeRefresh();
-            if (migrate) {
-              emit({ type: 'task.fail', taskId: task.taskId, error: transferError });
+            if (migrate || signal.aborted) {
+              reportTransferFailure();
               return;
             }
             // Transport closed mid-handshake: report as crash so operator
@@ -2288,7 +2301,6 @@ export function createCodexBackend(
               }, 2_000);
             };
             signal.addEventListener('abort', onAbort);
-            if (signal.aborted) onAbort();
 
             // Shared liveness heartbeat — see heartbeat.ts. Routes through the
             // wrapped `emit` so a heartbeat refreshes the silence window;
@@ -2304,6 +2316,11 @@ export function createCodexBackend(
               clearIntervalFn: clearIntervalImpl,
               intervalMs: heartbeatMs,
             });
+
+            if (signal.aborted) {
+              finish({ status: 'aborted', finalText });
+              return;
+            }
 
             // Wire client-side timeout if configured. The default 0 means
             // wait for the server.
@@ -2341,7 +2358,13 @@ export function createCodexBackend(
               })
               .then(
                 (res) => {
-                  if (settled || signal.aborted) return;
+                  if (signal.aborted) {
+                    // This RPC response identifies the canceled start even if the
+                    // cancellation grace elapsed and another task now owns the context.
+                    void client.request('turn/interrupt', { threadId, turnId: res.turn.id }).catch(() => {});
+                    return;
+                  }
+                  if (settled) return;
                   activeTurnId = res.turn.id;
                   confirmTurn(activeTurnId);
                   recorder.mark('turnStarted');
@@ -2510,7 +2533,7 @@ export function createCodexBackend(
           }
 
           // Map turn outcome to A2A lifecycle.
-          if (outcome.status === 'interrupted' || outcome.status === 'aborted') {
+          if (signal.aborted || outcome.status === 'interrupted' || outcome.status === 'aborted') {
             // Caller-side abort (`signal.aborted`) takes precedence: surface
             // as `canceled` regardless of whether we also captured a tool
             // call, because the caller asked for cancelation.
