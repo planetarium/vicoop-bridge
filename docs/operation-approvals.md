@@ -58,6 +58,14 @@ local and registered names overlap for an available caller scheme. The client
 offers the tool on authenticated A2A turns that activate the extension.
 Ordinary host tasks can still use the existing host tools and workspace.
 
+When the negotiated operation set changes within a verified A2A conversation,
+Codex starts a thread with the new tools and carries forward the same caller’s
+text messages, assistant replies and operation proposals. Transfer supports up to
+128 completed turns and 512 KiB of replay data. For conversations with other
+native tool activity, attachments, or incomplete history, the bridge returns
+`context_transfer_failed`. Resume with the previous tool set, or start a new
+A2A context and supply the relevant details.
+
 Run the agent daemon and model under a dedicated unprivileged OS account.
 Run the executor under a separate account or on a separate host. Only that
 executor should be able to read its claim credential and upstream service

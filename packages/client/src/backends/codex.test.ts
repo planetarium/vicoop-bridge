@@ -4601,7 +4601,7 @@ test('host Codex resumes matching operation turns and drops the tool when author
     assert.deepEqual(requests.filter(f => f.method === 'thread/start' || f.method === 'thread/resume')
       .map(f => [f.method, f.params?.dynamicTools?.map(t => t.name)]), [
       ['thread/start', ['propose_operation']], ['thread/resume', undefined],
-      ['thread/start', undefined], ['thread/resume', undefined], ['thread/resume', undefined],
+      ['thread/start', undefined], ['thread/resume', undefined], ['thread/start', undefined],
     ]);
   } finally { await backend.close(); }
 });
@@ -4616,4 +4616,130 @@ test('a proposal requires the current app-server turn ID, including during resum
   assert.equal((await handle(call)).success, false);
   assert.equal((await handle({ ...call, turnId: turn })).success, true);
   assert.equal(emitted, 1);
+});
+
+test('host Codex replays completed turns on repeated tool changes only within one caller scope', async () => {
+  const { OPERATION_APPROVAL_EXTENSION_URI: ext } = await import('@vicoop-bridge/protocol');
+  const turns = new Map<string, object[]>();
+  const injections: { thread: string; text: string }[] = [];
+  const reads: string[] = [];
+  const currentInput: string[] = [];
+  let rejectInject = false;
+  let counter = 0;
+  const fake = makeFakeSpawn(() => ({
+    onLine(frame, child) {
+      const { method, id } = frame;
+      const p = frame.params as { threadId: string; input?: { text: string }[]; items?: unknown[] };
+      if (method === 'initialize') child.emitStdout({ id, result: {} });
+      if (method === 'thread/start') {
+        const threadId = 'thread-' + turns.size;
+        turns.set(threadId, []);
+        child.emitStdout({ id, result: { thread: { id: threadId } } });
+      }
+      if (method === 'thread/resume') child.emitStdout({ id, result: { thread: { id: p.threadId } } });
+      if (method === 'thread/read') {
+        reads.push(p.threadId);
+        child.emitStdout({ id, result: { thread: { id: p.threadId, turns: turns.get(p.threadId) } } });
+      }
+      if (method === 'thread/inject_items') {
+        if (rejectInject) child.emitStdout({ id, error: { code: -32000, message: 'Unavailable' } });
+        else {
+          injections.push({ thread: p.threadId, text: JSON.stringify(p.items) });
+          child.emitStdout({ id, result: {} });
+        }
+      }
+      if (method === 'turn/start') {
+        const turnId = 'turn-' + ++counter;
+        const input = p.input![0]!.text;
+        currentInput.push(input);
+        turns.get(p.threadId)!.push({ id: turnId, status: 'completed', items: [
+          { id: 'u', type: 'userMessage', content: [{ type: 'text', text: input }] },
+          ...(counter === 2 ? [{ id: 'proposal-call', type: 'dynamicToolCall', tool: 'propose_operation',
+            arguments: { operation: 'merge-pr' }, success: true, contentItems: [{ type: 'inputText', text: 'pending' }] }] : []),
+          { id: 'a', type: 'agentMessage', text: 'reply:' + counter },
+        ] });
+        child.emitStdout({ id, result: { turn: { id: turnId } } });
+        setImmediate(() => child.emitStdout({ method: 'turn/completed', params: { threadId: p.threadId, turn: { id: turnId, status: 'completed' } } }));
+      }
+    },
+  }));
+  const options = { spawn: fake.spawn, hostOperations: ['merge-pr'], operatorInstructions: 'initial instructions' };
+  const backend = createCodexBackend(options);
+  const handle = async (text: string, active: boolean, principalId = 'google:alice') => {
+    const { emit, frames } = collect();
+    await backend.handle({ ...assign(text, 'shared'), caller: { principal: { id: principalId } },
+      executionId: 'exec-' + text,
+      executionScope: { policy: 'direct-principal-v1', id: (principalId === 'google:alice' ? 'a' : 'b').repeat(64), agentId: 'host', principalId },
+      ...(active ? { requestedExtensions: [ext], operationNames: ['merge-pr'] } : {}),
+    }, emit, NEVER);
+    return frames.at(-1);
+  };
+  try {
+    assert.equal((await handle('alice one', false))?.type, 'task.complete');
+    assert.equal((await handle('alice two', true))?.type, 'task.complete');
+    assert.equal(injections.length, 1);
+    assert.match(injections[0]!.text, /alice one/);
+    assert.match(injections[0]!.text, /reply:1/);
+    rejectInject = true;
+    const failed = await handle('not dispatched', false);
+    assert.ok(failed?.type === 'task.fail' && failed.error.code === 'context_transfer_failed');
+    assert.equal(currentInput.length, 2);
+    rejectInject = false;
+    assert.equal((await handle('alice three', false))?.type, 'task.complete');
+    assert.equal(injections.length, 2);
+    assert.equal(injections[1]!.text.split('alice one').length, 2);
+    assert.match(injections[1]!.text, /alice two/);
+    assert.match(injections[1]!.text, /reply:2/);
+    assert.match(injections[1]!.text, /function_call_output.*proposal-call.*pending/);
+    const first = turns.get('thread-0')![0] as { items: object[] };
+    first.items.push({ type: 'fileChange' });
+    const unsupported = await handle('cannot transfer', true);
+    assert.ok(unsupported?.type === 'task.fail' && unsupported.error.code === 'context_transfer_failed');
+    assert.equal((await handle('same tools still work', false))?.type, 'task.complete');
+    const priorReads = reads.length;
+    options.operatorInstructions = 'new instructions';
+    assert.equal((await handle('alice after instructions changed', true))?.type, 'task.complete');
+    assert.equal(reads.length, priorReads);
+    assert.equal((await handle('bob one', true, 'google:bob'))?.type, 'task.complete');
+    assert.equal(reads.length, priorReads);
+    assert.equal(injections.length, 2);
+  } finally { await backend.close(); }
+});
+
+test('early Codex proposal calls wait for their own turn/start confirmation and reject stale or failed starts', async () => {
+  const { OPERATION_APPROVAL_EXTENSION_URI: ext } = await import('@vicoop-bridge/protocol');
+  for (const mode of ['match', 'stale', 'failed', 'abort']) {
+    const abort = new AbortController();
+    const answers: boolean[] = [];
+    const fake = makeFakeSpawn(() => ({
+      onLine(frame, child) {
+        const { method, id } = frame;
+        if (method === 'initialize') child.emitStdout({ id, result: {} });
+        if (method === 'thread/start') child.emitStdout({ id, result: { thread: { id: 'thread' } } });
+        if (method === 'turn/start') {
+          child.emitStdout({ id: 'early', method: 'item/tool/call', params: { threadId: 'thread', turnId: mode === 'stale' ? 'other' : 'current',
+            namespace: null, tool: 'propose_operation', arguments: { operation: 'merge-pr', arguments: {} } } });
+          setImmediate(() => {
+            if (mode === 'abort') abort.abort();
+            if (mode === 'failed') child.emitStdout({ id, error: { code: -32000, message: 'start failed' } });
+            else child.emitStdout({ id, result: { turn: { id: 'current' } } });
+          });
+        }
+        if (id === 'early') {
+          answers.push((frame.result as { success: boolean }).success);
+          child.emitStdout({ method: 'turn/completed', params: { threadId: 'thread', turn: { id: 'current', status: 'completed' } } });
+        }
+      },
+    }));
+    const backend = createCodexBackend({ spawn: fake.spawn, hostOperations: ['merge-pr'] });
+    const { emit, frames } = collect();
+    try {
+      await backend.handle({ ...assign('review'), executionId: 'generation', requestedExtensions: [ext], operationNames: ['merge-pr'],
+        executionScope: { policy: 'direct-principal-v1', id: 'a'.repeat(64), agentId: 'host', principalId: 'google:abc' },
+      }, emit, abort.signal);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.deepEqual(answers, [mode === 'match'], mode);
+      assert.equal(frames.some(f => f.type === 'task.artifact' && f.artifact.extensions?.includes(ext)), mode === 'match', mode);
+    } finally { await backend.close(); }
+  }
 });
