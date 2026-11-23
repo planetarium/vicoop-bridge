@@ -239,7 +239,7 @@ export class WSForwardingExecutor extends AgentExecutor {
     // Absent in tests and on deployments without a DB-backed payment path;
     // the gate is then never installed and every agent is free.
     private readonly x402: X402ExecutorOptions | undefined = undefined,
-    private readonly operationNamesFor?: (conn: ClientConnection, scheme: OperationCallerScheme) => string[],
+    private readonly operationNamesFor?: (conn: ClientConnection, scheme: OperationCallerScheme) => string[] | Promise<string[]>,
   ) {
     super({
       runner: NOOP_RUNNER,
@@ -569,18 +569,22 @@ export class WSForwardingExecutor extends AgentExecutor {
     let interrupted: Task | undefined;
     let sent = false;
     let history = appendHistoryMessage(task.history ?? [], message);
-    const dispatch = (): boolean => {
+    const dispatch = async (): Promise<boolean> => {
+      const connection = this.registry.getAgent(this.agentId);
+      const scheme = executionScope && principalId ? operationCallerScheme({ principalId, actorId }) : undefined;
+      const grantKey = scheme === 'federated' ? authorizationKey : directOperationGrant;
+      const registeredNames = connection?.ownerRevision !== undefined && scheme && grantKey &&
+        operationGrantIsActive(grantKey, connection.allowedCallers) && requestedExtensions?.includes(OPERATION_APPROVAL_EXTENSION_URI)
+        ? await this.operationNamesFor?.(connection, scheme) : undefined;
+      // A DB-backed lookup can cross a reconnect. Never offer the previous
+      // registration's operations to a successor connection.
+      const operationNames = connection && grantKey && connection === this.registry.getAgent(this.agentId) &&
+        operationGrantIsActive(grantKey, connection.allowedCallers) ? registeredNames : undefined;
       if (!this.registry.bindTask(binding)) return false;
       task.metadata = withExecutionMarker(task.metadata as Record<string, unknown> | undefined, executionId);
       if (executionId !== undefined) delete task.artifacts;
       this.abortControllers.set(taskId, ac);
       task.history = history;
-      const connection = this.registry.getAgent(this.agentId);
-      const scheme = executionScope && principalId ? operationCallerScheme({ principalId, actorId }) : undefined;
-      const grantKey = scheme === 'federated' ? authorizationKey : directOperationGrant;
-      const operationNames = connection?.ownerRevision !== undefined && scheme && grantKey &&
-        operationGrantIsActive(grantKey, connection.allowedCallers) && requestedExtensions?.includes(OPERATION_APPROVAL_EXTENSION_URI)
-        ? this.operationNamesFor?.(connection, scheme) : undefined;
       if (operationNames?.length && connection?.ownerRevision !== undefined && grantKey) {
         binding.operationGrant = { names: operationNames, ownerRevision: connection.ownerRevision, grantKey };
       }
@@ -616,7 +620,7 @@ export class WSForwardingExecutor extends AgentExecutor {
           if (supportsExecutionMarking(store)) await store.markExecution(taskId, executionId, accumulatedArtifacts);
           return dispatch();
         })
-        : dispatch();
+        : await dispatch();
       if (!bound && !interrupted) {
         rejection = { code: 'task_owner_mismatch', message: 'task ownership validation failed', suffix: 'owner-mismatch' };
       }

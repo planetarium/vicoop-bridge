@@ -4,19 +4,15 @@ A caller-isolated Claude or Codex agent proposes named work. The connector regis
 
 ## Register a host operation
 
-1. On the **bridge server**, set `VICOOP_OPERATIONS` to a JSON array of deployment-managed definitions. An empty registry disables proposals, decisions and host access. An authorized originating requester can still read the status of its requests. All replicas must use identical definitions. For a policy change, drain and stop the old replicas before starting the new ones. Startup cancels pending and approved requests whose definitions changed or were removed. On upgrade from a registry with method-unbound federated operators, obtain a new proposal and approval for any outstanding unclaimed work governed by those definitions. Restoring a definition does not revive cancelled work. Use `SELECT id, owner_principal, owner_revision FROM agents WHERE id = ...` to obtain the current ownership binding. The revision changes on ownership transfer. Keep the previous revision's definition while its executor reconciles any claimed work. Register the new revision with a different executor credential. Only the current revision can claim work; the previous executor can list unresolved claims and finalize outcomes for its own revision. Removing the old definition disables even that recovery access. Deleting the agent removes its ledger, so finish reconciliation before deletion.
+1. As the **agent owner**, use an owner-session bearer to register a definition with `PUT /admin-api/agents/:agent/operations/:operation`. The agent and operation come from the URL. The bridge derives owner and revision from the authenticated owner and current agent registration. List definitions with `GET /admin-api/agents/:agent/operations`, read one with `GET` on its item URL, replace it with `PUT`, and retire it with `DELETE`. Changes apply across replicas without a restart. A semantic change or retirement cancels unclaimed work. Restoring the old definition cannot revive it. A retired executor can still reconcile work it already claimed. After ownership transfer, the new owner must register a fresh definition and a different executor credential. Finish reconciliation before deleting the agent, which removes its ledger.
 2. Give each designated executor a random high-entropy bearer secret (e.g. 32 random bytes encoded as hex). Set `executorTokenSha256` to the lowercase SHA-256 hex digest of the literal bearer string without a trailing newline. Keep the secret on the executor. A credential rotation with the same named executor preserves the request. Update the operation version when changing the handler's semantics. A definition change invalidates outstanding unclaimed approvals. Have the agent submit a new proposal using the updated definition.
 3. Register each operator by verified identity. For a federated operator, supply the platform subject, connector DID and authentication method URI. Omitting `method` selects the Mentionable Slack workspace proof (`urn:mentionable:auth:slack-workspace-member:v0.1`). For any other proof, supply its exact `method`. For direct Google or SIWE, supply only the individual principal: `google:<verified-sub>` or `eth:0x<40 lowercase hex digits>`. The agent's caller policy must also admit the operator. A listed operator can approve or deny their own proposal using the same decision credential required for any other proposal. Any authorized requester can cancel their own proposal before execution. Removing the requester's grant or transferring ownership cancels outstanding work. Removing an operator's grant cancels their unconsumed decisions.
 4. On the **bridge client**, add `"operations":["merge-pr"]` under the Claude or Codex backend's `caller_runtime`. These names control which operations its `propose_operation` MCP tool offers. Include argument names and formats in `operatorInstructions`. The proposal tool works with file delivery disabled. Keep all side-effect credentials on the executor host, outside the agent's environment, mounts and available credential proxies.
 
-Example server definition (replace the placeholders with deployment values):
+To register a PR merge, save the following body as `merge-pr.json` and replace the example targets, operator identities and digest.
 
 ```json
-[{
-  "agentId":"ops-agent",
-  "ownerPrincipal":"<registered owner principal>",
-  "ownerRevision":0,
-  "operation":"merge-pr",
+{
   "version":"1",
   "executorId":"github-host",
   "executorTokenSha256":"<64 lowercase hexadecimal characters>",
@@ -32,10 +28,24 @@ Example server definition (replace the placeholders with deployment values):
     "base":{"type":"string","allowedValues":["main"]},
     "head":{"type":"string"}
   }
-}]
+}
+```
+
+```sh
+curl --fail-with-body -X PUT \
+  -H "Authorization: Bearer $OWNER_SESSION" \
+  -H 'Content-Type: application/json' \
+  --data-binary @merge-pr.json \
+  "$BRIDGE_URL/admin-api/agents/ops-agent/operations/merge-pr"
 ```
 
 Fields are required; extra fields are rejected. Supported values are strings, safe integers and booleans. Use the optional `allowedValues` to pin target identifiers. The host adapter also enforces service-specific constraints and uses upstream preconditions. The model supplies only arguments and a registered operation name. It has no channel to specify a command, executable path, approver, destination URL, executor, credentials, or TTL.
+
+### Migrating an existing bridge
+
+Drain and stop replicas running the old registry before the upgrade. Supply the existing `VICOOP_OPERATIONS` array on the first startup with the new schema. The bridge imports it once, transactionally, and records completion in PostgreSQL. Each current entry keeps its existing policy digest. Entries for past ownership revisions are retained for executor reconciliation. Resolve missing agents or future ownership bindings in the legacy registry before retrying a failed migration.
+
+After startup, verify the active definitions using each owner's list endpoint and remove the environment variable. Subsequent startups ignore its value; retiring an operation through the API is durable even if a replica still has the old environment. A fresh installation starts with an empty registry. During upgrade, an existing live ledger with a missing legacy configuration stops startup to avoid accidentally dropping access; set `[]` only if the legacy registry really was empty.
 
 ## v1
 

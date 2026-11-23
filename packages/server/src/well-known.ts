@@ -22,7 +22,7 @@ export interface WellKnownDeps {
   // Resolves a connection's runtime AgentCardV03 (post-auth synthesis,
   // streaming/extensions/security all reflected). The HTTP layer hands us
   // a closure over its per-agent cache so we don't rebuild cards here.
-  getAgentCard: (conn: ClientConnection) => AgentCardV03;
+  getAgentCard: (conn: ClientConnection) => AgentCardV03 | Promise<AgentCardV03>;
   // Bridge's own admin agent card. Listed under @admin@<host> in every
   // well-known surface — does not depend on a WS connection (it's the
   // bridge itself).
@@ -97,7 +97,7 @@ function entriesFromPairs(
   return entries;
 }
 
-function collectPairs(deps: WellKnownDeps): ConnectionPair[] {
+async function collectPairs(deps: WellKnownDeps): Promise<ConnectionPair[]> {
   const candidates = new Map<string, ClientConnection | 'collision'>();
   for (const conn of deps.listAgents()) {
     if (!isValidMentionableLocal(conn.agentId)) continue;
@@ -109,11 +109,8 @@ function collectPairs(deps: WellKnownDeps): ConnectionPair[] {
     candidates.set(key, conn);
   }
 
-  const pairs: ConnectionPair[] = [];
-  for (const conn of candidates.values()) {
-    if (conn !== 'collision') pairs.push({ conn, card: deps.getAgentCard(conn) });
-  }
-  return pairs;
+  const connections = [...candidates.values()].filter(conn => conn !== 'collision');
+  return Promise.all(connections.map(async conn => ({ conn, card: await deps.getAgentCard(conn) })));
 }
 
 function isIpLiteral(hostname: string): boolean {
@@ -154,7 +151,7 @@ function isMentionableEligible(
   return true;
 }
 
-function resolveLocal(deps: WellKnownDeps, local: string): ResolvedLocal | undefined {
+async function resolveLocal(deps: WellKnownDeps, local: string): Promise<ResolvedLocal | undefined> {
   const lower = local.toLowerCase();
   if (lower === MENTIONABLE_ADMIN_LOCAL.toLowerCase()) {
     return { local: MENTIONABLE_ADMIN_LOCAL, card: deps.adminCard };
@@ -178,7 +175,7 @@ function resolveLocal(deps: WellKnownDeps, local: string): ResolvedLocal | undef
     match = conn;
   }
   return match
-    ? { local: match.agentId, card: deps.getAgentCard(match) }
+    ? { local: match.agentId, card: await deps.getAgentCard(match) }
     : undefined;
 }
 
@@ -238,7 +235,7 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
     ) {
       return c.json({ error: 'not found' }, 404);
     }
-    const resolved = resolveLocal(deps, parsed.local);
+    const resolved = await resolveLocal(deps, parsed.local);
     const identity = parsed.local.toLowerCase() === MENTIONABLE_ADMIN_LOCAL
       ? undefined : await publicationFor(parsed.local);
     if (!resolved && identity === null) return c.json({ error: 'publication directory unavailable' }, 503);
@@ -280,7 +277,7 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
     return c.json({ keys: identity.keys }, 200, { 'Content-Type': 'application/jwk-set+json' });
   });
 
-  app.get('/.well-known/agent-card/:local', (c) => {
+  app.get('/.well-known/agent-card/:local', async (c) => {
     if (!isMentionableEligible(deps)) {
       return c.json({ error: 'agent-card not available (PUBLIC_URL must be HTTPS with a multi-label hostname)' }, 404);
     }
@@ -288,7 +285,7 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
     if (!isValidMentionableLocal(local)) {
       return c.json({ error: 'not found' }, 404);
     }
-    const resolved = resolveLocal(deps, local);
+    const resolved = await resolveLocal(deps, local);
     if (!resolved) return c.json({ error: 'not found' }, 404);
     const mentionable = buildMentionableCard(resolved.card, {
       local: resolved.local,
@@ -300,7 +297,7 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
     return c.json(mentionable);
   });
 
-  app.get('/.well-known/mentionable-agents.json', (c) => {
+  app.get('/.well-known/mentionable-agents.json', async (c) => {
     if (!isMentionableEligible(deps)) {
       return c.json({ error: 'directory not available (PUBLIC_URL must be HTTPS with a multi-label hostname)' }, 404);
     }
@@ -308,7 +305,7 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
       baseUrl: deps.publicUrl,
       domain: deps.domain.toLowerCase(),
       organizationName: deps.organizationName,
-      entries: entriesFromPairs(collectPairs(deps), deps.adminCard),
+      entries: entriesFromPairs(await collectPairs(deps), deps.adminCard),
     });
     return c.json(directory);
   });
@@ -320,7 +317,7 @@ export function mountWellKnown(app: Hono, deps: WellKnownDeps): void {
 // already walks the registry to render its own client list, so passing the
 // same snapshot in saves a redundant listAgents() + per-agent getAgentCard
 // round on every landing-page hit.
-export function buildLandingDirectory(
+export async function buildLandingDirectory(
   deps: WellKnownDeps,
   pairs?: readonly ConnectionPair[],
 ) {
@@ -331,6 +328,6 @@ export function buildLandingDirectory(
     baseUrl: deps.publicUrl,
     domain: deps.domain.toLowerCase(),
     organizationName: deps.organizationName,
-    entries: entriesFromPairs(pairs ?? collectPairs(deps), deps.adminCard),
+    entries: entriesFromPairs(pairs ?? await collectPairs(deps), deps.adminCard),
   });
 }

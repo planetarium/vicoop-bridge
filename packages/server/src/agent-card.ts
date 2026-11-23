@@ -1,5 +1,5 @@
 import { parseFederatedDelegation } from './auth/federated-delegation.js';
-import type { OperationDefinition } from './operations.js';
+import type { OperationPolicyRef } from './operation-registry.js';
 import { matchingOperationNames, type OperationCallerScheme } from './operation-callers.js';
 import { OPERATION_APPROVAL_EXTENSION_URI, APPROVAL_EXTENSION_URI, REMOTE_APPROVAL_CAPABILITY } from '@vicoop-bridge/protocol';
 import {
@@ -34,7 +34,8 @@ export interface AgentA2XOptions {
   publicUrl: string | undefined;
   deviceFlowEnabled: boolean;
   protocolVersion?: ProtocolVersion;
-  operationPolicies?: readonly OperationDefinition[];
+  operationPolicies?: readonly OperationPolicyRef[];
+  readOperationPolicies?: (conn: ClientConnection) => Promise<readonly OperationPolicyRef[]>;
   // DB handle for the x402 offering store. Absent on deployments assembled
   // without a payment path; the executor then never installs the gate.
   db?: Sql;
@@ -84,13 +85,16 @@ export function buildAgentA2XServer(
     return matchingOperationNames(current, opts.operationPolicies ?? [], scheme);
   }
 
+  const readPolicies = opts.readOperationPolicies;
   const executor = new WSForwardingExecutor(
     conn.agentId,
     registry,
     taskStore,
     undefined,
     paymentsWired ? { sql: opts.db!, resource: url } : undefined,
-    operationNamesFor,
+    readPolicies
+      ? async (current, scheme) => matchingOperationNames(current, await readPolicies(current), scheme)
+      : operationNamesFor,
   );
 
   const a2xServer = new A2XServer({

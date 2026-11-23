@@ -3,7 +3,7 @@ import { loadOutboundSigner, type PublicationAuthority } from './outbound-signat
 import { watchAgentOwners } from './agent-transfer.js';
 import { serve } from '@hono/node-server';
 import { Registry } from './registry.js';
-import { readOperationRegistry, reconcileOperationPolicies } from './operations.js';
+import { migrateOperationRegistry } from './operation-registry.js';
 import { createHttpApp } from './http.js';
 import { attachWsServer } from './ws.js';
 import { PostgresTaskStore } from './postgres-task-store.js';
@@ -107,13 +107,11 @@ export async function configuredPublicationAuthority(
 
 export async function startServer(opts: ServerOptions) {
   const outboundSigner = await configuredPublicationAuthority(opts.db, opts.publicUrl);
-  const policies = readOperationRegistry(process.env.VICOOP_OPERATIONS);
-  await reconcileOperationPolicies(opts.db, policies);
+  await opts.db.begin(tx => migrateOperationRegistry(tx, process.env.VICOOP_OPERATIONS));
   const registry = new Registry();
   const app = createHttpApp({
     registry,
     publicationAuthority: outboundSigner,
-    operationPolicies: policies,
     publicUrl: opts.publicUrl,
     db: opts.db,
     google: opts.google,

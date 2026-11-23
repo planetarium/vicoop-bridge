@@ -4,6 +4,7 @@ import { authorizeRequesterApproval, RequesterDecisionBody, requesterApprovalRes
 import path from 'node:path';
 import fs from 'node:fs';
 import { Hono, type Context, type MiddlewareHandler } from 'hono';
+import { HTTPException } from 'hono/http-exception';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { stream } from 'hono/streaming';
 import { html } from 'hono/html';
@@ -62,8 +63,9 @@ import {
   rejectAgentRequest,
 } from './agent-auth.js';
 import { CALLER_TOKEN_PREFIX, OWNER_SESSION_PREFIX, verifySessionToken } from './auth/caller-token.js';
+import { mountOperationRegistry, operationPolicyRefs, type OperationPolicyRef } from './operation-registry.js';
 import { matchingOperationNames, operationCallerScheme } from './operation-callers.js';
-import { directOperationGrants, mountOperations, readOperationRegistry, type OperationDefinition } from './operations.js';
+import { directOperationGrants, mountOperations, type OperationDefinition } from './operations.js';
 import { mountDeviceFlow } from './auth/device-flow.js';
 import { mountDeviceUi } from './auth/device-ui.js';
 import { mountTokenRevocation } from './auth/revoke.js';
@@ -193,7 +195,6 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }),
   );
 
-  const operationPolicies = opts.operationPolicies ?? readOperationRegistry(process.env.VICOOP_OPERATIONS);
 
   // The built-in admin agent and every connected client agent get distinct
   // owner-scoped views of the same Postgres table. A handler can therefore
@@ -223,12 +224,32 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   const deviceFlowEnabled = Boolean(opts.google && opts.publicUrl);
   const tokenExchangeProfiles = [createMentionableOAuthProfile({ resolver: identityVcResolver })];
   const tokenExchangeResourceProfiles = [createMentionableResourceProfile()];
-  const agentCardOpts: AgentA2XOptions = {
+  const cardPolicies = new Map<string, readonly OperationPolicyRef[]>();
+  async function loadPolicies(conn: ClientConnection) {
+    if (opts.operationPolicies) return opts.operationPolicies;
+    if (!conn.agentCard.capabilities?.extensions?.some(e => e.uri === OPERATION_APPROVAL_EXTENSION_URI)) return [];
+    return operationPolicyRefs(opts.db, conn.agentId);
+  }
+  // Only the names and ownership epoch affect discovery. Reload on discovery
+  // and negotiation, so separate replicas don't rely on cache notifications.
+  async function refreshPolicies(conn: ClientConnection) {
+    const policies = await loadPolicies(conn);
+    if (opts.registry.getAgent(conn.agentId) !== conn) {
+      throw new HTTPException(503, { message: 'Agent connection changed; retry the request' });
+    }
+    if (JSON.stringify(cardPolicies.get(conn.agentId) ?? []) !== JSON.stringify(policies)) {
+      invalidateAgent(conn.agentId);
+      cardPolicies.set(conn.agentId, policies);
+    }
+    return policies;
+  }
+  const agentCardOpts = (conn: ClientConnection): AgentA2XOptions => ({
     publicUrl: opts.publicUrl,
-    operationPolicies,
+    operationPolicies: cardPolicies.get(conn.agentId) ?? [],
+    readOperationPolicies: loadPolicies,
     deviceFlowEnabled,
     db: opts.db,
-  };
+  });
 
   function getAgentForConn(conn: ClientConnection): A2XServer {
     const cached = agentCache.get(conn.agentId);
@@ -238,7 +259,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       ownerAgent: conn.agentId,
       listAccess: () => taskListAccess.getStore(),
     });
-    const a2x = buildAgentA2XServer(conn, taskStore, opts.registry, agentCardOpts);
+    const a2x = buildAgentA2XServer(conn, taskStore, opts.registry, agentCardOpts(conn));
     agentCache.set(conn.agentId, a2x);
     return a2x;
   }
@@ -260,7 +281,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       listAccess: () => taskListAccess.getStore(),
     });
     const a2x = buildAgentA2XServer(conn, taskStore, opts.registry, {
-      ...agentCardOpts,
+      ...agentCardOpts(conn),
       protocolVersion: '1.0',
     });
     agentV1Cache.set(conn.agentId, a2x);
@@ -287,25 +308,16 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
 
   // Invalidate cached A2XServer + handler when allowedCallers changes so
   // the rendered card reflects the updated security fields.
-  opts.registry.onCallerChange((agentId) => {
+  function invalidateAgent(agentId: string) {
     agentCache.delete(agentId);
     handlerCache.delete(agentId);
     agentV1Cache.delete(agentId);
     handlerV1Cache.delete(agentId);
     httpJsonV1Cache.delete(agentId);
-  });
-  // Also invalidate on (re)registration or disconnect. The handler
-  // captures the agent card at construction time — including
-  // `capabilities.streaming` — so a client that reconnects with an
-  // updated card would otherwise be served by a stale handler that
-  // still advertises the old capabilities.
-  opts.registry.onAgentChange((agentId) => {
-    agentCache.delete(agentId);
-    handlerCache.delete(agentId);
-    agentV1Cache.delete(agentId);
-    handlerV1Cache.delete(agentId);
-    httpJsonV1Cache.delete(agentId);
-  });
+    cardPolicies.delete(agentId);
+  }
+  opts.registry.onCallerChange(invalidateAgent);
+  opts.registry.onAgentChange(invalidateAgent);
 
   // Log label for a message/stream response, which outlives its connection;
   // undefined for every other operation.
@@ -422,7 +434,8 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }
 
     const scheme = caller && operationCallerScheme(caller);
-    const operationNames = scheme ? matchingOperationNames(conn, operationPolicies, scheme) : [];
+    const operationNames = scheme
+      ? matchingOperationNames(conn, await refreshPolicies(conn), scheme) : [];
     const directGrants = caller && !caller.tokenExchange && operationNames.length
       ? directOperationGrants(conn.allowedCallers, caller) : [];
     let directGrantKey: string | undefined = directGrants[0];
@@ -620,7 +633,8 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
     }
   }
 
-  mountOperations(app, opts.db, operationPolicies, siweDomain);
+  mountOperations(app, opts.db, opts.operationPolicies, siweDomain);
+  mountOperationRegistry(app, opts.db, authOwnerSession);
 
   if (opts.publicUrl) {
     mountTokenExchangeRoutes(app, {
@@ -662,7 +676,10 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       if (keys.length) return { ...identity, keys };
     } : undefined,
     listAgents: () => opts.registry.listAgents(),
-    getAgentCard: (conn) => getAgentForConn(conn).getAgentCard() as AgentCardV03,
+    getAgentCard: async (conn) => {
+      await refreshPolicies(conn);
+      return getAgentForConn(conn).getAgentCard() as AgentCardV03;
+    },
     adminCard,
     publicUrl: opts.publicUrl,
     domain: siweDomain,
@@ -672,17 +689,16 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
   mountWellKnown(app, wellKnownDeps);
 
   // Server info — HTML landing for browsers, JSON for API clients
-  app.get('/', (c) => {
+  app.get('/', async (c) => {
     // Single registry walk per request: the HTML landing's `clients` array
     // and the JSON-LD directory it embeds both derive from the same
     // (connection, AgentCardV03) snapshot. Reusing one snapshot means the
     // two views can never disagree mid-request — and getAgentCard, which
     // reads from a per-agent cache that's invalidated on caller-policy /
     // hello-frame changes, is called once per agent instead of twice.
-    const pairs: ConnectionPair[] = opts.registry.listAgents().map((conn) => ({
-      conn,
-      card: getAgentForConn(conn).getAgentCard() as AgentCardV03,
-    }));
+    const pairs: ConnectionPair[] = await Promise.all(opts.registry.listAgents().map(async conn => ({
+      conn, card: await wellKnownDeps.getAgentCard(conn),
+    })));
     const clients = pairs.map(({ conn, card }) => ({
       id: conn.agentId,
       url: opts.publicUrl
@@ -704,7 +720,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
         clients,
       });
     }
-    const directory = buildLandingDirectory(wellKnownDeps, pairs);
+    const directory = await buildLandingDirectory(wellKnownDeps, pairs);
     return c.html(
       html`<!DOCTYPE html>${(
         <Landing
@@ -1350,6 +1366,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       }
       return c.json({ error: 'agent not connected' }, 404);
     }
+    await refreshPolicies(conn);
     return c.json(getAgentForConn(conn).getAgentCard() as AgentCardV03);
   });
 
@@ -1366,6 +1383,7 @@ export function createHttpApp(opts: ServerHttpOptions): Hono {
       }
       return c.json({ error: 'agent not connected' }, 404);
     }
+    await refreshPolicies(conn);
     return c.json(getAgentV1ForConn(conn).getAgentCard() as AgentCardV10);
   });
 

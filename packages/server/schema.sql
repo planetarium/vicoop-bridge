@@ -1382,6 +1382,31 @@ REVOKE ALL ON infra.operation_requests FROM app_anonymous, app_authenticated, PU
 GRANT SELECT, INSERT, UPDATE ON infra.operation_requests TO app_postgraphile;
 REVOKE DELETE ON infra.operation_requests FROM app_postgraphile;
 
+-- One active definition per ownership epoch. Retired credentials remain bound
+-- to their original executor for reconciliation; rotated credentials are disabled.
+CREATE TABLE IF NOT EXISTS infra.operation_definitions (
+  agent_id text NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  operation text NOT NULL,
+  owner_revision bigint NOT NULL,
+  executor_id text NOT NULL,
+  token_digest text NOT NULL,
+  definition jsonb NOT NULL,
+  active boolean NOT NULL,
+  credential_enabled boolean NOT NULL DEFAULT true,
+  PRIMARY KEY (agent_id, operation, token_digest)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS operation_definitions_active
+  ON infra.operation_definitions(agent_id, operation, owner_revision) WHERE active;
+CREATE TABLE IF NOT EXISTS infra.operation_registry_migration (
+  singleton boolean PRIMARY KEY CHECK (singleton)
+);
+REVOKE ALL ON infra.operation_definitions, infra.operation_registry_migration
+  FROM app_anonymous, app_authenticated, PUBLIC;
+REVOKE DELETE ON infra.operation_definitions FROM app_postgraphile;
+REVOKE UPDATE, DELETE ON infra.operation_registry_migration FROM app_postgraphile;
+GRANT SELECT, INSERT, UPDATE ON infra.operation_definitions TO app_postgraphile;
+GRANT SELECT, INSERT ON infra.operation_registry_migration TO app_postgraphile;
+
 -- Outside the GraphQL schemas. A NULL envelope disables this registration epoch.
 CREATE SCHEMA IF NOT EXISTS bridge_private;
 CREATE TABLE IF NOT EXISTS bridge_private.publication_keys (
