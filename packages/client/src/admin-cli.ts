@@ -15,6 +15,7 @@ import { message } from '@optique/core/message';
 import type { InferValue } from '@optique/core/parser';
 import { integer, string } from '@optique/core/valueparser';
 import { readFile } from 'node:fs/promises';
+import { z } from 'zod';
 import { resolveOwnerSession } from './owner-session.js';
 import { agentRegisterCmd } from './setup.js';
 
@@ -244,6 +245,35 @@ const agentCallersSubCmd = command(
   },
 );
 
+const operationAgentArgs = {
+  action: constant('agent-operations' as const),
+  ...sharedFlags,
+  // Dot segments normalize to the parent resource even after URI encoding.
+  agentId: argument(string({ metavar: 'AGENT_ID', pattern: /^(?!\.{1,2}$).+$/ })),
+};
+const operationItemArgs = {
+  ...operationAgentArgs,
+  operation: argument(string({ metavar: 'OPERATION', pattern: /^[a-z][a-z0-9_-]{0,62}$/ })),
+};
+const agentOperationsCmd = command('operations', longestMatch(
+  command('list', object({ ...operationAgentArgs, verb: constant('list' as const) }), {
+    brief: message`List active operation definitions for an agent.`,
+  }),
+  command('get', object({ ...operationItemArgs, verb: constant('get' as const) }), {
+    brief: message`Print editable definition JSON. Use --json for the complete server record.`,
+  }),
+  command('apply', object({
+    ...operationItemArgs,
+    verb: constant('apply' as const),
+    file: option('--file', string({ metavar: 'PATH' }), {
+      description: message`Read the operation definition as JSON from PATH, or from stdin with --file -.`,
+    }),
+  }), { brief: message`Create or replace an operation definition.` }),
+  command('remove', object({ ...operationItemArgs, verb: constant('remove' as const) }), {
+    brief: message`Retire an operation and cancel its unclaimed requests.`,
+  }),
+), { brief: message`Manage the agent's operator-approved host operations.` });
+
 // ----- agent x402 (pricing) ---------------------------------------------------
 //
 // Pricing is server-side state, not client config: `payTo` names the wallet
@@ -352,12 +382,13 @@ export const agentCmd = command(
     agentTransferSubCmd,
     agentCallersSubCmd,
     agentX402SubCmd,
+    agentOperationsCmd,
     agentListSubCmd,
     agentRemoveSubCmd,
   ),
   {
-    brief: message`Manage agent registrations, their callers, and their pricing.`,
-    description: message`Operator-facing umbrella for agent state. Subcommands: \`transfer\`, \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, add-federated, remove-federated, issue-api-key}\`, \`x402 {show, set, clear}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
+    brief: message`Manage agent registrations, callers, pricing, and operation definitions.`,
+    description: message`Operator-facing umbrella for agent state. Subcommands: \`transfer\`, \`register\`, \`list\`, \`remove\`, \`callers {list, add, remove, add-federated, remove-federated, issue-api-key}\`, \`x402 {show, set, clear}\`, \`operations {list, get, apply, remove}\`. Replaces the older flat \`setup\` / \`list-agents\` / \`list-clients\` / \`revoke-client\` / \`{add,remove,list}-caller\` commands, which remain as deprecated aliases.`,
     hidden: 'usage',
   },
 );
@@ -526,6 +557,7 @@ interface RequestArgs {
   method: 'GET' | 'POST' | 'PUT' | 'DELETE';
   path: string;
   body?: unknown;
+  redirect?: RequestInit['redirect'];
 }
 
 interface ApiResult {
@@ -533,18 +565,21 @@ interface ApiResult {
   body: unknown;
 }
 
-async function callApi({ session, method, path, body }: RequestArgs): Promise<ApiResult> {
+async function callApi({ session, method, path, body, redirect }: RequestArgs): Promise<ApiResult> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${session.token}`,
   };
   if (body !== undefined) headers['content-type'] = 'application/json';
   let res: Response;
+  let text: string;
   try {
     res = await fetch(`${session.bridge}${path}`, {
       method,
       headers,
+      redirect,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
+    text = await res.text();
   } catch (err) {
     // Surface DNS / ECONNREFUSED / TLS / aborted-connection failures through
     // the same emitError path the rest of the subcommands use, so the user
@@ -555,7 +590,6 @@ async function callApi({ session, method, path, body }: RequestArgs): Promise<Ap
       body: { error: `network error: ${(err as Error).message}` },
     };
   }
-  const text = await res.text();
   let parsed: unknown = text;
   if (text) {
     try {
@@ -929,6 +963,88 @@ export async function runAgentCallersRemoveFederated(
   return execFederatedCaller(args, 'DELETE');
 }
 
+// Decode the owner API response before rendering it. Policy validation belongs
+// to the server; the CLI checks the wire shape and the requested resource.
+const registryDefinition = z.object({
+  agentId: z.string(), operation: z.string(), ownerPrincipal: z.string(), ownerRevision: z.number().int(),
+  version: z.string(), executorId: z.string(), executorTokenSha256: z.string(), ttlSeconds: z.number().int(),
+  operators: z.array(z.object({ principalId: z.string(), actorId: z.string().optional(), method: z.string().optional() })),
+  fields: z.record(z.object({
+    type: z.enum(['string', 'integer', 'boolean']),
+    allowedValues: z.array(z.union([z.string(), z.number(), z.boolean()])).optional(),
+  })),
+});
+const registryList = z.object({ operations: z.array(registryDefinition) });
+
+function renderOperationList(operations: z.infer<typeof registryDefinition>[]): string {
+  if (!operations.length) return '(no active operations)';
+  const rows = operations.map(op => [op.operation, op.version, op.executorId].map(value =>
+    JSON.stringify(value).slice(1, -1)));
+  return renderTable(['OPERATION', 'VERSION', 'EXECUTOR'], rows);
+}
+
+export async function runAgentOperations(args: InferValue<typeof agentOperationsCmd>): Promise<number> {
+  const explicit = args.server !== undefined || args.token !== undefined;
+  const { VICOOP_BRIDGE: bridge, VICOOP_OWNER_TOKEN: token } = process.env;
+  if (explicit && (!args.server?.trim() || !args.token?.trim())) {
+    process.stderr.write('Pass a nonempty --server and --token together.\n');
+    return 1;
+  }
+  if (!explicit && (bridge !== undefined || token !== undefined) && (!bridge?.trim() || !token?.trim())) {
+    process.stderr.write('Set VICOOP_BRIDGE and VICOOP_OWNER_TOKEN together, or unset both to use the saved session.\n');
+    return 1;
+  }
+  const session = resolveSession(args);
+  if ('error' in session) {
+    process.stderr.write(`${session.error}\n`);
+    return 1;
+  }
+  const base = `/admin-api/agents/${encodeURIComponent(args.agentId)}/operations`;
+  const path = args.verb === 'list' ? base : `${base}/${encodeURIComponent(args.operation)}`;
+  const methods = { list: 'GET', get: 'GET', apply: 'PUT', remove: 'DELETE' } as const;
+  let body: unknown;
+  if (args.verb === 'apply') {
+    try {
+      body = await readJsonFile(args.file);
+    } catch (err) {
+      // A JSON parser error can include a fragment of the input file.
+      const detail = err instanceof SyntaxError ? 'invalid JSON' : (err as Error).message;
+      process.stderr.write(`Could not read operation definition: ${detail}\n`);
+      return 1;
+    }
+  }
+  const result = await callApi({ session, method: methods[args.verb], path, body, redirect: 'manual' });
+  if (result.status === 0 || result.status >= 400) {
+    const error = z.object({ error: z.string() }).safeParse(result.body);
+    emitError({ status: result.status, body: { error: error.success ? error.data.error : 'Operation registry request failed' } });
+    return 1;
+  }
+  if (args.verb === 'remove') {
+    if (result.status === 204) {
+      return emit({ status: 204, body: null }, args.json, () => `Retired ${args.operation} for ${args.agentId}.`);
+    }
+  } else if (args.verb === 'list') {
+    const list = registryList.safeParse(result.body);
+    if (result.status === 200 && list.success && list.data.operations.every(op => op.agentId === args.agentId)) {
+      return emit(result, args.json, () => renderOperationList(list.data.operations));
+    }
+  } else {
+    const record = registryDefinition.safeParse(result.body);
+    const ok = result.status === 200 || (args.verb === 'apply' && result.status === 201);
+    if (ok && record.success && record.data.agentId === args.agentId && record.data.operation === args.operation) {
+      return emit(result, args.json, () => {
+        if (args.verb === 'apply') return `Applied ${args.operation} to ${args.agentId}.`;
+        // Preserve fields added by newer bridges. PUT rejects only the four
+        // bridge-bound keys; taking Zod's parsed output would drop unknown keys.
+        const { agentId, operation, ownerPrincipal, ownerRevision, ...input } = result.body as Record<string, unknown>;
+        return JSON.stringify(input, null, 2);
+      });
+    }
+  }
+  process.stderr.write(`Unexpected operation registry response (HTTP ${result.status}).\n`);
+  return 1;
+}
+
 // ----- agent x402 (pricing) ---------------------------------------------------
 
 /**
@@ -964,7 +1080,7 @@ function buildPricingFromFlags(args: AgentX402SetArgs): Record<string, unknown> 
   return Object.keys(out).length > 0 ? out : null;
 }
 
-async function readPricingFile(path: string): Promise<unknown> {
+async function readJsonFile(path: string): Promise<unknown> {
   const raw =
     path === '-'
       ? await new Promise<string>((resolve, reject) => {
@@ -1041,7 +1157,7 @@ export async function runAgentX402Set(args: AgentX402SetArgs): Promise<number> {
   let pricing: unknown;
   if (args.file !== undefined) {
     try {
-      pricing = await readPricingFile(args.file);
+      pricing = await readJsonFile(args.file);
     } catch (err) {
       process.stderr.write(`could not read pricing JSON: ${(err as Error).message}\n`);
       return 1;

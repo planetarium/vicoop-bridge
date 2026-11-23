@@ -970,6 +970,8 @@ vicoop-client auth login
 These talk to the bridge's `/admin-api/*` routes — same logic the admin
 agent's tools run, but without an LLM round-trip per call.
 
+To manage which host operations an agent can propose, use `agent operations`. See the [operation registration example](./operation-approvals.md#register-a-host-operation).
+
 To authorize a Mentionable Connector for one exact platform subject, follow
 [`manage-federated-callers.md`](./manage-federated-callers.md). It covers the
 structured `agent callers add-federated` command, public/restricted policy
