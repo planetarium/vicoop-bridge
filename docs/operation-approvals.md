@@ -41,12 +41,6 @@ curl --fail-with-body -X PUT \
 
 Fields are required; extra fields are rejected. Supported values are strings, safe integers and booleans. Use the optional `allowedValues` to pin target identifiers. The host adapter also enforces service-specific constraints and uses upstream preconditions. The model supplies only arguments and a registered operation name. It has no channel to specify a command, executable path, approver, destination URL, executor, credentials, or TTL.
 
-### Migrating an existing bridge
-
-Drain and stop replicas running the old registry before the upgrade. Supply the existing `VICOOP_OPERATIONS` array on the first startup with the new schema. The bridge imports it once, transactionally, and records completion in PostgreSQL. Each current entry keeps its existing policy digest. Entries for past ownership revisions are retained for executor reconciliation. Resolve missing agents or future ownership bindings in the legacy registry before retrying a failed migration.
-
-After startup, verify the active definitions using each owner's list endpoint and remove the environment variable. Subsequent startups ignore its value; retiring an operation through the API is durable even if a replica still has the old environment. A fresh installation starts with an empty registry. During upgrade, an existing live ledger with a missing legacy configuration stops startup to avoid accidentally dropping access; set `[]` only if the legacy registry really was empty.
-
 ## v1
 
 The optional A2A extension URI is `https://github.com/planetarium/vicoop-bridge/blob/main/docs/operation-approvals.md#v1`. Discover it in `capabilities.extensions` on either Agent Card version. The bridge advertises it when a supported caller runtime and its current ownership-bound server policy share an operation for an available authentication scheme. Its `params.registrationUrl` identifies the registration endpoint. Resolve a relative URL against the card origin and verify the trusted bridge origin before sending credentials.
@@ -87,3 +81,9 @@ The one-shot Node worker in [examples/operation-executor](../examples/operation-
 The worker authenticates `POST /operation-executors/:agent/:operation/claim`. An atomic SQL claim returns `{operation:null}` or a stored job exactly once. The handler receives that job as JSON on stdin and runs without a shell. It must return only a user-safe `{state,result}` on stdout, with a state of `succeeded`, `failed` or `unknown`. Keep internal artifacts and credentials out of the result; it will be shown to the requester. A timeout, malformed handler response, or uncertain upstream write leads to reconciliation. The host reports the result to `POST /operation-executors/:agent/:operation/:id/result`.
 
 If a host dies after claim, or loses a response, inspect `GET /operation-executors/:agent/:operation/unresolved` with its credential for executing/unknown IDs. Check the actual provider before recording a result. Re-reporting the same final state and result is idempotent. An unknown outcome can be settled by ID. The bridge never reassigns consumed work.
+
+## Migrating an existing bridge
+
+Drain and stop replicas running the old registry before the upgrade. Supply the existing `VICOOP_OPERATIONS` array on the first startup with the new schema. The bridge imports it once, transactionally, and records completion in PostgreSQL. Each current entry keeps its existing policy digest. Entries for past ownership revisions are retained for executor reconciliation. Resolve missing agents or future ownership bindings in the legacy registry before retrying a failed migration.
+
+After startup, verify the active definitions using each owner's list endpoint and remove the environment variable. Subsequent startups ignore its value; retiring an operation through the API is durable even if a replica still has the old environment. A fresh installation starts with an empty registry. During upgrade, an existing live ledger with a missing legacy configuration stops startup to avoid accidentally dropping access; set `[]` only if the legacy registry really was empty.
