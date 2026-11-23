@@ -5,6 +5,12 @@ import { getDocPageSync, parse } from '@optique/core/parser';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createServer } from 'node:http';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
+import { saveOwnerSession } from './owner-session.js';
 import {
   runAddCaller,
   runAgentCallersIssue,
@@ -117,6 +123,7 @@ interface Captured {
   url: string;
   method: string;
   headers: Record<string, string>;
+  redirect?: RequestInit['redirect'];
   body: string | null;
 }
 
@@ -149,6 +156,7 @@ function installFetch(t: { after: (fn: () => void) => void }, response: {
       url,
       method: init?.method ?? 'GET',
       headers,
+      redirect: init?.redirect,
       body: typeof init?.body === 'string' ? init.body : null,
     });
     const status = response.status ?? 200;
@@ -1242,17 +1250,24 @@ test('agent operations list uses the owner session and the agent-scoped registry
   const stdout = captureStdout(t);
   assert.equal(await runAgentOperations(parseOperations('list', 'agent one')), 0);
   assert.equal(calls[0].url, BRIDGE + '/admin-api/agents/agent%20one/operations');
+  assert.equal(calls[0].redirect, 'manual');
   assert.equal(calls[0].headers.authorization, 'Bearer ' + TOKEN);
   assert.match(stdout.read(), /merge-pr\s+1\s+pt4/);
 });
 
 test('agent operations get exports an editable definition that apply sends unchanged', async t => {
   withEnv(t, { VICOOP_OWNER_TOKEN: TOKEN, VICOOP_BRIDGE: BRIDGE });
-  const { calls } = installFetch(t, { body: mergeRecord });
+  const newerPolicy = {
+    ...mergeInput,
+    queuePolicy: 'serialized',
+    fields: { pull: { ...mergeInput.fields.pull, minimum: 1 } },
+    operators: [{ ...mergeInput.operators[0], requiresConfirmation: true }],
+  };
+  const { calls } = installFetch(t, { body: { ...mergeRecord, ...newerPolicy } });
   const stdout = captureStdout(t);
   assert.equal(await runAgentOperations(parseOperations('get', 'agent one', 'merge-pr')), 0);
   const exported = stdout.read();
-  assert.deepEqual(JSON.parse(exported), mergeInput);
+  assert.deepEqual(JSON.parse(exported), newerPolicy);
   const dir = mkdtempSync(join(tmpdir(), 'operation-cli-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const file = join(dir, 'merge.json');
@@ -1260,7 +1275,7 @@ test('agent operations get exports an editable definition that apply sends uncha
   assert.equal(await runAgentOperations(parseOperations('apply', 'agent one', 'merge-pr', '--file', file)), 0);
   const item = BRIDGE + '/admin-api/agents/agent%20one/operations/merge-pr';
   assert.deepEqual(calls.map(c => [c.method, c.url]), [['GET', item], ['PUT', item]]);
-  assert.deepEqual(JSON.parse(calls[1].body!), mergeInput);
+  assert.deepEqual(JSON.parse(calls[1].body!), newerPolicy);
 });
 
 test('agent operations get --json retains the server ownership binding', async t => {
@@ -1295,4 +1310,93 @@ test('agent operations preserves API errors and requires a file before applying'
   assert.equal(await runAgentOperations(parseOperations('apply', 'foo', 'merge', '--file', file)), 1);
   assert.match(stderr.read(), /invalid JSON/);
   assert.equal(calls.length, 1);
+});
+
+test('agent operations rejects unexpected registry status, body and identity', async t => {
+  const fileDir = mkdtempSync(join(tmpdir(), 'operation-cli-contract-'));
+  t.after(() => rmSync(fileDir, { recursive: true, force: true }));
+  const file = join(fileDir, 'definition.json');
+  writeFileSync(file, JSON.stringify(mergeInput));
+  for (const [command, status, body] of [
+    [['get', 'agent one', 'merge-pr', '--json'], 200, 'unexpected-response-content'],
+    [['get', 'agent one', 'merge-pr'], 200, { ...mergeRecord, fields: null }],
+    [['get', 'agent one', 'merge-pr'], 200, { ...mergeRecord, operation: 'other' }],
+    [['list', 'agent one'], 200, {}],
+    [['list', 'agent one', '--json'], 200, { operations: [{ ...mergeRecord, agentId: 'other' }] }],
+    [['apply', 'agent one', 'merge-pr', '--file', file], 302, {}],
+    [['apply', 'agent one', 'merge-pr', '--file', file], 200, '<html>unexpected-response-content</html>'],
+    [['remove', 'agent one', 'merge-pr'], 200, {}],
+    [['remove', 'agent one', 'merge-pr'], 404, 'unexpected-response-content'],
+  ] as const) {
+    await t.test(command[0] + ' ' + status, async sub => {
+      const stdout = captureStdout(sub);
+      const stderr = captureStderr(sub);
+      const { calls } = installFetch(sub, { status, body });
+      assert.equal(await runAgentOperations(parseOperations(...command, '--server', BRIDGE, '--token', TOKEN)), 1);
+      assert.equal(calls[0].redirect, 'manual');
+      assert.equal(stdout.read(), '');
+      assert.match(stderr.read(), new RegExp(String(status)));
+      assert.doesNotMatch(stderr.read(), /unexpected-response-content/);
+    });
+  }
+});
+
+test('agent operations refuses partial overrides even when an owner session is saved', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'operation-cli-session-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  withEnv(t, { VICOOP_HOME: dir, VICOOP_BRIDGE: undefined, VICOOP_OWNER_TOKEN: undefined });
+  saveOwnerSession({ bridge: BRIDGE, token: TOKEN, saved_at: new Date().toISOString(), expires_at: '2099-01-01T00:00:00Z' });
+  const { calls } = installFetch(t, { body: { operations: [] } });
+  captureStderr(t);
+  for (const env of [
+    { VICOOP_BRIDGE: 'http://localhost:9999', VICOOP_OWNER_TOKEN: undefined },
+    { VICOOP_BRIDGE: undefined, VICOOP_OWNER_TOKEN: 'other' },
+    { VICOOP_BRIDGE: '', VICOOP_OWNER_TOKEN: '' },
+  ]) {
+    await t.test('partial env pair', async sub => {
+      withEnv(sub, env);
+      assert.equal(await runAgentOperations(parseOperations('remove', 'agent', 'merge-pr')), 1);
+    });
+  }
+  assert.equal(calls.length, 0);
+  withEnv(t, { VICOOP_BRIDGE: 'http://localhost:9999', VICOOP_OWNER_TOKEN: undefined });
+  assert.equal(await runAgentOperations(parseOperations('list', 'agent', '--server', BRIDGE, '--token', TOKEN)), 0);
+  assert.equal(calls[0].url, BRIDGE + '/admin-api/agents/agent/operations');
+});
+
+test('agent operations list escapes multiline versions for table output', async t => {
+  const stdout = captureStdout(t);
+  installFetch(t, { body: { operations: [{ ...mergeRecord, version: 'one\nline\t' }] } });
+  assert.equal(await runAgentOperations(parseOperations('list', 'agent one', '--server', BRIDGE, '--token', TOKEN)), 0);
+  assert.match(stdout.read(), /one\\nline\\t/);
+});
+
+test('operations CLI drains large JSON lists to a slow pipe reader', { timeout: 30_000 }, async t => {
+  const field = { type: 'string', allowedValues: ['a'.repeat(2048), 'b'.repeat(2048)] };
+  const operations = Array.from({ length: 200 }, (_, n) => ({
+    ...mergeRecord, operation: 'op-' + n, fields: { repository: field },
+  }));
+  const server = createServer((_req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ operations }));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => server.close());
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const cli = fileURLToPath(new URL('./cli.ts', import.meta.url));
+  const child = spawn(process.execPath, ['--import', 'tsx', cli, 'agent', 'operations', 'list', 'agent one', '--json'], {
+    env: { ...process.env, VICOOP_BRIDGE: 'http://127.0.0.1:' + address.port, VICOOP_OWNER_TOKEN: TOKEN },
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  t.after(() => child.kill());
+  const closed = once(child, 'close');
+  const chunks: Buffer[] = [];
+  for await (const chunk of child.stdout) {
+    chunks.push(chunk as Buffer);
+    await delay(5);
+  }
+  assert.equal((await closed)[0], 0);
+  assert.deepEqual(JSON.parse(Buffer.concat(chunks).toString()), { operations });
 });

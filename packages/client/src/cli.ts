@@ -1001,8 +1001,8 @@ async function main(): Promise<void> {
       process.exit(await runAgentCallersIssue(parsed));
       break;
     case 'agent-operations':
-      process.exit(await runAgentOperations(parsed));
-      break;
+      process.exitCode = await runAgentOperations(parsed);
+      return;
     case 'agent-x402-show':
       process.exit(await runAgentX402Show(parsed));
       break;

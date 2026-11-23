@@ -15,6 +15,7 @@ import { message } from '@optique/core/message';
 import type { InferValue } from '@optique/core/parser';
 import { integer, string } from '@optique/core/valueparser';
 import { readFile } from 'node:fs/promises';
+import { z } from 'zod';
 import { resolveOwnerSession } from './owner-session.js';
 import { agentRegisterCmd } from './setup.js';
 
@@ -556,6 +557,7 @@ interface RequestArgs {
   method: 'GET' | 'POST' | 'PUT' | 'DELETE';
   path: string;
   body?: unknown;
+  redirect?: RequestInit['redirect'];
 }
 
 interface ApiResult {
@@ -563,18 +565,21 @@ interface ApiResult {
   body: unknown;
 }
 
-async function callApi({ session, method, path, body }: RequestArgs): Promise<ApiResult> {
+async function callApi({ session, method, path, body, redirect }: RequestArgs): Promise<ApiResult> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${session.token}`,
   };
   if (body !== undefined) headers['content-type'] = 'application/json';
   let res: Response;
+  let text: string;
   try {
     res = await fetch(`${session.bridge}${path}`, {
       method,
       headers,
+      redirect,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
+    text = await res.text();
   } catch (err) {
     // Surface DNS / ECONNREFUSED / TLS / aborted-connection failures through
     // the same emitError path the rest of the subcommands use, so the user
@@ -585,7 +590,6 @@ async function callApi({ session, method, path, body }: RequestArgs): Promise<Ap
       body: { error: `network error: ${(err as Error).message}` },
     };
   }
-  const text = await res.text();
   let parsed: unknown = text;
   if (text) {
     try {
@@ -959,48 +963,86 @@ export async function runAgentCallersRemoveFederated(
   return execFederatedCaller(args, 'DELETE');
 }
 
-function renderOperationList(body: unknown): string {
-  const { operations } = body as { operations: { operation: string; version: string; executorId: string }[] };
-  if (!operations.length) return '(no active operations)';
-  return renderTable(['OPERATION', 'VERSION', 'EXECUTOR'], operations.map(op => [op.operation, op.version, op.executorId]));
-}
+// Decode the owner API response before rendering it. Policy validation belongs
+// to the server; the CLI checks the wire shape and the requested resource.
+const registryDefinition = z.object({
+  agentId: z.string(), operation: z.string(), ownerPrincipal: z.string(), ownerRevision: z.number().int(),
+  version: z.string(), executorId: z.string(), executorTokenSha256: z.string(), ttlSeconds: z.number().int(),
+  operators: z.array(z.object({ principalId: z.string(), actorId: z.string().optional(), method: z.string().optional() })),
+  fields: z.record(z.object({
+    type: z.enum(['string', 'integer', 'boolean']),
+    allowedValues: z.array(z.union([z.string(), z.number(), z.boolean()])).optional(),
+  })),
+});
+const registryList = z.object({ operations: z.array(registryDefinition) });
 
-function renderEditableDefinition(body: unknown): string {
-  // These four fields are bound by the bridge and its PUT endpoint rejects them.
-  const { agentId, operation, ownerPrincipal, ownerRevision, ...input } = body as Record<string, unknown>;
-  return JSON.stringify(input, null, 2);
+function renderOperationList(operations: z.infer<typeof registryDefinition>[]): string {
+  if (!operations.length) return '(no active operations)';
+  const rows = operations.map(op => [op.operation, op.version, op.executorId].map(value =>
+    JSON.stringify(value).slice(1, -1)));
+  return renderTable(['OPERATION', 'VERSION', 'EXECUTOR'], rows);
 }
 
 export async function runAgentOperations(args: InferValue<typeof agentOperationsCmd>): Promise<number> {
+  const explicit = args.server !== undefined || args.token !== undefined;
+  const { VICOOP_BRIDGE: bridge, VICOOP_OWNER_TOKEN: token } = process.env;
+  if (explicit && (!args.server?.trim() || !args.token?.trim())) {
+    process.stderr.write('Pass a nonempty --server and --token together.\n');
+    return 1;
+  }
+  if (!explicit && (bridge !== undefined || token !== undefined) && (!bridge?.trim() || !token?.trim())) {
+    process.stderr.write('Set VICOOP_BRIDGE and VICOOP_OWNER_TOKEN together, or unset both to use the saved session.\n');
+    return 1;
+  }
   const session = resolveSession(args);
   if ('error' in session) {
     process.stderr.write(`${session.error}\n`);
     return 1;
   }
   const base = `/admin-api/agents/${encodeURIComponent(args.agentId)}/operations`;
-  if (args.verb === 'list') {
-    return emit(await callApi({ session, method: 'GET', path: base }), args.json, renderOperationList);
-  }
-  const path = `${base}/${encodeURIComponent(args.operation)}`;
-  if (args.verb === 'get') {
-    return emit(await callApi({ session, method: 'GET', path }), args.json, renderEditableDefinition);
-  }
-  if (args.verb === 'remove') {
-    const result = await callApi({ session, method: 'DELETE', path });
-    if (result.status === 204) result.body = null;
-    return emit(result, args.json, () => `Retired ${args.operation} for ${args.agentId}.`);
-  }
+  const path = args.verb === 'list' ? base : `${base}/${encodeURIComponent(args.operation)}`;
+  const methods = { list: 'GET', get: 'GET', apply: 'PUT', remove: 'DELETE' } as const;
   let body: unknown;
-  try {
-    body = await readJsonFile(args.file);
-  } catch (err) {
-    // A JSON parser error can include a fragment of the input file.
-    const detail = err instanceof SyntaxError ? 'invalid JSON' : (err as Error).message;
-    process.stderr.write(`Could not read operation definition: ${detail}\n`);
+  if (args.verb === 'apply') {
+    try {
+      body = await readJsonFile(args.file);
+    } catch (err) {
+      // A JSON parser error can include a fragment of the input file.
+      const detail = err instanceof SyntaxError ? 'invalid JSON' : (err as Error).message;
+      process.stderr.write(`Could not read operation definition: ${detail}\n`);
+      return 1;
+    }
+  }
+  const result = await callApi({ session, method: methods[args.verb], path, body, redirect: 'manual' });
+  if (result.status === 0 || result.status >= 400) {
+    const error = z.object({ error: z.string() }).safeParse(result.body);
+    emitError({ status: result.status, body: { error: error.success ? error.data.error : 'Operation registry request failed' } });
     return 1;
   }
-  const result = await callApi({ session, method: 'PUT', path, body });
-  return emit(result, args.json, () => `Applied ${args.operation} to ${args.agentId}.`);
+  if (args.verb === 'remove') {
+    if (result.status === 204) {
+      return emit({ status: 204, body: null }, args.json, () => `Retired ${args.operation} for ${args.agentId}.`);
+    }
+  } else if (args.verb === 'list') {
+    const list = registryList.safeParse(result.body);
+    if (result.status === 200 && list.success && list.data.operations.every(op => op.agentId === args.agentId)) {
+      return emit(result, args.json, () => renderOperationList(list.data.operations));
+    }
+  } else {
+    const record = registryDefinition.safeParse(result.body);
+    const ok = result.status === 200 || (args.verb === 'apply' && result.status === 201);
+    if (ok && record.success && record.data.agentId === args.agentId && record.data.operation === args.operation) {
+      return emit(result, args.json, () => {
+        if (args.verb === 'apply') return `Applied ${args.operation} to ${args.agentId}.`;
+        // Preserve fields added by newer bridges. PUT rejects only the four
+        // bridge-bound keys; taking Zod's parsed output would drop unknown keys.
+        const { agentId, operation, ownerPrincipal, ownerRevision, ...input } = result.body as Record<string, unknown>;
+        return JSON.stringify(input, null, 2);
+      });
+    }
+  }
+  process.stderr.write(`Unexpected operation registry response (HTTP ${result.status}).\n`);
+  return 1;
 }
 
 // ----- agent x402 (pricing) ---------------------------------------------------
