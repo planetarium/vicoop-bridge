@@ -4804,3 +4804,77 @@ test('a canceled start confirmed after the grace period interrupts only the orig
     assert.deepEqual(interrupted, [{ threadId: 'thread-0', turnId: 'canceled-turn' }]);
   } finally { await backend.close(); }
 });
+
+test('resumed same-caller thread filters the canceled turn and preserves early events from the new turn', { timeout: 8000 }, async () => {
+  const abort = new AbortController();
+  const ids = ['initial', 'canceled', 'resumed'];
+  const resumes: string[] = [];
+  const fake = makeFakeSpawn(() => ({
+    onLine(frame, child) {
+      const { method, id } = frame;
+      const threadId = 'shared-thread';
+      const publish = (turnId: string, message: string) => {
+        child.emitStdout({ method: 'item/agentMessage/delta', params: { threadId, turnId, delta: message.slice(0, 3) } });
+        child.emitStdout({ method: 'item/completed', params: { threadId, turnId, item: { type: 'agentMessage', text: message } } });
+        child.emitStdout({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'completed' } } });
+      };
+      if (method === 'initialize') child.emitStdout({ id, result: {} });
+      if (method === 'thread/resume') resumes.push((frame.params as { threadId: string }).threadId);
+      if (method === 'thread/start' || method === 'thread/resume') child.emitStdout({ id, result: { thread: { id: threadId } } });
+      if (method === 'turn/interrupt') child.emitStdout({ id, result: {} });
+      if (method !== 'turn/start') return;
+      const turnId = ids.shift()!;
+      if (turnId === 'resumed') {
+        publish('canceled', 'old reply');
+        publish('resumed', 'new reply');
+      }
+      child.emitStdout({ id, result: { turn: { id: turnId } } });
+      if (turnId === 'initial') setImmediate(() => publish(turnId, 'first reply'));
+      if (turnId === 'canceled') setImmediate(() => abort.abort());
+    },
+  }));
+  const backend = createCodexBackend({ spawn: fake.spawn, hostOperations: ['merge-pr'] });
+  const run = async (text: string, signal = NEVER) => {
+    const { frames, emit } = collect();
+    await backend.handle(assign(text, 'context', { caller: { principal: { id: 'google:member' } } }), emit, signal);
+    return frames;
+  };
+  try {
+    await run('initial');
+    const canceled = await run('cancel me', abort.signal);
+    assert.ok(canceled.some(f => f.type === 'task.complete' && f.status?.state === 'canceled'));
+    const resumed = await run('resume');
+    assert.deepEqual(resumes, ['shared-thread', 'shared-thread']);
+    assert.equal(resumed.filter(f => f.type === 'task.artifact').map(artifactText).join(''), 'new reply');
+    assert.ok(resumed.some(f => f.type === 'task.complete' && f.status?.state === 'completed'));
+  } finally { await backend.close(); }
+});
+
+test('excess early Codex notifications fail the task and interrupt the confirmed turn', async () => {
+  const interrupts: unknown[] = [];
+  const fake = makeFakeSpawn(() => ({
+    onLine(frame, child) {
+      const { method, id } = frame;
+      if (method === 'initialize') child.emitStdout({ id, result: {} });
+      if (method === 'thread/start') child.emitStdout({ id, result: { thread: { id: 'thread' } } });
+      if (method === 'turn/start') {
+        for (let i = 0; i < 513; i++) {
+          child.emitStdout({ method: 'item/agentMessage/delta', params: { threadId: 'thread', turnId: 'turn', delta: 'hello' } });
+        }
+        child.emitStdout({ id, result: { turn: { id: 'turn' } } });
+      }
+      if (method === 'turn/interrupt') {
+        interrupts.push(frame.params);
+        child.emitStdout({ id, result: {} });
+      }
+    },
+  }));
+  const backend = createCodexBackend({ spawn: fake.spawn });
+  const { emit, frames } = collect();
+  try {
+    await backend.handle(assign('hello'), emit, NEVER);
+    assert.ok(frames.some(f => f.type === 'task.fail'));
+    assert.ok(frames.every(f => f.type !== 'task.artifact'));
+    assert.deepEqual(interrupts, [{ threadId: 'thread', turnId: 'turn' }]);
+  } finally { await backend.close(); }
+});

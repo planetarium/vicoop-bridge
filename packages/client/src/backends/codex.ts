@@ -1001,7 +1001,7 @@ export function createCodexFileToolHandler(
     requests++;
     try {
       let turnId = currentTurn();
-      if (call.tool === 'propose_operation' && !turnId) {
+      if (!turnId) {
         // Server requests and the turn/start reply can arrive in either order.
         // Bound both outstanding requests (above) and a peer that never replies.
         turnId = waitForTurn ? await withTimeout(waitForTurn(), 5_000, 'Turn confirmation timed out') : null;
@@ -1871,10 +1871,6 @@ export function createCodexBackend(
                 });
               }
             }
-            if (approvalDecision === 'remote') {
-              approvalThreadId = threadId;
-              approvalHandlers.set(threadId, { request: requestApproval, signal: AbortSignal.any([signal, turnLifetime.signal]) });
-            }
             // Append prior conversation (if any) as native Responses API
             // items so codex's session builder includes them in the model
             // prompt as proper user/assistant turns + function-call
@@ -1925,11 +1921,33 @@ export function createCodexBackend(
 
           // Subscribe to notifications scoped to our turn. The turnId is
           // not known until `turn/start` returns; we capture it then
-          // filter incoming notifications by it. Prior to capture we
-          // ignore turn-level events (no turn of ours is yet on the wire).
+          // replay only its buffered notifications, in their original order.
           let activeTurnId: string | null = null;
-          let proposalTurnOpen = false;
+          let turnOpen = false;
           let currentTurnReady = Promise.resolve<string | null>(null);
+          let waitingRequests = 0;
+          const matchesTurn = async (turnId: unknown): Promise<boolean> => {
+            if (!turnOpen || signal.aborted || typeof turnId !== 'string') return false;
+            if (activeTurnId) return turnId === activeTurnId;
+            if (waitingRequests >= MAX_PENDING_FILE_REQUESTS) return false;
+            waitingRequests++;
+            try {
+              const confirmed = await withTimeout(currentTurnReady, 5_000, 'Turn confirmation timed out');
+              return turnOpen && !signal.aborted && confirmed === turnId && activeTurnId === confirmed;
+            } catch {
+              return false;
+            } finally {
+              waitingRequests--;
+            }
+          };
+          if (approvalDecision === 'remote') {
+            approvalThreadId = threadId;
+            approvalHandlers.set(threadId, {
+              request: async (toolName, input, approvalSignal) =>
+                await matchesTurn(input.turnId) ? requestApproval(toolName, input, approvalSignal) : 'deny',
+              signal: AbortSignal.any([signal, turnLifetime.signal]),
+            });
+          }
           let finalText: string | null = null;
           // Explicit widening type — without this TS infers a too-narrow type
           // through the `if (parsed) finalUsage = parsed;` assignment when
@@ -2018,10 +2036,11 @@ export function createCodexBackend(
             const send = hostProposal ? async (input: unknown) => hostProposal.propose(input) : fileDelivery!.bind();
             const executionSignal = AbortSignal.any([signal, turnLifetime.signal]);
             registeredThreadId = threadId;
-            toolCallHandlers.set(threadId, createCodexFileToolHandler(send, executionSignal, () => proposalTurnOpen ? activeTurnId : null, hostTools?.map(tool => tool.name), () => currentTurnReady));
+            toolCallHandlers.set(threadId, createCodexFileToolHandler(send, executionSignal, () => turnOpen ? activeTurnId : null, hostTools?.map(tool => tool.name), () => currentTurnReady));
           } else if (envelope) {
             registeredThreadId = threadId;
             toolCallHandlers.set(threadId, async (p) => {
+              if (!await matchesTurn(p.turnId)) return { success: false, contentItems: [] };
               capturedToolCall = true;
               // OpenAI Chat Completions requires `arguments` as a JSON-encoded
               // string; codex hands us a parsed JSON value, so we stringify
@@ -2138,7 +2157,7 @@ export function createCodexBackend(
             // The previous turn's id would filter out this turn's
             // notifications until `turn/start` answers.
             activeTurnId = null;
-            proposalTurnOpen = true;
+            turnOpen = true;
             let confirmTurn!: (id: string | null) => void;
             currentTurnReady = new Promise(resolveId => { confirmTurn = resolveId; });
             finalText = null;
@@ -2148,13 +2167,16 @@ export function createCodexBackend(
             turnHostToolItems = 0;
             turnHostToolFailures = 0;
             turnHostToolKinds.clear();
+            const earlyEvents: Array<{ turnId: string; method: string; params: unknown }> = [];
+            let earlyBytes = 0;
             let settled = false;
             const finish = (o: TurnRunOutcome): void => {
               if (settled) return;
               settled = true;
-              proposalTurnOpen = false;
+              turnOpen = false;
               confirmTurn(null);
               currentTurnReady = Promise.resolve(null);
+              earlyEvents.length = 0;
               cleanupNotifications();
               // Disarm a pending deferred interrupt — the turn already
               // reached a terminal state, so firing it later would only
@@ -2168,16 +2190,8 @@ export function createCodexBackend(
               resolve(o);
             };
 
-            const cleanupNotifications = client.onNotification((method, params) => {
-              // Notifications are per app-server client, and tasks on other
-              // contexts share it. The `turnId` checks below only work once
-              // `turn/start` has answered; until then another thread's usage,
-              // items, text or even `turn/completed` would be taken for ours.
-              // Every turn-scoped notification carries `threadId`, so drop the
-              // foreign ones here. A notification without one falls through to
-              // the `turnId` checks as before.
-              const notifiedThreadId = (params as { threadId?: unknown } | undefined)?.threadId;
-              if (typeof notifiedThreadId === 'string' && notifiedThreadId !== threadId) return;
+            const applyNotification = (method: string, params: unknown): void => {
+              if (settled || (signal.aborted && method !== 'turn/completed')) return;
               if (method === 'thread/tokenUsage/updated') {
                 const p = params as
                   | {
@@ -2186,7 +2200,6 @@ export function createCodexBackend(
                       tokenUsage?: unknown;
                     }
                   | undefined;
-                if (activeTurnId && p?.turnId !== activeTurnId) return;
                 // Not this turn's accounting but a repeat of the previous
                 // turn's: not usage, not a model round, and not the signal the
                 // deferred tool-call interrupt is waiting for.
@@ -2209,7 +2222,6 @@ export function createCodexBackend(
               }
               if (method === 'item/completed') {
                 const p = params as { item?: ThreadItem; turnId?: string } | undefined;
-                if (activeTurnId && p?.turnId !== activeTurnId) return;
                 const item = p?.item;
                 if (!item) return;
                 if (item.type === 'agentMessage' && typeof item.text === 'string') {
@@ -2237,8 +2249,6 @@ export function createCodexBackend(
                 return;
               }
               if (method === 'item/agentMessage/delta') {
-                const p = params as { turnId?: string } | undefined;
-                if (activeTurnId && p?.turnId !== activeTurnId) return;
                 recorder.mark('firstDelta');
                 const delta = extractAgentMessageDelta(params);
                 if (delta) {
@@ -2258,7 +2268,6 @@ export function createCodexBackend(
                     }
                   | undefined;
                 const t = p?.turn;
-                if (activeTurnId && t?.id !== activeTurnId) return;
                 if (t?.status === 'completed') {
                   finish({ status: 'completed', finalText });
                 } else if (t?.status === 'interrupted') {
@@ -2271,10 +2280,28 @@ export function createCodexBackend(
                   });
                 }
               }
+            };
+            const cleanupNotifications = client.onNotification((method, params) => {
+              if (!['item/completed', 'item/agentMessage/delta', 'turn/completed', 'thread/tokenUsage/updated'].includes(method)) return;
+              const event = params as { threadId?: string; turnId?: string; turn?: { id?: string } } | undefined;
+              if (event?.threadId !== undefined && event.threadId !== threadId) return;
+              const turnId = method === 'turn/completed' ? event?.turn?.id : event?.turnId;
+              if (typeof turnId !== 'string') return;
+              if (activeTurnId) {
+                if (activeTurnId === turnId) applyNotification(method, params);
+                return;
+              }
+              if (signal.aborted && method !== 'turn/completed') return;
+              earlyBytes += Buffer.byteLength(JSON.stringify(params));
+              if (earlyEvents.length >= 512 || earlyBytes > 2 * 1024 * 1024) {
+                finish({ status: 'failed', finalText, error: { message: 'Too many Codex notifications before turn confirmation' } });
+                return;
+              }
+              earlyEvents.push({ turnId, method, params });
             });
 
             const onAbort = (): void => {
-              proposalTurnOpen = false;
+              turnOpen = false;
               confirmTurn(null);
               // Best-effort `turn/interrupt`; the resolution will land on
               // turn/completed status:'interrupted'. If the rpc client is
@@ -2358,16 +2385,19 @@ export function createCodexBackend(
               })
               .then(
                 (res) => {
-                  if (signal.aborted) {
-                    // This RPC response identifies the canceled start even if the
-                    // cancellation grace elapsed and another task now owns the context.
+                  // Even after cancellation, timeout, or buffer overflow, stop
+                  // exactly the native turn created by this start request.
+                  if (settled || signal.aborted) {
                     void client.request('turn/interrupt', { threadId, turnId: res.turn.id }).catch(() => {});
-                    return;
+                    if (settled) return;
                   }
-                  if (settled) return;
                   activeTurnId = res.turn.id;
-                  confirmTurn(activeTurnId);
+                  confirmTurn(signal.aborted ? null : activeTurnId);
                   recorder.mark('turnStarted');
+                  for (const event of earlyEvents) {
+                    if (event.turnId === activeTurnId) applyNotification(event.method, event.params);
+                  }
+                  earlyEvents.length = 0;
                 },
                 (err) => {
                   finish({
