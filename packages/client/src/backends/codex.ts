@@ -19,7 +19,7 @@ import {
 import { HEARTBEAT_INTERVAL_MS, startLivenessHeartbeat } from './heartbeat.js';
 import { normalizeTaskFailError } from '../failure-code.js';
 import { buildSelfIdentitySystemPrompt, type AgentIdentity } from '../identity.js';
-import { createLogger, safeToken, type Logger } from '../logger.js';
+import { createLogger, diagnosticTaskId, safeToken, type Logger } from '../logger.js';
 import {
   callerToolDispatchActive,
   chatHistoryFromMessages,
@@ -2103,6 +2103,7 @@ export function createCodexBackend(
             turnHostToolItems = 0;
             turnHostToolFailures = 0;
             turnHostToolKinds.clear();
+            let lastStage = 'turn_start_requested';
             let settled = false;
             const finish = (o: TurnRunOutcome): void => {
               if (settled) return;
@@ -2153,10 +2154,18 @@ export function createCodexBackend(
                   );
                 }
                 if (parsed) finalUsage = parsed;
+                lastStage = 'usage_updated';
                 turnModelRounds += 1;
                 // Usage is in — release any interrupt held back by the
                 // tool-call handler (#351).
                 if (parsed && interruptRequested) sendDeferredInterrupt();
+                return;
+              }
+              if (method === 'item/started') {
+                const p = params as { item?: ThreadItem; turnId?: string } | undefined;
+                if (!p?.item || (activeTurnId && p.turnId !== activeTurnId)) return;
+                lastStage = p.item.type === 'imageView' || p.item.type === 'imageGeneration'
+                  ? 'image_item_started' : 'item_started';
                 return;
               }
               if (method === 'item/completed') {
@@ -2164,6 +2173,8 @@ export function createCodexBackend(
                 if (activeTurnId && p?.turnId !== activeTurnId) return;
                 const item = p?.item;
                 if (!item) return;
+                lastStage = item.type === 'imageView' || item.type === 'imageGeneration'
+                  ? 'image_item_completed' : 'item_completed';
                 if (item.type === 'agentMessage' && typeof item.text === 'string') {
                   recorder.mark('firstFinal');
                   finalText = item.text;
@@ -2191,6 +2202,7 @@ export function createCodexBackend(
               if (method === 'item/agentMessage/delta') {
                 const p = params as { turnId?: string } | undefined;
                 if (activeTurnId && p?.turnId !== activeTurnId) return;
+                lastStage = 'agent_message_delta';
                 recorder.mark('firstDelta');
                 const delta = extractAgentMessageDelta(params);
                 if (delta) {
@@ -2287,6 +2299,9 @@ export function createCodexBackend(
             // notification-driven. Race the close future against the rest.
             void client.waitForClose().then(() => {
               if (!settled) {
+                logger.warn('[codex] transport closed during turn', JSON.stringify({
+                  taskId: diagnosticTaskId(task.taskId), lastStage, ...client.terminationDiagnostic(),
+                }));
                 finish({
                   status: 'failed',
                   error: { message: 'codex app-server transport closed during turn' },
@@ -2304,10 +2319,13 @@ export function createCodexBackend(
               })
               .then(
                 (res) => {
+                  if (lastStage === 'turn_start_requested') lastStage = 'turn_started';
                   activeTurnId = res.turn.id;
                   recorder.mark('turnStarted');
                 },
                 (err) => {
+                  // On transport end the close waiter owns the sanitized terminal.
+                  if (client.isClosed()) return;
                   finish({
                     status: 'failed',
                     error: { message: `turn/start failed: ${errorMessage(err)}` },

@@ -116,7 +116,7 @@ export class ToolApprovals {
         // A dead backend must not leave a Task waiting indefinitely.
         const b = this.registry.getBinding(a.taskId);
         if (b) {
-          this.registry.sendToAgent(a.agentId, { type: 'task.cancel', taskId: a.taskId, executionId: a.executionId });
+          this.registry.sendToAgent(a.agentId, { type: 'task.cancel', trigger: 'approval_deadline', taskId: a.taskId, executionId: a.executionId });
           this.registry.failTaskBinding(b, 'approval_expired', 'Remote tool approval expired');
         }
         return;
@@ -131,6 +131,7 @@ export class ToolApprovals {
   private audit(a: ToolApproval, event: string): void {
     const origin = this.origins.get(a.requestId);
     logEvent(`tool_approval_${event}`, { agentId: a.agentId, taskId: a.taskId, executionId: a.executionId,
+      ...(event === 'expired' ? { approvalDeadlineEpochMs: Date.parse(a.expiresAt) } : {}),
       requestId: a.requestId, toolName: a.toolName, decision: a.decision, decidedBy: a.decidedBy,
       decidedVia: a.decidedVia, originPrincipal: origin?.principalId, originActor: origin?.actorId,
       originProfile: origin?.authorizationProfile });

@@ -1,3 +1,4 @@
+import { AppServerRpcClient } from './backends/codex-rpc.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -100,3 +101,32 @@ for (const kind of ['claude', 'codex'] as const) {
     await backend.close();
   });
 }
+
+test('Codex diagnostics distinguish Docker exec from relay-reported process termination', async () => {
+  for (const report of [
+    { frames: [{ t: 'exit', code: null, signal: 'SIGSEGV' }], signal: 'SIGSEGV', error: 'unknown' },
+    { frames: [{ t: 'error', code: 'ENOENT' }], signal: 'unknown', error: 'ENOENT' },
+    { frames: [{ t: 'error', code: '/private/spawn' }, { t: 'exit', signal: '/private/signal' }], signal: 'unknown', error: 'unknown' },
+    { frames: [], signal: 'unknown', error: 'unknown' },
+  ]) {
+    const relay = Object.assign(new EventEmitter(), {
+      stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+    });
+    const broker = createExecutionBrokerSpawn('fixture', {
+      backend: 'codex', spawnImpl: (() => relay) as unknown as typeof spawn,
+      createBroker: () => ({ token: 'private-token', revoke() {}, attach() {} }) as any,
+    });
+    const client = new AppServerRpcClient({ spawn: broker.spawn });
+    client.start();
+    const closed = client.waitForClose();
+    for (const frame of report.frames) relay.stdout.write(JSON.stringify(frame) + '\n');
+    relay.emit('close', 0, null);
+    await closed;
+    assert.deepEqual(client.terminationDiagnostic(), {
+      dockerExecCode: 0, dockerExecSignal: 'unknown', dockerExecError: 'unknown',
+      relayReportedAppCode: 'unknown', relayReportedAppSignal: report.signal,
+      relayReportedAppError: report.error,
+    });
+    broker.close();
+  }
+});

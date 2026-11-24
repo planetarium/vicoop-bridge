@@ -209,3 +209,11 @@ test('caller context fails closed on unknown or oversized fields', () => {
     }),
   );
 });
+
+test('a missing or unrecognized cancel trigger preserves the cancellation', () => {
+  for (const extra of [{}, { trigger: 'future_reason' }]) {
+    const frame = parseDownFrame(JSON.stringify({ type: 'task.cancel', taskId: 'task', ...extra }));
+    assert.ok(frame.type === 'task.cancel');
+    assert.equal(frame.trigger, undefined);
+  }
+});

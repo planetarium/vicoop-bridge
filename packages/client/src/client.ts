@@ -1,3 +1,4 @@
+import { cancelRuntime } from './runtime-cancellation.js';
 import { randomUUID } from 'node:crypto';
 import { OUTBOUND_CAPABILITY, type OutboundRequest, type OutboundHeaders } from '@vicoop-bridge/protocol';
 import { RemoteApprovalBroker } from './remote-approval.js';
@@ -233,7 +234,7 @@ export class Client {
     // running to completion after the WS is gone.
     for (const run of this.inflight.values()) {
       run.suppressed = true;
-      run.controller.abort();
+      cancelRuntime(run.controller, 'client_stop');
     }
     // Nothing will replay these — the process is going away.
     this.dropPendingFrames();
@@ -515,7 +516,7 @@ export class Client {
                 run.suppressed = true;
                 this.removePendingExecution(frame.executionId);
               }
-              run.controller.abort();
+              cancelRuntime(run.controller, frame.trigger ?? 'task_cancel_frame');
             }
           }
           break;
@@ -552,7 +553,7 @@ export class Client {
       for (const run of this.inflight.values()) {
         if (run.executionId !== undefined && this.pendingRetentionEnabled()) continue;
         run.suppressed = true;
-        run.controller.abort();
+        cancelRuntime(run.controller, 'bridge_disconnect');
       }
       // Terminal auth failures the daemon cannot recover from by waiting:
       //
@@ -586,7 +587,7 @@ export class Client {
         this.clearReconnectTimer();
         for (const run of this.inflight.values()) {
           run.suppressed = true;
-          run.controller.abort();
+          cancelRuntime(run.controller, 'bridge_disconnect');
         }
         // Nothing will ever replay these — this daemon is not reconnecting. The
         // host process may keep running (onFatal owns that decision), so
@@ -864,7 +865,7 @@ export class Client {
   private failReliableRun(run: ClientRun, why: string, disconnect: boolean): void {
     if (run.suppressed) return;
     run.suppressed = true;
-    run.controller.abort();
+    cancelRuntime(run.controller, 'delivery_failure');
     if (run.executionId !== undefined) this.removePendingExecution(run.executionId);
     this.logger.error(`${why}; suppressing the run so the bridge fails it closed`);
     if (disconnect && this.ws?.readyState === WebSocket.OPEN) this.ws.terminate();
@@ -1050,7 +1051,7 @@ export class Client {
     const previous = this.inflight.get(frame.taskId);
     if (previous) {
       previous.suppressed = true;
-      previous.controller.abort();
+      cancelRuntime(previous.controller, 'reassigned');
       if (previous.executionId !== undefined) this.removePendingExecution(previous.executionId);
     }
     const controller = new AbortController();

@@ -1,3 +1,4 @@
+import { exitCode, exitSignal, spawnErrorCategory, type BrokerTermination } from '../process-termination.js';
 import { spawn as nodeSpawn } from 'node:child_process';
 import type { Logger } from '../logger.js';
 
@@ -11,6 +12,7 @@ import type { Logger } from '../logger.js';
 export interface AppServerChildHandle {
   /** Host-owned execution grant, supplied only by the container broker. */
   readonly executionToken?: string;
+  readonly brokerTermination?: BrokerTermination;
   readonly stdin: NodeJS.WritableStream | null;
   readonly stdout: NodeJS.ReadableStream | null;
   readonly stderr: NodeJS.ReadableStream | null;
@@ -399,6 +401,23 @@ export class AppServerRpcClient {
     return new Promise((resolve) => {
       this.closeWaiters.add(resolve);
     });
+  }
+
+  terminationDiagnostic() {
+    const broker = this.child?.brokerTermination;
+    if (broker) return {
+      dockerExecCode: exitCode(broker.dockerExecCode),
+      dockerExecSignal: exitSignal(broker.dockerExecSignal),
+      dockerExecError: spawnErrorCategory({ code: broker.dockerExecError }),
+      relayReportedAppCode: exitCode(broker.relayReportedAppCode),
+      relayReportedAppSignal: exitSignal(broker.relayReportedAppSignal),
+      relayReportedAppError: spawnErrorCategory({ code: broker.relayReportedAppError }),
+    };
+    return {
+      appProcessCode: exitCode(this.closeReason?.code),
+      appProcessSignal: exitSignal(this.closeReason?.signal),
+      appProcessError: spawnErrorCategory(this.closeReason?.error),
+    };
   }
 
   // Send a JSON-RPC request and resolve with the `result` field. Rejects

@@ -359,7 +359,8 @@ test('periodic Docker storage-check failure is not reported as quota or caller c
 });
 
 
-test('task deadline also aborts worker initialization before any backend work', async () => {
+test('task deadline also aborts worker initialization before any backend work', async t => {
+  const log = t.mock.method(console, 'error', () => {});
   const f = fixture(undefined, { taskTimeoutMs: 20 });
   const backend = new CallerScopedBackend('agent', f.pool, async (_container, signal) => {
     await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
@@ -370,8 +371,23 @@ test('task deadline also aborts worker initialization before any backend work', 
   assert.match(JSON.stringify(frames), /runtime_canceled/);
   assert.equal(f.stops.length, 1);
   assert.equal(f.workers.length, 0);
+  const record = log.mock.calls.find(call => call.arguments[0] === 'Caller runtime cancellation:');
+  assert.ok(record);
+  const { elapsedMs, ...fields } = JSON.parse(record.arguments[1]);
+  assert.ok(Number.isInteger(elapsedMs) && elapsedMs >= 0);
+  assert.deepEqual(fields, { taskId: 'unknown', source: 'task_deadline',
+    phase: 'backend-initialization', runtimeDeadlineMs: 20 });
 });
 
+
+test('a task deadline during recovery preserves the initiating backend failure', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const log = t.mock.method(console, 'error', () => {});
+  const f = fixture(async () => { throw new Error('backend failed'); }, { taskTimeoutMs: 20 });
+  f.pool.stop = async () => { t.mock.timers.tick(21); };
+  assert.match(JSON.stringify(await f.run()), /runtime_failed/);
+  assert.ok(!log.mock.calls.some(call => call.arguments[0] === 'Caller runtime cancellation:'));
+});
 
 test('missing retained storage quarantines only its caller without starting a worker', async () => {
   const f = fixture();
