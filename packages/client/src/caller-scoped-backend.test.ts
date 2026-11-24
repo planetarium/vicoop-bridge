@@ -376,9 +376,18 @@ test('task deadline also aborts worker initialization before any backend work', 
   const { elapsedMs, ...fields } = JSON.parse(record.arguments[1]);
   assert.ok(Number.isInteger(elapsedMs) && elapsedMs >= 0);
   assert.deepEqual(fields, { taskId: 'unknown', source: 'task_deadline',
-    phase: 'backend-initialization', deadlineMs: 20 });
+    phase: 'backend-initialization', runtimeDeadlineMs: 20 });
 });
 
+
+test('a task deadline during recovery preserves the initiating backend failure', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const log = t.mock.method(console, 'error', () => {});
+  const f = fixture(async () => { throw new Error('backend failed'); }, { taskTimeoutMs: 20 });
+  f.pool.stop = async () => { t.mock.timers.tick(21); };
+  assert.match(JSON.stringify(await f.run()), /runtime_failed/);
+  assert.ok(!log.mock.calls.some(call => call.arguments[0] === 'Caller runtime cancellation:'));
+});
 
 test('missing retained storage quarantines only its caller without starting a worker', async () => {
   const f = fixture();

@@ -580,7 +580,7 @@ test('cancel delivers a CANCELED terminal event through the stream before aborti
   // ac.abort(); aborting first resolves iterate() with `done` and the terminal
   // event stays buffered-but-unyielded, closing the stream without ever
   // delivering a terminal frame to the client.
-  const { ws } = makeWsCapture();
+  const { ws, sent } = makeWsCapture();
   const registry = new Registry();
   registry.registerAgent({
     agentId: 'ac',
@@ -608,6 +608,8 @@ test('cancel delivers a CANCELED terminal event through the stream before aborti
   assert.ok(registry.getBinding('t-cancel'), 'binding must exist before cancel');
 
   await executor.cancel(task);
+  assert.ok(sent.map(parseDownFrame).some(frame =>
+    frame.type === 'task.cancel' && frame.trigger === 'explicit_request'));
 
   const r = await first;
   assert.equal(r.done, false, 'the CANCELED terminal must be yielded, not swallowed by abort');

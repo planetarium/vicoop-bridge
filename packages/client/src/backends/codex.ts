@@ -2161,6 +2161,13 @@ export function createCodexBackend(
                 if (parsed && interruptRequested) sendDeferredInterrupt();
                 return;
               }
+              if (method === 'item/started') {
+                const p = params as { item?: ThreadItem; turnId?: string } | undefined;
+                if (!p?.item || (activeTurnId && p.turnId !== activeTurnId)) return;
+                lastStage = p.item.type === 'imageView' || p.item.type === 'imageGeneration'
+                  ? 'image_item_started' : 'item_started';
+                return;
+              }
               if (method === 'item/completed') {
                 const p = params as { item?: ThreadItem; turnId?: string } | undefined;
                 if (activeTurnId && p?.turnId !== activeTurnId) return;

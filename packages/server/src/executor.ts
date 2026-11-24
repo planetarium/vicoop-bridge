@@ -841,7 +841,7 @@ export class WSForwardingExecutor extends AgentExecutor {
             // No output may cross the publication boundary after the payment
             // lifecycle has expired or failed. Stop native work as well.
             this.registry.sendToAgent(this.agentId, {
-              type: 'task.cancel', taskId,
+              type: 'task.cancel', trigger: 'payment_refused', taskId,
               ...(binding.executionId !== undefined ? { executionId: binding.executionId } : {}),
             });
             event = refusal;
@@ -961,7 +961,7 @@ export class WSForwardingExecutor extends AgentExecutor {
     // Notify the connected client so it can abort in-flight work and
     // emit its own task.fail / task.complete frame.
     this.registry.sendToAgent(this.agentId, {
-      type: 'task.cancel',
+      type: 'task.cancel', trigger: 'explicit_request',
       taskId,
       ...(binding?.executionId !== undefined ? { executionId: binding.executionId } : {}),
     });

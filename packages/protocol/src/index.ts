@@ -622,7 +622,13 @@ export const TaskAssignFrame = z.object({
   executionScope: ExecutionScopeV1.optional(),
 });
 
+const TaskCancelTrigger = z.enum([
+  'explicit_request', 'approval_deadline', 'payment_refused', 'invalid_approval',
+  'invalid_proposal', 'invalid_frame',
+]);
 export const TaskCancelFrame = z.object({
+  // Unknown future trigger labels must never prevent cancellation.
+  trigger: TaskCancelTrigger.optional().catch(undefined),
   type: z.literal('task.cancel'),
   taskId: z.string(),
   executionId: z.string().min(1).max(128).optional(),

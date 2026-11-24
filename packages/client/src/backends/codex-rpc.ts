@@ -404,7 +404,15 @@ export class AppServerRpcClient {
   }
 
   terminationDiagnostic() {
-    if (this.child?.brokerTermination) return { ...this.child.brokerTermination };
+    const broker = this.child?.brokerTermination;
+    if (broker) return {
+      dockerExecCode: exitCode(broker.dockerExecCode),
+      dockerExecSignal: exitSignal(broker.dockerExecSignal),
+      dockerExecError: spawnErrorCategory({ code: broker.dockerExecError }),
+      relayReportedAppCode: exitCode(broker.relayReportedAppCode),
+      relayReportedAppSignal: exitSignal(broker.relayReportedAppSignal),
+      relayReportedAppError: spawnErrorCategory({ code: broker.relayReportedAppError }),
+    };
     return {
       appProcessCode: exitCode(this.closeReason?.code),
       appProcessSignal: exitSignal(this.closeReason?.signal),

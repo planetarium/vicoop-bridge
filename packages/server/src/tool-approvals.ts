@@ -116,7 +116,7 @@ export class ToolApprovals {
         // A dead backend must not leave a Task waiting indefinitely.
         const b = this.registry.getBinding(a.taskId);
         if (b) {
-          this.registry.sendToAgent(a.agentId, { type: 'task.cancel', taskId: a.taskId, executionId: a.executionId });
+          this.registry.sendToAgent(a.agentId, { type: 'task.cancel', trigger: 'approval_deadline', taskId: a.taskId, executionId: a.executionId });
           this.registry.failTaskBinding(b, 'approval_expired', 'Remote tool approval expired');
         }
         return;

@@ -516,7 +516,7 @@ export class Client {
                 run.suppressed = true;
                 this.removePendingExecution(frame.executionId);
               }
-              cancelRuntime(run.controller, 'task_cancel_frame');
+              cancelRuntime(run.controller, frame.trigger ?? 'task_cancel_frame');
             }
           }
           break;

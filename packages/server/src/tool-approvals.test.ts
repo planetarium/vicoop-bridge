@@ -73,3 +73,11 @@ test('status metadata carries both owner and requester URLs; origin snapshot is 
   } finally { registry.unbindTask(b.taskId, b); }
   assert.equal(registry.approvals.origin(a.requestId), undefined);
 });
+
+test('approval expiry communicates its deadline as the cancellation trigger', t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  const { sent } = fixture();
+  t.mock.timers.tick(60_001);
+  assert.ok(sent.map(frame => JSON.parse(frame)).some(frame =>
+    frame.type === 'task.cancel' && frame.trigger === 'approval_deadline'));
+});

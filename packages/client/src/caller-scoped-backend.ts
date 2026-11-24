@@ -259,7 +259,7 @@ export class CallerScopedBackend implements Backend {
     let phase = 'queue';
     const deadlineMs = opts.taskTimeoutMs;
     const abort = () => cancelRuntime(controller, cancellationSource(signal));
-    observeCancellation(controller.signal, task.taskId, () => ({ phase, deadlineMs }));
+    const stopObserving = observeCancellation(controller.signal, task.taskId, () => ({ phase, deadlineMs }));
     signal.addEventListener('abort', abort, { once: true });
     if (signal.aborted) abort();
     const timer = setTimeout(() => cancelRuntime(controller, 'task_deadline'), deadlineMs);
@@ -387,6 +387,11 @@ export class CallerScopedBackend implements Backend {
       if (!terminal) throw new Error('backend missing terminal');
       emit(terminal);
     } catch (error) {
+      // Cleanup still needs cancellation, but a later abort cannot explain
+      // the failure that already brought this execution into recovery.
+      stopObserving();
+      const abortedAtFailure = controller.signal.aborted;
+      forwarding = false;
       clearInterval(monitor);
       if (resuming) {
         try {
@@ -402,7 +407,6 @@ export class CallerScopedBackend implements Backend {
         phase,
         JSON.stringify({ scope: id, ...callerFailureDiagnostic(error) }),
       );
-      forwarding = false;
       if (acquired) {
         entry.worker?.backend.stop?.();
         entry.worker?.close();
@@ -466,7 +470,7 @@ export class CallerScopedBackend implements Backend {
             ? 'runtime_storage_limit'
             : storageCheckFailed
               ? 'runtime_failed'
-              : controller.signal.aborted
+              : abortedAtFailure
                 ? 'runtime_canceled'
                 : 'runtime_failed',
         entry.quarantined
@@ -476,6 +480,7 @@ export class CallerScopedBackend implements Backend {
             : 'Queued caller request canceled or rejected; running work and existing conversations are unchanged.',
       );
     } finally {
+      stopObserving();
       forwarding = false;
       clearInterval(monitor);
       clearInterval(heartbeat);
@@ -517,7 +522,7 @@ export class CallerScopedBackend implements Backend {
     let phase = 'queue';
     let deadlineMs = opts.concurrency!.queueTimeoutMs;
     const abort = () => cancelRuntime(controller, cancellationSource(signal));
-    observeCancellation(controller.signal, task.taskId, () => ({ phase, deadlineMs }));
+    const stopObserving = observeCancellation(controller.signal, task.taskId, () => ({ phase, deadlineMs }));
     signal.addEventListener('abort', abort, { once: true });
     if (signal.aborted) abort();
     let timer = setTimeout(() => cancelRuntime(controller, 'queue_deadline'), deadlineMs);
@@ -577,6 +582,11 @@ export class CallerScopedBackend implements Backend {
       if (!terminal) throw new Error('backend missing terminal');
       emit(terminal);
     } catch (error) {
+      // Cleanup still needs cancellation, but a later abort cannot explain
+      // the failure that already brought this execution into recovery.
+      stopObserving();
+      const abortedAtFailure = controller.signal.aborted;
+      const source = cancellationSource(controller.signal);
       forwarding = false;
       console.error('Caller context runtime failure phase:', phase, JSON.stringify({ scope: id, context, ...callerFailureDiagnostic(error) }));
       // Only this context owns this worker/broker/container. A sibling's grant,
@@ -602,13 +612,14 @@ export class CallerScopedBackend implements Backend {
       this.fail(task, emit,
         quarantined ? 'runtime_quarantined' : (error instanceof CallerQueueFullError || error instanceof CallerContextCapacityError) ? 'runtime_capacity' :
           error instanceof CallerEnvironmentPendingError ? 'runtime_setup_pending' :
-          cancellationSource(controller.signal) === 'queue_deadline' ? 'runtime_queue_timeout' :
-          cancellationSource(controller.signal) === 'task_deadline' ? 'runtime_timeout' :
-          controller.signal.aborted ? 'runtime_canceled' : 'runtime_failed',
+          source === 'queue_deadline' ? 'runtime_queue_timeout' :
+          source === 'task_deadline' ? 'runtime_timeout' :
+          abortedAtFailure ? 'runtime_canceled' : 'runtime_failed',
         quarantined ? 'Runtime cleanup or storage is uncertain; offline recovery required' :
           phase === 'queue' ? 'Caller request left the queue; running executions are unchanged' :
             'Caller context execution ended; persistent context files, including partial writes, are retained');
     } finally {
+      stopObserving();
       forwarding = false;
       clearTimeout(timer);
       clearInterval(heartbeat);

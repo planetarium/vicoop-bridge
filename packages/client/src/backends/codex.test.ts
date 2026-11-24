@@ -826,47 +826,52 @@ test('app-server spawn failure surfaces disconnected', async () => {
   );
 });
 
-test('transport closing mid-turn emits task.fail', async () => {
-  const fake = makeFakeSpawn(() => ({
-    onLine(frame, child) {
-      const id = (frame as { id?: unknown }).id;
-      const method = (frame as { method?: string }).method;
-      if (method === 'initialize' && id !== undefined) {
-        child.emitStdout({ id, result: { userAgent: 'fake' } });
-        return;
-      }
-      if (method === 'thread/start' && id !== undefined) {
-        child.emitStdout({ id, result: { thread: { id: 'thr' } } });
-        return;
-      }
-      if (method === 'turn/start' && id !== undefined) {
-        child.emitStdout({ id, result: { turn: { id: 't', status: 'inProgress' } } });
-        setImmediate(() => {
-          for (let i = 0; i < 4; i++) child.emitStdout({
-            method: 'item/completed', params: { threadId: 'thr', turnId: 't',
-              item: { type: 'imageView', result: 'private-image-data', path: '/private/file' } },
+for (const lastStage of ['image_item_started', 'image_item_completed']) {
+  test(`transport closing after ${lastStage} emits a sanitized failure diagnostic`, async () => {
+    const fake = makeFakeSpawn(() => ({
+      onLine(frame, child) {
+        const id = (frame as { id?: unknown }).id;
+        const method = (frame as { method?: string }).method;
+        if (method === 'initialize' && id !== undefined) {
+          child.emitStdout({ id, result: { userAgent: 'fake' } });
+          return;
+        }
+        if (method === 'thread/start' && id !== undefined) {
+          child.emitStdout({ id, result: { thread: { id: 'thr' } } });
+          return;
+        }
+        if (method === 'turn/start' && id !== undefined) {
+          child.emitStdout({ id, result: { turn: { id: 't', status: 'inProgress' } } });
+          setImmediate(() => {
+            for (let i = 0; i < 4; i++) child.emitStdout({
+              method: 'item/completed', params: { threadId: 'thr', turnId: 't',
+                item: { type: 'imageView', result: 'private-image-data', path: '/private/file' } },
+            });
+            if (lastStage === 'image_item_started') child.emitStdout({
+              method: 'item/started', params: { threadId: 'thr', turnId: 't', item: { type: 'imageView' } },
+            });
+            child.finish(null, 'SIGKILL');
           });
-          child.finish(null, 'SIGKILL');
-        });
-      }
-    },
-  }));
-  const logs = captureLogs();
-  const backend = createCodexBackend({ spawn: fake.spawn, logger: logs.logger });
-  const { emit, frames } = collect();
-  await backend.handle(assign('crash me'), emit, NEVER);
-  const prefix = 'warn [codex] transport closed during turn ';
-  const line = logs.lines.find(line => line.startsWith(prefix));
-  assert.ok(line);
-  assert.deepEqual(JSON.parse(line.slice(prefix.length)), {
-    taskId: 'unknown', lastStage: 'image_item_completed', appProcessCode: 'unknown',
-    appProcessSignal: 'SIGKILL', appProcessError: 'unknown',
-  });
+        }
+      },
+    }));
+    const logs = captureLogs();
+    const backend = createCodexBackend({ spawn: fake.spawn, logger: logs.logger });
+    const { emit, frames } = collect();
+    await backend.handle(assign('crash me'), emit, NEVER);
+    const prefix = 'warn [codex] transport closed during turn ';
+    const line = logs.lines.find(line => line.startsWith(prefix));
+    assert.ok(line);
+    assert.deepEqual(JSON.parse(line.slice(prefix.length)), {
+      taskId: 'unknown', lastStage, appProcessCode: 'unknown',
+      appProcessSignal: 'SIGKILL', appProcessError: 'unknown',
+    });
 
-  const last = frames.at(-1);
-  assert.equal(last?.type, 'task.fail');
-  assert.equal(last?.type === 'task.fail' && last.error.code, 'disconnected');
-});
+    const last = frames.at(-1);
+    assert.equal(last?.type, 'task.fail');
+    assert.equal(last?.type === 'task.fail' && last.error.code, 'disconnected');
+  });
+}
 
 test('traceability extension surfaces commandExecution item as a trace artifact', async () => {
   const fake = makeFakeSpawn(() =>

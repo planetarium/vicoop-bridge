@@ -439,7 +439,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
             status: wireStatusToA2X(approvalStatus(a), b.taskId, b.contextId) });
           acknowledge(b);
         } catch {
-          opts.registry.sendToAgent(b.agentId, { type: 'task.cancel', taskId: b.taskId, executionId: b.executionId });
+          opts.registry.sendToAgent(b.agentId, { type: 'task.cancel', trigger: 'invalid_approval', taskId: b.taskId, executionId: b.executionId });
           opts.registry.failTaskBinding(b, 'invalid_approval_request', 'Invalid remote approval request');
         }
         break;
@@ -500,7 +500,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
               frame.append || !frame.lastChunk || frame.artifact.parts.length !== 1 ||
               part?.kind !== 'data' || part.data.type !== OPERATION_PROPOSAL_TYPE ||
               typeof part.data.operation !== 'string' || !grant.names.includes(part.data.operation)) {
-            opts.registry.sendToAgent(b.agentId, { type: 'task.cancel', taskId: b.taskId, executionId: b.executionId });
+            opts.registry.sendToAgent(b.agentId, { type: 'task.cancel', trigger: 'invalid_proposal', taskId: b.taskId, executionId: b.executionId });
             opts.registry.failTaskBinding(b, 'invalid_operation_proposal', 'Invalid operation proposal');
             return;
           }
@@ -684,7 +684,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           'client frame execution id is required for a replay-capable execution',
         );
         opts.registry.sendToAgent(binding.agentId, {
-          type: 'task.cancel',
+          type: 'task.cancel', trigger: 'invalid_frame',
           taskId: binding.taskId,
           executionId: binding.executionId,
         });
@@ -714,7 +714,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           'client frame sequence is required for a replay-capable execution',
         );
         opts.registry.sendToAgent(binding.agentId, {
-          type: 'task.cancel',
+          type: 'task.cancel', trigger: 'invalid_frame',
           taskId: binding.taskId,
           executionId: binding.executionId,
         });
@@ -744,7 +744,7 @@ function handleConnection(ws: WebSocket, _req: IncomingMessage, opts: ServerWsOp
           `client frame sequence gap: expected ${expected}, received ${frame.seq}`,
         );
         opts.registry.sendToAgent(binding.agentId, {
-          type: 'task.cancel',
+          type: 'task.cancel', trigger: 'invalid_frame',
           taskId: binding.taskId,
           executionId: binding.executionId,
         });
