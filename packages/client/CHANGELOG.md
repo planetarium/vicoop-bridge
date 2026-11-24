@@ -1,5 +1,11 @@
 # @vicoop-bridge/client
 
+## 0.54.1
+
+### Patch Changes
+
+- 87e6200: Report process-specific Codex transport termination details and record caller runtime cancellation sources, deadlines, and elapsed time.
+
 ## 0.54.0
 
 ### Minor Changes
