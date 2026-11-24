@@ -1,3 +1,4 @@
+import { exitCode, exitSignal, spawnErrorCategory, type BrokerTermination } from './process-termination.js';
 import { spawn as nodeSpawn } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
@@ -93,6 +94,10 @@ export function createExecutionBrokerSpawn(container: string | (() => string), o
     let ended = false;
     let terminating = false;
     let resultCode: number | undefined;
+    const termination: BrokerTermination = {
+      dockerExecCode: 'unknown', dockerExecSignal: 'unknown', dockerExecError: 'unknown',
+      relayReportedAppCode: 'unknown', relayReportedAppSignal: 'unknown', relayReportedAppError: 'unknown',
+    };
     let readyWrite: (() => void) | undefined;
     let readyEnd: (() => void) | undefined;
     const send = (frame: object) => {
@@ -143,8 +148,10 @@ export function createExecutionBrokerSpawn(container: string | (() => string), o
       },
     });
     relay.stdin?.on('error', fail);
-    relay.on('error', fail);
-    relay.on('close', (code) => {
+    relay.on('error', error => { termination.dockerExecError = spawnErrorCategory(error); fail(); });
+    relay.on('close', (code, signal) => {
+      termination.dockerExecCode = exitCode(code);
+      termination.dockerExecSignal = exitSignal(signal);
       // A successful supervisor exit proves descendant cleanup, irrespective
       // of the untrusted relay's claimed exit frame. Never finish on that frame.
       if (code === 0) { finish(resultCode ?? 1, null); return; }
@@ -176,8 +183,14 @@ export function createExecutionBrokerSpawn(container: string | (() => string), o
         try {
           const m = JSON.parse(line);
           if (m.t === 'ready') { ready = true; clearTimeout(startup); readyWrite?.(); readyWrite = undefined; readyEnd?.(); readyEnd = undefined; }
-          else if (m.t === 'exit') { fileController.abort(); resultCode ??= Number.isInteger(m.code) ? m.code : 1; return; }
-          else if (m.t === 'error') { fail(); return; }
+          else if (m.t === 'exit') {
+            fileController.abort();
+            termination.relayReportedAppCode = exitCode(m.code);
+            termination.relayReportedAppSignal = exitSignal(m.signal);
+            resultCode ??= Number.isInteger(m.code) ? m.code : 1;
+            return;
+          }
+          else if (m.t === 'error') { termination.relayReportedAppError = spawnErrorCategory(m); fail(); return; }
           else if (m.t === 'stdout' || m.t === 'stderr') {
             const stream = m.t === 'stdout' ? stdout : stderr;
             if (stream.readableLength > 8 * 1024 * 1024) { fail(); return; }
@@ -270,7 +283,7 @@ export function createExecutionBrokerSpawn(container: string | (() => string), o
         ...(deliverFile ? {fileDelivery:{token:fileToken,helper:CALLER_FILE_MCP,operations,filesEnabled:opts.fileDelivery!.filesEnabled,description:opts.fileDelivery!.description}} : {}), files:promptFiles.map((file,id)=>({id,argIndex:file.argIndex})) });
     })().catch(fail);
     return Object.assign(events, {
-      ...(opts.backend === 'codex' ? {executionToken: broker.token} : {}),
+      ...(opts.backend === 'codex' ? {executionToken: broker.token, brokerTermination: termination} : {}),
       stdin, stdout, stderr,
       kill(_signal: NodeJS.Signals = 'SIGTERM') {
         if (ended) return false;

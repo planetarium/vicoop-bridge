@@ -201,7 +201,7 @@ function receive(m) {
       child.stdout.on('data', data => send({t:'stdout', data:data.toString('base64')}));
       child.stderr.on('data', data => send({t:'stderr', data:data.toString('base64')}));
       child.stdin.on('error', () => {});
-      child.on('error', () => { send({t:'error'}); shutdown(1); });
+      child.on('error', err => { send({t:'error',code:err.code}); process.stdout.write('', () => shutdown(1)); });
       child.on('exit', () => killGroup('SIGKILL'));
       child.on('close', (code, signal) => {
         killGroup('SIGKILL');

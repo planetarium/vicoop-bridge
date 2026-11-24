@@ -841,14 +841,27 @@ test('transport closing mid-turn emits task.fail', async () => {
       }
       if (method === 'turn/start' && id !== undefined) {
         child.emitStdout({ id, result: { turn: { id: 't', status: 'inProgress' } } });
-        // Kill the child mid-turn.
-        queueMicrotask(() => child.finish(1));
+        setImmediate(() => {
+          for (let i = 0; i < 4; i++) child.emitStdout({
+            method: 'item/completed', params: { threadId: 'thr', turnId: 't',
+              item: { type: 'imageView', result: 'private-image-data', path: '/private/file' } },
+          });
+          child.finish(null, 'SIGKILL');
+        });
       }
     },
   }));
-  const backend = createCodexBackend({ spawn: fake.spawn });
+  const logs = captureLogs();
+  const backend = createCodexBackend({ spawn: fake.spawn, logger: logs.logger });
   const { emit, frames } = collect();
   await backend.handle(assign('crash me'), emit, NEVER);
+  const prefix = 'warn [codex] transport closed during turn ';
+  const line = logs.lines.find(line => line.startsWith(prefix));
+  assert.ok(line);
+  assert.deepEqual(JSON.parse(line.slice(prefix.length)), {
+    taskId: 'unknown', lastStage: 'image_item_completed', appProcessCode: 'unknown',
+    appProcessSignal: 'SIGKILL', appProcessError: 'unknown',
+  });
 
   const last = frames.at(-1);
   assert.equal(last?.type, 'task.fail');

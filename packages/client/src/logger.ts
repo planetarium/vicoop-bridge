@@ -169,3 +169,9 @@ export function createLogger(
     },
   };
 }
+
+// Task IDs from the bridge are UUIDs. Avoid copying arbitrary assignment data
+// into process and cancellation diagnostics.
+export function diagnosticTaskId(id: string): string {
+  return /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id) ? id : 'unknown';
+}

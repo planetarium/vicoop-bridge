@@ -1,3 +1,4 @@
+import { cancelRuntime, cancellationSource, observeCancellation } from './runtime-cancellation.js';
 import { callerFailureDiagnostic } from './caller-runtime-diagnostics.js';
 import { CallerExecutionScheduler, CallerQueueFullError } from './caller-execution-scheduler.js';
 import { CallerStorageHelperUnconfirmedError } from './caller-storage.js';
@@ -255,10 +256,13 @@ export class CallerScopedBackend implements Backend {
     this.pending++;
     entry.users++;
     this.cancelIdle(entry);
-    const abort = () => controller.abort();
+    let phase = 'queue';
+    const deadlineMs = opts.taskTimeoutMs;
+    const abort = () => cancelRuntime(controller, cancellationSource(signal));
+    observeCancellation(controller.signal, task.taskId, () => ({ phase, deadlineMs }));
     signal.addEventListener('abort', abort, { once: true });
     if (signal.aborted) abort();
-    const timer = setTimeout(abort, opts.taskTimeoutMs);
+    const timer = setTimeout(() => cancelRuntime(controller, 'task_deadline'), deadlineMs);
     const previous = entry.tail;
     let release!: () => void;
     const lease = new Promise<void>((r) => {
@@ -267,7 +271,6 @@ export class CallerScopedBackend implements Backend {
     entry.tail = previous.then(() => lease);
     let acquired = false,
       forwarding = true;
-    let phase = 'queue';
     let monitor: NodeJS.Timeout | undefined;
     let storageCheck: Promise<void> | undefined;
     let storageFailure = false;
@@ -352,7 +355,7 @@ export class CallerScopedBackend implements Backend {
             if (controller.signal.aborted) return;
             storageCheckFailed = true;
             storageFailure = error instanceof CallerStorageLimitError;
-            abort();
+            cancelRuntime(controller, 'storage_check');
           })
           .finally(() => {
             storageCheck = undefined;
@@ -511,13 +514,13 @@ export class CallerScopedBackend implements Backend {
     entry.users++;
     const controller = new AbortController();
     this.controllers.add(controller);
-    const abort = () => controller.abort();
+    let phase = 'queue';
+    let deadlineMs = opts.concurrency!.queueTimeoutMs;
+    const abort = () => cancelRuntime(controller, cancellationSource(signal));
+    observeCancellation(controller.signal, task.taskId, () => ({ phase, deadlineMs }));
     signal.addEventListener('abort', abort, { once: true });
     if (signal.aborted) abort();
-    let phase = 'queue';
-    let timedOut = false;
-    const timeout = () => { timedOut = true; abort(); };
-    let timer = setTimeout(timeout, opts.concurrency!.queueTimeoutMs);
+    let timer = setTimeout(() => cancelRuntime(controller, 'queue_deadline'), deadlineMs);
     let release: (() => void) | undefined;
     let acquired = false;
     let forwarding = true;
@@ -531,7 +534,8 @@ export class CallerScopedBackend implements Backend {
     try {
       release = await this.scheduler!.acquire(id, context, controller.signal);
       clearTimeout(timer);
-      timer = setTimeout(timeout, opts.taskTimeoutMs);
+      deadlineMs = opts.taskTimeoutMs;
+      timer = setTimeout(() => cancelRuntime(controller, 'task_deadline'), deadlineMs);
       controller.signal.throwIfAborted();
       if (entry.quarantined || entry.failedContexts.has(context)) throw new Error('context unavailable');
       if (!entry.contexts.has(context) && entry.contexts.size >= opts.maxContexts) {
@@ -598,7 +602,8 @@ export class CallerScopedBackend implements Backend {
       this.fail(task, emit,
         quarantined ? 'runtime_quarantined' : (error instanceof CallerQueueFullError || error instanceof CallerContextCapacityError) ? 'runtime_capacity' :
           error instanceof CallerEnvironmentPendingError ? 'runtime_setup_pending' :
-          timedOut ? (phase === 'queue' ? 'runtime_queue_timeout' : 'runtime_timeout') :
+          cancellationSource(controller.signal) === 'queue_deadline' ? 'runtime_queue_timeout' :
+          cancellationSource(controller.signal) === 'task_deadline' ? 'runtime_timeout' :
           controller.signal.aborted ? 'runtime_canceled' : 'runtime_failed',
         quarantined ? 'Runtime cleanup or storage is uncertain; offline recovery required' :
           phase === 'queue' ? 'Caller request left the queue; running executions are unchanged' :
@@ -619,7 +624,7 @@ export class CallerScopedBackend implements Backend {
   stop() {
     this.stopped = true;
     for (const entry of this.entries.values()) this.cancelIdle(entry);
-    for (const controller of this.controllers) controller.abort();
+    for (const controller of this.controllers) cancelRuntime(controller, 'runtime_stop');
   }
   async close(): Promise<void> {
     this.stop();
