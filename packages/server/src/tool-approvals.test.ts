@@ -76,8 +76,13 @@ test('status metadata carries both owner and requester URLs; origin snapshot is 
 
 test('approval expiry communicates its deadline as the cancellation trigger', t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
-  const { sent } = fixture();
+  const log = t.mock.method(console, 'log', () => {});
+  const { sent, a } = fixture();
   t.mock.timers.tick(60_001);
+  const expiry = log.mock.calls.map(call => JSON.parse(call.arguments[0]))
+    .find(record => record.event === 'tool_approval_expired');
+  assert.equal(expiry?.approvalDeadlineEpochMs, Date.parse(a.expiresAt));
+  assert.equal(expiry.taskId, a.taskId);
   assert.ok(sent.map(frame => JSON.parse(frame)).some(frame =>
     frame.type === 'task.cancel' && frame.trigger === 'approval_deadline'));
 });

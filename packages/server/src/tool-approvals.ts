@@ -131,6 +131,7 @@ export class ToolApprovals {
   private audit(a: ToolApproval, event: string): void {
     const origin = this.origins.get(a.requestId);
     logEvent(`tool_approval_${event}`, { agentId: a.agentId, taskId: a.taskId, executionId: a.executionId,
+      ...(event === 'expired' ? { approvalDeadlineEpochMs: Date.parse(a.expiresAt) } : {}),
       requestId: a.requestId, toolName: a.toolName, decision: a.decision, decidedBy: a.decidedBy,
       decidedVia: a.decidedVia, originPrincipal: origin?.principalId, originActor: origin?.actorId,
       originProfile: origin?.authorizationProfile });
