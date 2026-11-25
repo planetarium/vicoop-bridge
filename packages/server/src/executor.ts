@@ -13,6 +13,7 @@ import {
   type TaskArtifactUpdateEvent,
   type TaskStatusUpdateEvent,
   type TaskStore,
+  type TaskUpdate,
 } from '@a2x/sdk';
 import { randomUUID } from 'node:crypto';
 import type { ClientConnection, Registry, TaskBinding, TaskSink } from './registry.js';
@@ -269,24 +270,10 @@ export class WSForwardingExecutor extends AgentExecutor {
   }
 
   override async execute(task: Task, message: Message): Promise<Task> {
-    // Drain the streaming variant so callers that use message/send
-    // (non-streaming) still get the full final task with accumulated
-    // artifacts. The terminal events mutate `task` in place.
-    for await (const event of this.executeStream(task, message)) {
-      // Nonblocking message/send detaches this drain from its response.
-      // Unlike the SDK's SSE pump, the unary runner only saves on completion,
-      // so publish intermediate snapshots here for subsequent tasks/get.
-      try {
-        if ('artifact' in event) {
-          await this.taskStore.updateTask(task.id, { artifacts: task.artifacts });
-        } else if (!TERMINAL_STATES.has(event.status.state)) {
-          await this.taskStore.updateTask(task.id, { status: task.status, history: task.history });
-        }
-      } catch (err) {
-        // A failed progress snapshot must not close the generator and orphan
-        // native work. Later snapshots and the terminal save can recover it.
-        logEvent('task_persist_error', { taskId: task.id, phase: 'unary_progress', error: String(err) });
-      }
+    // The unary SDK runner only persists the final result. Publish intermediate
+    // snapshots for tasks/get while draining the same execution as SSE.
+    for await (const _event of this.runTask(task, message, true)) {
+      // runTask applies the event to task in place.
     }
     return task;
   }
@@ -401,9 +388,14 @@ export class WSForwardingExecutor extends AgentExecutor {
     };
   }
 
-  override async *executeStream(
+  override executeStream(task: Task, message: Message): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
+    return this.runTask(task, message, false);
+  }
+
+  private async *runTask(
     task: Task,
     message: Message,
+    polling: boolean,
   ): AsyncGenerator<TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
     const taskId = task.id;
     const contextId = task.contextId ?? taskId;
@@ -830,6 +822,20 @@ export class WSForwardingExecutor extends AgentExecutor {
     let sawFinalEvent = false;
     let deliveryAuthorized = false;
 
+    // Fold queued progress in FIFO order, then write the latest values of
+    // every changed field together. No detached write can race the final save.
+    let pending: TaskUpdate = {};
+    const checkpoint = async (update: TaskUpdate, immediate: boolean) => {
+      Object.assign(pending, update);
+      if (!immediate && queue.hasBufferedEvents) return;
+      try {
+        await this.taskStore.updateTask(taskId, pending);
+        pending = {};
+      } catch (err) {
+        logEvent('task_persist_error', { taskId, phase: 'unary_progress', error: String(err) });
+      }
+    };
+
     try {
       armWatchdog();
       for await (let event of queue.iterate(ac.signal)) {
@@ -856,6 +862,10 @@ export class WSForwardingExecutor extends AgentExecutor {
           // consumers received.
           appendArtifactChunk(accumulatedArtifacts, event);
           task.artifacts = taskArtifacts(priorArtifacts, accumulatedArtifacts);
+          if (polling) {
+            const hasFile = event.artifact.parts.some(part => 'raw' in part || 'url' in part);
+            await checkpoint({ artifacts: task.artifacts }, hasFile && event.lastChunk !== false);
+          }
           yield event;
           continue;
         }
@@ -880,13 +890,16 @@ export class WSForwardingExecutor extends AgentExecutor {
           yield withOrigin(terminal);
           break;
         }
-        const wasAuthRequired = task.status.state === TaskState.AUTH_REQUIRED;
+        const previousState = task.status.state;
         history = appendHistoryMessage(history, event.status.message);
         task.history = history;
         task.status = event.status;
         // Polling/subscribing clients must see the suspended state while the
         // original streaming call remains open, and its subsequent resumption.
-        if (wasAuthRequired !== (event.status.state === TaskState.AUTH_REQUIRED)) {
+        if (polling) {
+          await checkpoint({ status: task.status, history }, event.final ||
+            previousState !== event.status.state || event.status.state !== TaskState.WORKING);
+        } else if ((previousState === TaskState.AUTH_REQUIRED) !== (event.status.state === TaskState.AUTH_REQUIRED)) {
           await this.taskStore.updateTask(taskId, { status: task.status, history });
         }
         yield withOrigin(event);

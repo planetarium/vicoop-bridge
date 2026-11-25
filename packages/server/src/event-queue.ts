@@ -13,6 +13,10 @@ export class AsyncEventQueue<T> {
   private closed = false;
   private failure: { error: unknown } | null = null;
 
+  get hasBufferedEvents(): boolean {
+    return this.buffer.length > 0;
+  }
+
   push(item: T): void {
     if (this.closed || this.failure) return;
     if (this.waiter) {
