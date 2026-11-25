@@ -1,4 +1,9 @@
 import { test } from 'node:test';
+import { createHash, randomBytes } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
+import { createDb } from './db.js';
+import { PostgresTaskStore } from './postgres-task-store.js';
+import { executionWriter } from './execution-marker.js';
 import assert from 'node:assert/strict';
 import type { WebSocket } from 'ws';
 import {
@@ -1272,6 +1277,122 @@ test('unary execution persists progress and file bytes before backend completion
   assert.equal((await store.getTask(task.id))?.status.state, TaskState.COMPLETED);
   assert.deepEqual((await store.getTask(task.id))?.artifacts?.map(artifact => artifact.artifactId), ['previous', 'partial']);
 });
+
+test('unary execution surfaces an approval transition that polling cannot retrieve', async () => {
+  const agentId = 'approval-checkpoint';
+  const registry = new Registry();
+  registry.registerAgent({ agentId, clientId: 'client', ownerPrincipal: 'owner',
+    agentCard: makeAgentCard(), allowedCallers: [], ws: makeWsCapture().ws, connectedAt: 0 });
+  const store = new InMemoryTaskStore();
+  const task = await store.createTask({});
+  const update = store.updateTask.bind(store);
+  store.updateTask = (id, patch) => {
+    if (patch.status?.state === TaskState.AUTH_REQUIRED) throw new Error('approval write failed');
+    return update(id, patch);
+  };
+  const executor = new WSForwardingExecutor(agentId, registry, store);
+  const run = executor.execute(task, { role: 'user', messageId: 'input', parts: [{ text: 'work' }] });
+  for (let i = 0; i < 100 && !registry.getBinding(task.id); i++) await delay(1);
+  const binding = registry.getBinding(task.id)!;
+  binding.sink.pushStatus({ taskId: task.id, contextId: task.contextId!, final: false,
+    status: { state: TaskState.AUTH_REQUIRED } });
+  binding.sink.finish();
+  await assert.rejects(run, /approval write failed/);
+});
+
+test('nonblocking polling checkpoints a burst without delaying completion behind each event',
+  { skip: !process.env.DATABASE_URL }, async t => {
+    const sql = createDb(process.env.DATABASE_URL!);
+    const agentId = 'burst-test';
+    const registry = new Registry();
+    registry.registerAgent({ agentId, clientId: 'client', ownerPrincipal: 'owner',
+      agentCard: makeAgentCard(), allowedCallers: [], ws: makeWsCapture().ws, connectedAt: 0 });
+    const store = new PostgresTaskStore(sql, { ownerAgent: agentId });
+    const server = new A2XServer({
+      executor: new WSForwardingExecutor(agentId, registry, store), taskStore: store, protocolVersion: '0.3',
+    });
+    const handler = new DefaultRequestHandler(server);
+    const update = store.updateTask.bind(store);
+    let writes = 0;
+    let terminalPersisted = 0;
+    store.updateTask = async (id, patch) => {
+      const result = await update(id, patch);
+      writes++;
+      if (!terminalPersisted && result.status.state === TaskState.COMPLETED) terminalPersisted = performance.now();
+      return result;
+    };
+    const started = performance.now();
+    const send = await executionWriter.run({}, () => handler.handle({
+      jsonrpc: '2.0', id: 1, method: 'message/send', params: {
+        message: { role: 'user', messageId: 'input', parts: [{ text: 'generate files' }] },
+        configuration: { blocking: false },
+      },
+    })) as { result: Task };
+    const { id, contextId } = send.result;
+    const events = server.taskEventBus.subscribe(id, AbortSignal.timeout(60_000));
+    const detachedOutcome = events.next();
+    const files = [randomBytes(2_045_856), randomBytes(895_127)];
+    const digest = (data: Buffer) => createHash('sha256').update(data).digest('hex');
+    const poll = async (fileCount: number, state: TaskState) => {
+      const deadline = performance.now() + 30_000;
+      do {
+        const response = await handler.handle({ jsonrpc: '2.0', id: 2, method: 'tasks/get', params: { id } });
+        const task = (response as { result: Task }).result;
+        const fileParts = task.artifacts?.flatMap(a => a.parts).filter(p => 'file' in p) ?? [];
+        if (task.status.state === state && fileParts.length === fileCount) {
+          for (const [i, part] of fileParts.entries()) {
+            const bytes = (part as { file: { bytes: string } }).file.bytes;
+            assert.equal(digest(Buffer.from(bytes, 'base64')), digest(files[i]!));
+          }
+          return task;
+        }
+        await delay(5);
+      } while (performance.now() < deadline);
+      assert.fail(`timed out polling for ${state} and ${fileCount} files`);
+    };
+    try {
+      for (let i = 0; i < 1000 && !registry.getBinding(id); i++) await delay(5);
+      const binding = registry.getBinding(id);
+      assert.ok(binding);
+      const base = { taskId: id, contextId: contextId! };
+      const progress = (label: string) => binding.sink.pushStatus({ ...base, final: false,
+        status: { state: TaskState.WORKING, message: { role: 'agent', messageId: label, parts: [{ text: label }] } } });
+      const file = (i: number) => binding.sink.pushArtifact({ ...base, lastChunk: true,
+        artifact: { artifactId: `file-${i}`, parts: [{ raw: files[i]!.toString('base64'), filename: `${i}.zip` }] } });
+      for (let i = 0; i < 8; i++) progress(`before-${i}`);
+      file(0);
+      await poll(1, TaskState.WORKING);
+      const firstFile = performance.now();
+      file(1);
+      await poll(2, TaskState.WORKING);
+      const secondFile = performance.now();
+      for (let i = 0; i < 48; i++) {
+        progress(`after-${i}`);
+        binding.sink.pushArtifact({ ...base, append: i > 0,
+          artifact: { artifactId: 'text', parts: [{ text: 'x' }] } });
+      }
+      const completed = performance.now();
+      binding.sink.pushStatus({ ...base, final: true, status: { state: TaskState.COMPLETED } });
+      progress('late');
+      binding.sink.finish();
+      const task = await poll(2, TaskState.COMPLETED);
+      const observed = performance.now();
+      const polledWrites = writes;
+      assert.equal((await detachedOutcome).value?.status?.state, TaskState.COMPLETED);
+      assert.deepEqual(task.history?.slice(-48).map(m => m.messageId),
+        Array.from({ length: 48 }, (_, i) => `after-${i}`));
+      assert.equal((task.artifacts?.find(a => a.artifactId === 'text')?.parts[0] as { text: string }).text, 'x'.repeat(48));
+      assert.equal((await store.getTask(id))?.status.state, TaskState.COMPLETED);
+      t.diagnostic(`updateTask calls through poll: ${polledWrites}, first/second file: ${Math.round(firstFile - started)}/${Math.round(secondFile - started)} ms, completion to persist/poll: ${Math.round(terminalPersisted - completed)}/${Math.round(observed - completed)} ms`);
+      assert.ok(polledWrites < 16, `unexpected per-event snapshots: ${polledWrites}`);
+    } finally {
+      registry.getBinding(id)?.sink.finish();
+      await detachedOutcome;
+      await events.return(undefined);
+      await store.deleteTask(id);
+      await sql.end();
+    }
+  });
 
 test('paid output is authorized before publication and failed upto work remains uncharged', async () => {
   for (const blocked of [false, true]) {
