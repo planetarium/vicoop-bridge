@@ -896,11 +896,14 @@ export class WSForwardingExecutor extends AgentExecutor {
         task.status = event.status;
         // Polling/subscribing clients must see the suspended state while the
         // original streaming call remains open, and its subsequent resumption.
-        if (polling) {
+        if ((previousState === TaskState.AUTH_REQUIRED) !== (event.status.state === TaskState.AUTH_REQUIRED)) {
+          // Approval can suspend all further frames. A failed transition must
+          // surface even if there will be no later checkpoint to retry it.
+          await this.taskStore.updateTask(taskId, { ...pending, status: task.status, history });
+          pending = {};
+        } else if (polling) {
           await checkpoint({ status: task.status, history }, event.final ||
             previousState !== event.status.state || event.status.state !== TaskState.WORKING);
-        } else if ((previousState === TaskState.AUTH_REQUIRED) !== (event.status.state === TaskState.AUTH_REQUIRED)) {
-          await this.taskStore.updateTask(taskId, { status: task.status, history });
         }
         yield withOrigin(event);
       }

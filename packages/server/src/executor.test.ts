@@ -1278,6 +1278,28 @@ test('unary execution persists progress and file bytes before backend completion
   assert.deepEqual((await store.getTask(task.id))?.artifacts?.map(artifact => artifact.artifactId), ['previous', 'partial']);
 });
 
+test('unary execution surfaces an approval transition that polling cannot retrieve', async () => {
+  const agentId = 'approval-checkpoint';
+  const registry = new Registry();
+  registry.registerAgent({ agentId, clientId: 'client', ownerPrincipal: 'owner',
+    agentCard: makeAgentCard(), allowedCallers: [], ws: makeWsCapture().ws, connectedAt: 0 });
+  const store = new InMemoryTaskStore();
+  const task = await store.createTask({});
+  const update = store.updateTask.bind(store);
+  store.updateTask = (id, patch) => {
+    if (patch.status?.state === TaskState.AUTH_REQUIRED) throw new Error('approval write failed');
+    return update(id, patch);
+  };
+  const executor = new WSForwardingExecutor(agentId, registry, store);
+  const run = executor.execute(task, { role: 'user', messageId: 'input', parts: [{ text: 'work' }] });
+  for (let i = 0; i < 100 && !registry.getBinding(task.id); i++) await delay(1);
+  const binding = registry.getBinding(task.id)!;
+  binding.sink.pushStatus({ taskId: task.id, contextId: task.contextId!, final: false,
+    status: { state: TaskState.AUTH_REQUIRED } });
+  binding.sink.finish();
+  await assert.rejects(run, /approval write failed/);
+});
+
 test('nonblocking polling checkpoints a burst without delaying completion behind each event',
   { skip: !process.env.DATABASE_URL }, async t => {
     const sql = createDb(process.env.DATABASE_URL!);
@@ -1286,9 +1308,10 @@ test('nonblocking polling checkpoints a burst without delaying completion behind
     registry.registerAgent({ agentId, clientId: 'client', ownerPrincipal: 'owner',
       agentCard: makeAgentCard(), allowedCallers: [], ws: makeWsCapture().ws, connectedAt: 0 });
     const store = new PostgresTaskStore(sql, { ownerAgent: agentId });
-    const handler = new DefaultRequestHandler(new A2XServer({
+    const server = new A2XServer({
       executor: new WSForwardingExecutor(agentId, registry, store), taskStore: store, protocolVersion: '0.3',
-    }));
+    });
+    const handler = new DefaultRequestHandler(server);
     const update = store.updateTask.bind(store);
     let writes = 0;
     let terminalPersisted = 0;
@@ -1306,6 +1329,8 @@ test('nonblocking polling checkpoints a burst without delaying completion behind
       },
     })) as { result: Task };
     const { id, contextId } = send.result;
+    const events = server.taskEventBus.subscribe(id, AbortSignal.timeout(60_000));
+    const detachedOutcome = events.next();
     const files = [randomBytes(2_045_856), randomBytes(895_127)];
     const digest = (data: Buffer) => createHash('sha256').update(data).digest('hex');
     const poll = async (fileCount: number, state: TaskState) => {
@@ -1352,14 +1377,18 @@ test('nonblocking polling checkpoints a burst without delaying completion behind
       binding.sink.finish();
       const task = await poll(2, TaskState.COMPLETED);
       const observed = performance.now();
+      const polledWrites = writes;
+      assert.equal((await detachedOutcome).value?.status?.state, TaskState.COMPLETED);
       assert.deepEqual(task.history?.slice(-48).map(m => m.messageId),
         Array.from({ length: 48 }, (_, i) => `after-${i}`));
       assert.equal((task.artifacts?.find(a => a.artifactId === 'text')?.parts[0] as { text: string }).text, 'x'.repeat(48));
       assert.equal((await store.getTask(id))?.status.state, TaskState.COMPLETED);
-      t.diagnostic(`updateTask calls through poll: ${writes}, first/second file: ${Math.round(firstFile - started)}/${Math.round(secondFile - started)} ms, completion to persist/poll: ${Math.round(terminalPersisted - completed)}/${Math.round(observed - completed)} ms`);
-      assert.ok(writes < 16, `unexpected per-event snapshots: ${writes}`);
+      t.diagnostic(`updateTask calls through poll: ${polledWrites}, first/second file: ${Math.round(firstFile - started)}/${Math.round(secondFile - started)} ms, completion to persist/poll: ${Math.round(terminalPersisted - completed)}/${Math.round(observed - completed)} ms`);
+      assert.ok(polledWrites < 16, `unexpected per-event snapshots: ${polledWrites}`);
     } finally {
       registry.getBinding(id)?.sink.finish();
+      await detachedOutcome;
+      await events.return(undefined);
       await store.deleteTask(id);
       await sql.end();
     }

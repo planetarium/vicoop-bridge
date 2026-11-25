@@ -136,8 +136,8 @@ test('nonblocking send retains ownership, partial files, and a single execution 
       const canceled = await (await rpc('tasks/cancel', { id })).json() as { result: Task };
       assert.equal(canceled.result.status.state, TaskState.CANCELED);
       release();
-      // Unary progress, gate-halt persistence, and SDK final persistence.
-      await waitFor(async () => haltedWrites === 3);
+      // Wait for both the gate-halt save and the detached SDK final save.
+      await waitFor(async () => haltedWrites === 2);
       assert.equal((await get(id)).status.state, TaskState.CANCELED);
       assert.equal(frames.some(frame => frame.type === 'task.assign' && frame.taskId === id), false);
     } finally {
